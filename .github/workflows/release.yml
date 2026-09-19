@@ -95,7 +95,7 @@ jobs:
       - name: Stamp version + build
         working-directory: electron
         run: |
-          npm version --no-git-tag-version "${{ env.VERSION }}"
+          npm pkg set version="${{ env.VERSION }}"
           npm install --no-audit --no-fund
           npx electron-builder ${{ matrix.args }} --publish never
       - uses: actions/upload-artifact@v4
