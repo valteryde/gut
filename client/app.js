@@ -1297,10 +1297,17 @@ async function probeDevice(d) {
   cur.pending = true;
   try {
     const r = await devFetch(d, '/api/version');
-    if (!r.ok) throw new Error(String(r.status));
-    const j = await r.json();
-    Object.assign(cur, { version: j.version, install: j.install,
-                         device: j.device, offline: false });
+    if (r.ok) {
+      const j = await r.json();
+      Object.assign(cur, { version: j.version, install: j.install,
+                           device: j.device, offline: false });
+      delete cur.legacy;
+    } else {
+      // Any HTTP answer means the backend is alive — daemons older than
+      // this route just report "online", no version.
+      Object.assign(cur, { offline: false, legacy: true });
+      delete cur.version;
+    }
   } catch (_) {
     cur.offline = true;
   }
@@ -1471,7 +1478,8 @@ function renderDeviceList() {
     const ver = document.createElement('span');
     ver.className = 'dev-ver';
     ver.textContent = info?.offline ? '· offline'
-      : info?.version ? `· v${info.version}` : '';
+      : info?.version ? `· v${info.version}`
+      : info?.legacy ? '· online' : '';
     label.appendChild(ver);
     if (d.id === activeDev().id) {
       const tag = document.createElement('span');
@@ -1480,6 +1488,7 @@ function renderDeviceList() {
       label.appendChild(tag);
     }
     label.onclick = () => fillDeviceForm(d);
+    row.appendChild(label);
     const upd = deviceUpdate(d, info);
     if (upd) {
       const up = document.createElement('button');
@@ -1495,14 +1504,49 @@ function renderDeviceList() {
       up.onclick = (e) => { e.stopPropagation(); updateDevice(d); };
       row.appendChild(up);
     }
+    if (gut && d.id === 'local') {
+      const rst = document.createElement('button');
+      rst.type = 'button';
+      rst.className = 'dev-update';
+      rst.textContent = info?.restarting ? 'restarting…' : 'restart';
+      rst.disabled = !!info?.restarting;
+      rst.title = 'Restart the local backend stack';
+      if (info?.restartError) {
+        rst.title = `last attempt failed: ${info.restartError}`;
+        rst.classList.add('failed');
+      }
+      rst.onclick = (e) => { e.stopPropagation(); restartLocalBackend(); };
+      row.appendChild(rst);
+    }
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'dev-del';
     del.textContent = '×';
     del.title = 'Remove device';
     del.onclick = () => removeDevice(d.id);
-    row.append(label, del);
+    row.appendChild(del);
     deviceListEl.appendChild(row);
+  }
+}
+
+// The Local row's restart button bounces whichever compose stack owns the
+// desktop container — the repo's dev `gut` or the generated `gut-local`.
+async function restartLocalBackend() {
+  const info = devInfo.local = devInfo.local || {};
+  if (info.restarting) return;
+  info.restarting = true;
+  delete info.restartError;
+  renderDeviceList();
+  try {
+    const r = await gut.restartLocal();
+    if (!r?.ok) info.restartError = r?.error || 'restart failed';
+  } catch (e) {
+    info.restartError = e?.message || 'restart failed';
+  } finally {
+    info.restarting = false;
+    const d = cfg.devices.find(x => x.id === 'local');
+    if (d) await probeDevice(d);
+    if (settingsOpen()) renderDeviceList();
   }
 }
 

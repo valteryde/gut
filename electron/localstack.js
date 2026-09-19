@@ -22,15 +22,24 @@ const PROVIDER_KEYS = [
 ];
 
 const DEV = !app.isPackaged;
-const PROJECT = DEV ? 'gut' : 'gut-local';
 const repoDir = path.resolve(__dirname, '..');
 
+// Two compose projects can be "the local backend": the repo's dev stack
+// (`gut`, built from source — what `docker compose up` runs) and the one
+// the app generates under userData (`gut-local`, prebuilt GHCR image).
+// Config/key writes go to MANAGED; lifecycle commands hit whichever
+// project owns the desktop container — see desktopContainer().
+const MANAGED = DEV ? 'gut' : 'gut-local';
+
 const stackDir = () => path.join(app.getPath('userData'), 'local');
-const envPath = () =>
-  DEV ? path.join(repoDir, '.env') : path.join(stackDir(), '.env');
-const composePath = () =>
-  DEV ? path.join(repoDir, 'docker-compose.yml')
-      : path.join(stackDir(), 'compose.yaml');
+const composeFile = (proj = MANAGED) => proj === 'gut'
+  ? path.join(repoDir, 'docker-compose.yml')
+  : path.join(stackDir(), 'compose.yaml');
+const envFile = (proj = MANAGED) => proj === 'gut'
+  ? path.join(repoDir, '.env')
+  : path.join(stackDir(), '.env');
+const envPath = () => envFile();
+const composePath = () => composeFile();
 const litellmPath = () => path.join(stackDir(), 'litellm.yaml');
 
 const imageTag = () =>
@@ -292,11 +301,27 @@ volumes:
 `);
 }
 
-const composeArgs = () => [
-  'compose', '-p', PROJECT, '-f', composePath(),
+const composeArgs = (proj = MANAGED) => [
+  'compose', '-p', proj, '-f', composeFile(proj),
   // A missing .env must not break ps/restart — `up` reports it anyway.
-  ...(fs.existsSync(envPath()) ? ['--env-file', envPath()] : []),
+  ...(fs.existsSync(envFile(proj)) ? ['--env-file', envFile(proj)] : []),
 ];
+
+// The gut desktop container, whichever compose project owns it — a running
+// one wins over created/exited. Lifecycle commands target this project.
+async function desktopContainer() {
+  const r = await run('docker',
+    ['ps', '-a', '--format', '{{.Names}} {{.State}}']);
+  let found = null;
+  for (const line of r.out.split('\n')) {
+    const m = line.match(/^(gut|gut-local)-desktop-\d+ (.*)$/);
+    if (!m) continue;
+    const c = { project: m[1], running: m[2].trim() === 'running' };
+    if (c.running) return c;
+    found = found || c;
+  }
+  return found;
+}
 
 // Any HTTP answer from :8000 means the agent process is alive — the route
 // deliberately doesn't matter, older daemons predate /api/version.
@@ -314,22 +339,18 @@ function probeAgent() {
 
 async function status() {
   const docker = (await run('docker', ['info'])).code === 0;
-  let running = false;
-  if (docker) {
-    // Container state decides "running", not the HTTP probe: a wedged or
-    // outdated daemon must still show Stop/Restart — that's when they're
-    // needed most.
-    const r = await run('docker', [
-      'ps', '--filter', `label=com.docker.compose.project=${PROJECT}`,
-      '--filter', 'name=desktop', '--format', '{{.State}}']);
-    running = r.out.trim() === 'running';
-  }
+  // Container state decides "running", not the HTTP probe: a wedged or
+  // outdated daemon must still show Stop/Restart — that's when they're
+  // needed most.
+  const c = docker ? await desktopContainer() : null;
+  const proj = c?.project || MANAGED;
   return {
     runtime: docker ? 'ready' : 'missing',
-    stack: running ? 'running' : 'stopped',
-    agent: running ? await probeAgent() : false,
-    image: DEV ? 'dev build' : imageTag(),
-    dir: DEV ? repoDir : stackDir(),
+    stack: c?.running ? 'running' : 'stopped',
+    project: proj,
+    agent: c?.running ? await probeAgent() : false,
+    image: proj === 'gut' ? 'dev build' : imageTag(),
+    dir: proj === 'gut' ? repoDir : stackDir(),
   };
 }
 
@@ -410,19 +431,21 @@ function litellmConfigFirstModel(env) {
 }
 
 async function stop() {
-  const r = await run('docker', [...composeArgs(), 'down']);
+  const proj = (await desktopContainer())?.project || MANAGED;
+  const r = await run('docker', [...composeArgs(proj), 'down']);
   return { ok: r.code === 0 };
 }
 
 // Bounce the stack: recreate the containers in place and wait on the
 // healthchecks, like start(). Picks up .env/config changes too.
 async function restart(log) {
-  if (!fs.existsSync(composePath())) {
+  const proj = (await desktopContainer())?.project || MANAGED;
+  if (!fs.existsSync(composeFile(proj))) {
     return { ok: false, error: 'local stack has not been created yet' };
   }
-  log('Restarting the local stack…');
+  log(`Restarting the local stack (project ${proj})…`);
   const r = await run('docker',
-    [...composeArgs(), 'up', '-d', '--wait', '--force-recreate'], log);
+    [...composeArgs(proj), 'up', '-d', '--wait', '--force-recreate'], log);
   if (r.code !== 0) return fail('docker compose up failed', r);
   return { ok: true };
 }
