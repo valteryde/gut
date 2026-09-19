@@ -147,8 +147,17 @@ jobs:
     needs: [image-manifest, deb, electron]
     runs-on: ubuntu-latest
     steps:
+      # download-artifact would also grab the buildx gha cache exports
+      # (*~*.dockerbuild), which are not valid zips and crash the download —
+      # restrict to the artifact prefixes we actually publish.
       - uses: actions/download-artifact@v4
         with:
+          pattern: 'deb-*'
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'electron-*'
           path: artifacts
           merge-multiple: true
       - name: Checksums
