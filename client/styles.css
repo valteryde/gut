@@ -84,9 +84,8 @@ body { display: flex; flex-direction: column; }
 .typing-text,
 .screen-status,
 #topbar .btn,
-.screen-btn,
 .presets .preset,
-dialog label {
+#settingsPage label {
   font-family: var(--mono);
   font-size: 11px;
   font-weight: 500;
@@ -144,8 +143,19 @@ dialog label {
   gap: 16px;
 }
 
+/* In the Electron shell the topbar doubles as the window drag region;
+   on macOS the traffic lights get their own strip up top and the
+   content row (brand left, controls right) sits on the bottom line. */
+.is-electron #topbar { -webkit-app-region: drag; }
+.is-electron .topbar-controls { -webkit-app-region: no-drag; }
+.is-electron.is-mac #topbar {
+  height: 78px;
+  align-items: flex-end;
+  padding: 0 20px 14px 14px;
+}
+
 /* ── controls ────────────────────────────────────────────── */
-select, input, button {
+select, input, textarea, button {
   font: inherit;
   color: inherit;
   margin: 0;
@@ -153,7 +163,8 @@ select, input, button {
 
 select,
 input[type="text"],
-input[type="password"] {
+input[type="password"],
+textarea {
   height: var(--control-h);
   background: var(--surface);
   border: 1px solid var(--line-strong);
@@ -161,8 +172,8 @@ input[type="password"] {
   padding: 0 10px;
   transition: border-color 0.12s, box-shadow 0.12s;
 }
-:is(input[type="text"], input[type="password"]):hover { border-color: var(--text-3); }
-:is(select, input[type="text"], input[type="password"]):focus {
+:is(input[type="text"], input[type="password"], textarea):hover { border-color: var(--text-3); }
+:is(select, input[type="text"], input[type="password"], textarea):focus {
   outline: none;
   border-color: var(--mint-ink);
   box-shadow: 0 0 0 3px var(--mint-soft);
@@ -188,7 +199,7 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
-input::placeholder { color: var(--text-3); }
+:is(input, textarea)::placeholder { color: var(--text-3); }
 
 .btn, button {
   height: var(--control-h);
@@ -222,20 +233,6 @@ button.ghost:hover { background: var(--surface-3); color: var(--text); }
 
 button.danger { color: var(--bad); border-color: var(--bad-line); }
 button.danger:hover { background: var(--bad-bg); }
-
-/* hands control to the human … */
-button.human { color: var(--clay-ink); border-color: var(--clay-line); }
-button.human:hover { background: var(--clay-soft); }
-/* … and, once taken over, hands it back to the agent */
-button.human.active {
-  background: var(--mint);
-  border-color: var(--mint);
-  color: var(--on-mint);
-}
-button.human.active:hover {
-  background: var(--mint-hover);
-  border-color: var(--mint-hover);
-}
 
 /* ── usage meter ─────────────────────────────────────────── */
 /* pill in the top bar; hover/focus opens the breakdown card */
@@ -686,15 +683,21 @@ body.verbose .verbose-only { display: grid; }
   border-top: 1px solid var(--line);
 }
 
-.composer { display: flex; gap: 8px; }
-.composer :is(input, button) { height: 38px; }
+.composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer button { height: 38px; }
 
 #chatInput {
   flex: 1;
   min-width: 0;
   background: var(--surface-2);
   border-color: var(--line);
-  padding: 0 12px;
+  padding: 8px 12px;
+  line-height: 20px;
+  height: 38px;
+  min-height: 38px;
+  max-height: 160px;
+  resize: none;
+  overflow-y: auto;
 }
 #chatInput:focus { background: var(--surface); }
 
@@ -775,23 +778,6 @@ body.verbose .verbose-only { display: grid; }
 body[data-agent="running"] #desktopPane { border-color: var(--mint); }
 body.takeover #desktopPane { border-color: var(--clay); }
 
-/* takeover floats over the pane it controls, top-right */
-.screen-btn {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 3;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  background: var(--surface);
-  box-shadow: 0 2px 10px rgba(30, 29, 26, 0.12);
-}
-.screen-btn .ph { width: 15px; height: 15px; flex: none; }
-.screen-btn .ic-bot { display: none; }
-.screen-btn.active .ic-hand { display: none; }
-.screen-btn.active .ic-bot { display: inline; }
-
 /* a slim gutter on every side keeps the stream framed — the ambient
    backdrop shows through it, so the pane always reads as a letterbox */
 #screen {
@@ -836,27 +822,24 @@ body.takeover #desktopPane { border-color: var(--clay); }
 }
 .screen-status:empty { display: none; }
 
+/* takeover notice — a clay band at the foot of the conversation, where
+   the resume action lives next to the composer's Stop/Send row */
 #takeoverBanner {
-  position: absolute;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 14px;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 8px 8px 18px;
   background: var(--clay-soft);
-  border: 1px solid var(--clay-line);
+  border-top: 1px solid var(--clay-line);
   color: var(--clay-ink);
   font-size: 13px;
   font-weight: 500;
-  padding: 6px 6px 6px 14px;
-  border-radius: var(--radius);
-  white-space: nowrap;
 }
 #takeoverBanner button {
-  height: 26px;
-  padding: 0 10px;
-  font-size: 12px;
+  height: 28px;
+  padding: 0 12px;
   background: var(--mint);
   border-color: var(--mint);
   color: var(--on-mint);
@@ -866,34 +849,70 @@ body.takeover #desktopPane { border-color: var(--clay); }
   border-color: var(--mint-hover);
 }
 
-/* ── settings dialog ─────────────────────────────────────── */
-dialog {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-card);
-  padding: 24px;
-  width: 400px;
-}
-dialog::backdrop { background: rgba(30, 29, 26, 0.4); }
+/* ── settings page ─────────────────────────────────────────── */
+/* Settings is a page, not a modal: it swaps in for the chat/desktop panes
+   inside <main> so every section gets the full window width. */
+body.settings-open #chatPane,
+body.settings-open #desktopPane { display: none; }
 
-dialog h3 {
-  margin: 0 0 16px;
+#settingsPage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.page-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2px 8px 14px;
+}
+.page-head h2 {
+  margin: 0;
   font-size: 22px;
   font-weight: 300;
   letter-spacing: -0.015em;
 }
-dialog label {
+
+.page-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.page-body {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 8px 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* each settings group is a card */
+.set-sec {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 16px 20px 18px;
+}
+.set-sec > .dlg-sub { display: block; margin-bottom: 4px; }
+
+#settingsPage label {
   display: block;
-  margin: 18px 0 0;
+  margin: 14px 0 0;
   color: var(--text-3);
 }
-dialog label small {
+#settingsPage label small {
   font-size: inherit;
   text-transform: none;
   letter-spacing: 0;
 }
-dialog input {
+#settingsPage label > input {
   display: block;
   width: 100%;
   margin-top: 6px;
@@ -905,23 +924,84 @@ dialog input {
   color: var(--text);
 }
 #hostInput { font-family: var(--mono); font-size: 12.5px; }
-dialog .hint {
+#settingsPage .hint {
   color: var(--text-3);
   font-size: 12.5px;
-  margin: 14px 0 0;
+  margin: 10px 0 0;
 }
 
-/* ── electron: local desktop box (settings dialog) ─────────── */
-#localBox {
+/* ── provider keys ─────────────────────────────────────────── */
+.provider-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+.prov-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 14px;
-  margin-top: 18px;
+  padding: 12px 14px;
 }
-#localBox .dlg-sub { margin: 0 0 8px; }
-#localStatus { margin-top: 0; }
-.local-keys label { margin-top: 10px; font-size: 12.5px; }
-.local-keys input { font-family: var(--mono); font-size: 12px; }
+.prov-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.prov-logo {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  color: var(--text-2);
+}
+.prov-id { flex: 1; min-width: 0; }
+.prov-name {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.prov-models {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prov-state {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.prov-state.set {
+  color: var(--mint-ink);
+  background: var(--mint-soft);
+  border-color: var(--mint-line);
+}
+.prov-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.prov-actions .grow { flex: 1; }
+.prov-key-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* ── electron: local desktop ───────────────────────────────── */
+#localStatus, #updateStatus { margin-top: 4px; }
 #localLog {
   margin: 12px 0 0;
   max-height: 140px;
@@ -938,14 +1018,6 @@ dialog .hint {
 }
 
 /* ── app updates ─────────────────────────────────────────── */
-#updateBox {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 14px;
-  margin-top: 18px;
-}
-#updateBox .dlg-sub { margin: 0 0 8px; }
-#updateStatus { margin-top: 0; }
 .ubar {
   height: 4px;
   margin-top: 10px;
@@ -960,21 +1032,22 @@ dialog .hint {
   background: var(--mint, #7fd8be);
   transition: width .25s ease;
 }
+#settingsBtn { display: inline-flex; align-items: center; gap: 7px; }
+#settingsBtn .ph { width: 14px; height: 14px; flex: none; }
 #settingsDot.dot {
   display: inline-block;
   width: 7px;
   height: 7px;
-  margin-left: 6px;
   border-radius: 50%;
   background: var(--mint, #7fd8be);
   vertical-align: middle;
 }
-dialog menu {
+.dev-form menu {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   padding: 0;
-  margin: 24px 0 0;
+  margin: 16px 0 0;
 }
 
 .presets {
@@ -995,7 +1068,7 @@ dialog menu {
 .presets .preset:hover { background: var(--surface-2); color: var(--text); }
 
 /* device manager rows */
-dialog .dlg-sub {
+.dlg-sub {
   margin: 0;
   font-family: var(--mono);
   font-size: 11px;
@@ -1004,7 +1077,7 @@ dialog .dlg-sub {
   text-transform: uppercase;
   color: var(--text-3);
 }
-dialog label.check {
+#settingsPage label.check {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1012,13 +1085,13 @@ dialog label.check {
   color: var(--text);
   cursor: pointer;
 }
-dialog label.check input {
+#settingsPage label.check input {
   display: inline-block;
   width: auto;
   margin: 0;
   accent-color: var(--mint-ink);
 }
-dialog label.check small {
+#settingsPage label.check small {
   display: block;
   font-family: var(--sans);
   color: var(--text-3);
@@ -1027,7 +1100,7 @@ dialog label.check small {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 22px 0 14px;
+  margin: 0 0 12px;
 }
 .dev-head .dlg-sub { margin: 0; }
 #newDevBtn { flex: none; }
@@ -1037,7 +1110,7 @@ dialog label.check small {
   color: var(--text);
 }
 .dev-form-title {
-  margin: 16px 0 0;
+  margin: 0;
   font-family: var(--mono);
   font-size: 11px;
   font-weight: 500;
@@ -1053,12 +1126,17 @@ dialog label.check small {
   color: var(--mint-ink);
   font-size: 10px;
 }
+/* on the wide page the device list and its edit form sit side by side */
+.dev-cols {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(320px, 1.2fr);
+  gap: 28px;
+  align-items: start;
+}
 .dev-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  max-height: 150px;
-  overflow-y: auto;
 }
 .dev-row { display: flex; gap: 6px; }
 .dev-label {
@@ -1076,6 +1154,18 @@ dialog label.check small {
 }
 .dev-del { flex: none; width: 32px; padding: 0; color: var(--text-3); }
 .dev-del:hover { color: var(--bad); }
+.dev-ver { color: var(--text-3); }
+.dev-update {
+  flex: none;
+  padding: 0 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mint-ink);
+  white-space: nowrap;
+}
+.dev-update:hover:not(:disabled) { background: var(--mint-soft); }
+.dev-update:disabled { color: var(--text-3); }
+.dev-update.failed:not(:disabled) { color: var(--bad); }
 
 /* narrow screens: chat on top */
 @media (max-width: 760px) {
@@ -1088,4 +1178,5 @@ dialog label.check small {
     resize: none;
   }
   .cost { display: none; }
+  .dev-cols { grid-template-columns: 1fr; }
 }

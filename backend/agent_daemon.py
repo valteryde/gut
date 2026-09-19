@@ -86,10 +86,28 @@ def _build_version() -> str:
 
 
 GUT_VERSION = _build_version()
+
+
+def _install_kind() -> str:
+    # docker = the gut-desktop image (GUT_VERSION is a baked-in ENV); deb =
+    # the gut-bot package (/opt/gut payload, /etc/gut env); else dev.
+    if os.environ.get("GUT_VERSION") or Path("/.dockerenv").exists():
+        return "docker"
+    if (Path("/etc/gut/gut-bot.env").exists()
+            or Path("/opt/gut/VERSION").exists()):
+        return "deb"
+    return "dev"
+
+
+INSTALL_KIND = _install_kind()
 # Conversation transcripts + model context persist on the desktop-home
 # volume (or ~/.gut outside docker) so they survive container rebuilds.
 GUT_DATA_DIR = Path(os.environ.get("GUT_DATA_DIR") or Path.home() / ".gut")
 CONV_DIR = GUT_DATA_DIR / "conversations"
+# Self-update status file (deb installs) — written by the detached updater
+# script, read by GET /api/update.
+UPDATE_STATUS_FILE = GUT_DATA_DIR / "update.json"
+GITHUB_REPO = os.environ.get("GUT_RELEASE_REPO", "valteryde/gut")
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.05
@@ -124,8 +142,10 @@ Talking to the user — act like a teammate, not a live feed:
   chat attachment. Paths are relative to {home}.
 - send_image: show the user an image — a file, or a fresh screenshot when no
   path is given.
-- ask_user: pause for input when blocked on a decision, credential, 2FA or
-  CAPTCHA — never for information visible on screen.
+- ask_user: pause for input only when blocked on something only a human can
+  provide — a decision, credential, 2FA or CAPTCHA. Never for information
+  visible on screen, and never just because you're stuck — brainstorm more
+  approaches instead.
 - task_complete: ends the task and sends `summary` as your wrap-up message.
   Make it a good one: what was done, where results live, what to check.
 
@@ -136,8 +156,11 @@ Guidelines:
   once (e.g. click field → type → press enter). Split only when the next step
   depends on what the screen shows after the previous one.
 - Prefer keyboard shortcuts, direct typing and run_command over pixel hunting.
-- If an action changes nothing after two tries, switch tactics (keyboard
-  navigation, run_command, ask_user) — never keep repeating the same click.
+- If an action changes nothing after two tries, stop and brainstorm at least
+  5 different approaches (keyboard navigation, menus, run_command, the
+  browser_* tools, a different app entirely) and try the most promising
+  untried one. Never keep repeating the same click, and never give up —
+  there is almost always another way forward.
 - type_text and key go to whatever window has focus — if keystrokes aren't
   landing, click the target field first (or use browser_type on web pages).
 - Never click tel:/mailto: links; they're blocked and just pop a dead-end OS
@@ -1359,6 +1382,27 @@ def _note(content, text: str):
     return content
 
 
+def _unstick_note(reason: str) -> str:
+    """Directive injected when the agent is looping without progress.
+
+    Rather than asking the user, push the model to brainstorm alternatives
+    and try a different approach. Only a human-only blocker (credentials,
+    2FA, CAPTCHA, a decision) justifies ask_user.
+    """
+    return (f"STUCK: {reason}. Do not keep doing the same thing. Before your "
+            "next tool call, brainstorm at least 5 fundamentally different "
+            "ways to reach your goal — different tools, keyboard vs mouse, "
+            "menus, run_command, browser_* tools, another app entirely, "
+            "reading docs or --help output — then try the most promising one "
+            "you haven't tried. Keep generating new approaches — never give "
+            "up. Only call ask_user if you're blocked on something only a "
+            "human can provide.")
+
+
+STUCK_ASK_USER = ("I've brainstormed and tried several different approaches "
+                  "and I'm still stuck. Any guidance?")
+
+
 async def llm_request(http: httpx.AsyncClient, messages: list) -> httpx.Response:
     """One chat-completion call with retry on transient failures.
 
@@ -1416,7 +1460,7 @@ async def agent_loop(conv_id: str, task_text: str) -> None:
         screenshot_block(force=True),
     ]})
     done = False
-    recent_sigs, unchanged_streak = deque(maxlen=10), 0
+    recent_sigs, unchanged_streak, stuck_rescues = deque(maxlen=10), 0, 0
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as http:
             for _ in range(MAX_STEPS):
@@ -1492,11 +1536,16 @@ async def agent_loop(conv_id: str, task_text: str) -> None:
                                 f"times in your last {len(recent_sigs)} "
                                 "steps with no progress — switch tactics now.")
                         elif seen >= 5:
-                            answer = await ask_user(
-                                "I'm stuck: I've repeated the same action "
-                                f"{seen} times. What should I do?")
-                            result = _note(result, f"[user replied]: {answer}")
+                            result = _note(result, _unstick_note(
+                                f"you've repeated this exact action {seen} "
+                                "times with no progress"))
                             recent_sigs.clear()
+                            stuck_rescues += 1
+                            if stuck_rescues >= 3:
+                                stuck_rescues = 0
+                                answer = await ask_user(STUCK_ASK_USER)
+                                result = _note(result,
+                                               f"[user replied]: {answer}")
 
                     messages.append({
                         "role": "tool",
@@ -1529,15 +1578,22 @@ async def agent_loop(conv_id: str, task_text: str) -> None:
                                 "your last 3 actions — they are having no "
                                 "effect. Switch tactics.")
                         elif unchanged_streak >= 6:
-                            answer = await ask_user(
-                                "The screen hasn't changed across my last "
-                                f"{unchanged_streak} actions — I may be "
-                                "stuck. Any guidance?")
                             target["content"] = _note(
-                                target["content"], f"[user replied]: {answer}")
+                                target["content"], _unstick_note(
+                                    "the screen has not changed across your "
+                                    f"last {unchanged_streak} actions — they "
+                                    "are having no effect"))
                             unchanged_streak = 0
+                            stuck_rescues += 1
+                            if stuck_rescues >= 3:
+                                stuck_rescues = 0
+                                answer = await ask_user(STUCK_ASK_USER)
+                                target["content"] = _note(
+                                    target["content"],
+                                    f"[user replied]: {answer}")
                     else:
                         unchanged_streak = 0
+                        stuck_rescues = 0
                         content = target["content"]
                         if isinstance(content, str):
                             target["content"] = [
@@ -1633,6 +1689,36 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
         await ws.send_text(json.dumps({"type": "pong"}))
 
 
+# Shell payload spawned by POST /api/update on gut-bot (deb) installs. It
+# must run outside gut-bot.service — the deb's postinst restarts the service
+# and its whole cgroup, so the updater goes through systemd-run (or setsid
+# on non-systemd hosts). Args: <status-file> <version> <arch> <repo>.
+SELF_UPDATE_SCRIPT = """#!/bin/sh
+STATUS="$1"; TARGET="$2"; ARCH="$3"; REPO="${4:-valteryde/gut}"
+say() {
+  err=""
+  [ $# -gt 1 ] && err=$(printf '%s' "$2" | tr -dc 'a-zA-Z0-9 ._-')
+  printf '{"state":"%s","target":"%s","error":"%s","ts":%s}\\n' "$1" "$TARGET" "$err" "$(date +%s)" > "$STATUS"
+}
+say downloading
+TMP=$(mktemp -d)
+cd "$TMP" || { say failed "mktemp failed"; exit 1; }
+BASE="https://github.com/$REPO/releases/download/v$TARGET"
+DEB="gut-bot_${TARGET}_${ARCH}.deb"
+curl -fsSL -o pkg.deb "$BASE/$DEB" || { say failed "download failed"; exit 1; }
+if curl -fsSL -o sums.txt "$BASE/SHA256SUMS.txt"; then
+  want=$(awk -v f="$DEB" '$2 == f {print $1}' sums.txt)
+  if [ -n "$want" ]; then
+    printf '%s  %s\\n' "$want" pkg.deb | sha256sum -c - >/dev/null 2>&1 || { say failed "checksum mismatch"; exit 1; }
+  fi
+fi
+say installing
+sudo -n apt-get install -y "$TMP/pkg.deb" >/dev/null 2>&1 || { say failed "install failed"; exit 1; }
+say done
+rm -rf "$TMP"
+"""
+
+
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -1703,7 +1789,66 @@ async def api_version():
     """Unauthenticated handshake — the client probes this to detect a Gut
     backend and check compatibility before presenting credentials."""
     return {"version": GUT_VERSION, "device": DEVICE_NAME,
-            "auth": bool(GUT_API_TOKEN)}
+            "auth": bool(GUT_API_TOKEN), "install": INSTALL_KIND}
+
+
+def _update_status() -> dict:
+    try:
+        s = json.loads(UPDATE_STATUS_FILE.read_text())
+        if isinstance(s, dict):
+            return s
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"state": "idle"}
+
+
+@app.get("/api/update")
+async def api_update_status():
+    return {"supported": INSTALL_KIND == "deb", "install": INSTALL_KIND,
+            **_update_status()}
+
+
+@app.post("/api/update")
+async def api_update(body: dict = Body(default={})):
+    """Self-update for gut-bot deb installs: download the release deb and
+    install it detached — the package's postinst restarts this service, so
+    the updater must live outside the service's cgroup."""
+    if INSTALL_KIND != "deb":
+        raise HTTPException(400, "self-update needs a gut-bot install "
+                                 f"(this backend is '{INSTALL_KIND}')")
+    target = str(body.get("version") or "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", target):
+        raise HTTPException(400, "version must look like 1.2.3")
+    if state.running:
+        raise HTTPException(409, "agent is working — stop it first")
+    if _update_status().get("state") in ("starting", "downloading",
+                                         "installing"):
+        raise HTTPException(409, "update already in progress")
+    try:
+        arch = subprocess.check_output(
+            ["dpkg", "--print-architecture"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        arch = ""
+    if arch not in ("amd64", "arm64"):
+        raise HTTPException(400, f"no gut-bot build for arch '{arch or '?'}'")
+
+    script = GUT_DATA_DIR / "self-update.sh"
+    script.write_text(SELF_UPDATE_SCRIPT)
+    script.chmod(0o755)
+    cmd = ["/bin/sh", str(script), str(UPDATE_STATUS_FILE), target,
+           arch, GITHUB_REPO]
+    UPDATE_STATUS_FILE.write_text(json.dumps(
+        {"state": "starting", "target": target, "ts": int(time.time())}))
+    launched = False
+    if Path("/run/systemd/system").exists():
+        launched = subprocess.run(
+            ["sudo", "-n", "systemd-run", "-q", "--collect",
+             "--unit=gut-self-update", *cmd],
+            capture_output=True).returncode == 0
+    if not launched:
+        subprocess.Popen(["setsid", *cmd], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"ok": True, "target": target}
 
 
 @app.get("/api/device")

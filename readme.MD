@@ -10,6 +10,7 @@ An open-source, vendor-neutral AI desktop environment governed by a vision-enabl
 - **Native Desktop App:** The UI is an Electron app — it can run a local backend for you (it installs a container runtime itself), and/or connect to remote `gut-bot` servers.
 - **Client/Server Decoupling:** Run the backend on your workstation or host it on an unmanaged VPS. Point the app at any target IP/domain.
 - **Multi-Device Switching:** Keep a list of Gut backends in the app and hop between them — each device runs its own agent, so several can work in parallel. One agent per desktop environment.
+- **Backend Management:** Settings → Devices shows each backend's version and flags newer releases. gut-bot servers self-update in place from the app; the local stack pulls the matching desktop image.
 - **Persistent Conversations:** Every device stores its conversations — transcript plus model context — so you can revisit a thread and keep talking where the agent left off.
 - **Model Agnostic (BYOK):** Integrated with LiteLLM. Use Claude, GPT, Gemini, DeepSeek, OpenRouter (one key for hundreds of models), or local Ollama/vLLM weights.
 - **Live Dollar & Token Cost Tracking:** Transparent spend tracking per session and lifetime via LiteLLM metrics.
@@ -61,6 +62,9 @@ Then: add at least one provider key to `/etc/gut/gut-bot.env`,
 `sudo systemctl restart gut-litellm`, and add the machine as a device in
 the app (host = its IP, password = the printed one). Re-print credentials
 anytime with `gut-bot info`; manage with `gut-bot status|logs|restart`.
+The app shows the backend's version on its device row and can push a
+release update to it (`POST /api/update` installs the new deb and restarts
+the services).
 
 ### Develop
 
@@ -177,11 +181,11 @@ administers the proxy.
 
 ## Human-in-the-loop
 
-The screen is always interactive. Click **Take Over** to pause the agent
-between steps (banner appears over the desktop), do what only a human can —
-logins, 2FA, CAPTCHAs — then **Resume Agent**. The agent can also pause
-itself by calling `ask_user`, which surfaces a question in the chat (and a
-desktop notification when the app isn't focused).
+The screen is always interactive. Clicking or typing into it pauses the
+agent and hands you control between steps — do what only a human can
+(logins, 2FA, CAPTCHAs), then hit **Resume agent** in the chat. The agent
+can also pause itself by calling `ask_user`, which surfaces a question in
+the chat (and a desktop notification when the app isn't focused).
 
 ## Agent-to-user messaging
 

@@ -4,11 +4,15 @@ const { contextBridge, ipcRenderer } = require('electron');
 // app.js detects it is running inside Electron.
 contextBridge.exposeInMainWorld('gut', {
   isElectron: true,
+  platform: process.platform,
   localStatus: () => ipcRenderer.invoke('local:status'),
   localKeys: () => ipcRenderer.invoke('local:keys'),
+  saveLocalKeys: (keys) => ipcRenderer.invoke('local:save-keys', keys),
   installRuntime: () => ipcRenderer.invoke('local:install-runtime'),
   startLocal: (keys) => ipcRenderer.invoke('local:start', keys),
   stopLocal: () => ipcRenderer.invoke('local:stop'),
+  restartLocal: () => ipcRenderer.invoke('local:restart'),
+  updateLocal: () => ipcRenderer.invoke('local:update'),
   openExternal: (url) => ipcRenderer.invoke('shell:open', url),
   onLocalLog: (cb) => ipcRenderer.on('local:log', (_e, line) => cb(line)),
   updateState: () => ipcRenderer.invoke('update:state'),

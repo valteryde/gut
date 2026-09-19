@@ -33,7 +33,7 @@
           <div class="cp-row cp-total" id="cpLifeRow" hidden><span>All-time</span><b id="cpLife">$0.00</b></div>
         </div>
       </div>
-      <button id="settingsBtn" class="btn ghost" title="Settings and devices">Settings<span id="settingsDot" class="dot" hidden></span></button>
+      <button id="settingsBtn" class="btn ghost" title="Settings and devices"><svg class="ph" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M128,80a48,48,0,1,0,48,48A48.05,48.05,0,0,0,128,80Zm0,80a32,32,0,1,1,32-32A32,32,0,0,1,128,160Zm109.94-52.79a8,8,0,0,0-3.89-5.4l-29.83-17-.12-33.62a8,8,0,0,0-2.83-6.08,111.91,111.91,0,0,0-36.72-20.67,8,8,0,0,0-6.46.59L128,41.85,97.88,25a8,8,0,0,0-6.47-.6A112.1,112.1,0,0,0,54.73,45.15a8,8,0,0,0-2.83,6.07l-.15,33.65-29.83,17a8,8,0,0,0-3.89,5.4,106.47,106.47,0,0,0,0,41.56,8,8,0,0,0,3.89,5.4l29.83,17,.12,33.62a8,8,0,0,0,2.83,6.08,111.91,111.91,0,0,0,36.72,20.67,8,8,0,0,0,6.46-.59L128,214.15,158.12,231a7.91,7.91,0,0,0,3.9,1,8.09,8.09,0,0,0,2.57-.42,112.1,112.1,0,0,0,36.68-20.73,8,8,0,0,0,2.83-6.07l.15-33.65,29.83-17a8,8,0,0,0,3.89-5.4A106.47,106.47,0,0,0,237.94,107.21Zm-15,34.91-28.57,16.25a8,8,0,0,0-3,3c-.58,1-1.19,2.06-1.81,3.06a7.94,7.94,0,0,0-1.22,4.21l-.15,32.25a95.89,95.89,0,0,1-25.37,14.3L134,199.13a8,8,0,0,0-3.91-1h-.19c-1.21,0-2.43,0-3.64,0a8.08,8.08,0,0,0-4.1,1l-28.84,16.1A96,96,0,0,1,67.88,201l-.11-32.2a8,8,0,0,0-1.22-4.22c-.62-1-1.23-2-1.8-3.06a8.09,8.09,0,0,0-3-3.06l-28.6-16.29a90.49,90.49,0,0,1,0-28.26L61.67,97.63a8,8,0,0,0,3-3c.58-1,1.19-2.06,1.81-3.06a7.94,7.94,0,0,0,1.22-4.21l.15-32.25a95.89,95.89,0,0,1,25.37-14.3L122,56.87a8,8,0,0,0,4.1,1c1.21,0,2.43,0,3.64,0a8.08,8.08,0,0,0,4.1-1l28.84-16.1A96,96,0,0,1,188.12,55l.11,32.2a8,8,0,0,0,1.22,4.22c.62,1,1.23,2,1.8,3.06a8.09,8.09,0,0,0,3,3.06l28.6,16.29A90.49,90.49,0,0,1,222.9,142.12Z"/></svg>Settings<span id="settingsDot" class="dot" hidden></span></button>
     </div>
   </header>
 
@@ -57,9 +57,14 @@
 
       <div id="messages"></div>
 
+      <div id="takeoverBanner" hidden>
+        You have control &mdash; agent paused
+        <button id="resumeBtn">Resume agent</button>
+      </div>
+
       <form id="chatForm" autocomplete="off">
         <div class="composer">
-          <input id="chatInput" type="text" placeholder="Describe a task&hellip;" autofocus>
+          <textarea id="chatInput" rows="1" placeholder="Describe a task&hellip;" autofocus></textarea>
           <button type="button" id="stopBtn" class="btn danger" title="Stop the agent" hidden>Stop</button>
           <button type="submit" id="sendBtn" class="btn primary">Send</button>
         </div>
@@ -79,89 +84,92 @@
 
     <section id="desktopPane">
       <div id="screen"></div>
-      <button id="takeoverBtn" class="btn human screen-btn" title="Pause the agent and drive the desktop yourself">
-        <svg class="ph ic-hand" viewBox="0 0 256 256" aria-hidden="true"><path d="M196,88a27.86,27.86,0,0,0-13.35,3.39A28,28,0,0,0,144,74.7V44a28,28,0,0,0-56,0v80l-3.82-6.13A28,28,0,0,0,35.73,146l4.67,8.23C74.81,214.89,89.05,240,136,240a88.1,88.1,0,0,0,88-88V116A28,28,0,0,0,196,88Zm12,64a72.08,72.08,0,0,1-72,72c-37.63,0-47.84-18-81.68-77.68l-4.69-8.27,0-.05A12,12,0,0,1,54,121.61a11.88,11.88,0,0,1,6-1.6,12,12,0,0,1,10.41,6,1.76,1.76,0,0,0,.14.23l18.67,30A8,8,0,0,0,104,152V44a12,12,0,0,1,24,0v68a8,8,0,0,0,16,0V100a12,12,0,0,1,24,0v20a8,8,0,0,0,16,0v-4a12,12,0,0,1,24,0Z"/></svg>
-        <svg class="ph ic-bot" viewBox="0 0 256 256" aria-hidden="true"><path d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32-32V80A32,32,0,0,0,200,48Zm16,144a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V80A16,16,0,0,1,56,64H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24ZM72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z"/></svg>
-        <span id="takeoverLabel">Take over</span>
-      </button>
-      <div id="takeoverBanner" hidden>
-        You have control &mdash; agent paused
-        <button id="resumeBtn">Resume agent</button>
-      </div>
       <div id="screenStatus" class="screen-status">connecting&hellip;</div>
     </section>
-  </main>
+    <section id="settingsPage" hidden>
+      <div class="page-head">
+        <button type="button" id="settingsBack" class="btn ghost">← Back</button>
+        <h2>Settings</h2>
+      </div>
+      <div class="page-scroll">
+        <div class="page-body">
 
-  <dialog id="settingsDialog">
-    <form method="dialog" id="settingsForm">
-      <h3>Settings</h3>
-      <label class="check" title="Show the agent's working log (thoughts, tool calls, results) in the transcript">
-        <input type="checkbox" id="verboseToggle">
-        <span>Verbose working log
-          <small>Show thoughts, tool calls and results in the chat</small>
-        </span>
-      </label>
-      <div id="updateBox" hidden>
-        <h4 class="dlg-sub">App</h4>
-        <p id="updateStatus" class="hint">…</p>
-        <div id="updateBar" class="ubar" hidden><span id="updateFill"></span></div>
-        <div class="presets">
-          <button type="button" id="updateAction" class="preset">Check for updates</button>
+          <section class="set-sec" id="keysBox" hidden>
+            <h4 class="dlg-sub">Provider keys</h4>
+            <p class="hint">API keys for the models the local desktop can run —
+              stored in the stack's .env on this machine only. At least one is
+              required to start the local desktop; changes apply on its next
+              start.</p>
+            <div id="providerGrid" class="provider-grid"></div>
+          </section>
+
+          <section class="set-sec" id="localBox" hidden>
+            <h4 class="dlg-sub">Local desktop</h4>
+            <p id="localStatus" class="hint">checking…</p>
+            <div class="presets">
+              <button type="button" id="localAction" class="preset">…</button>
+              <button type="button" id="localRestart" class="preset" hidden>Restart</button>
+              <button type="button" id="localStop" class="preset" hidden>Stop</button>
+            </div>
+            <pre id="localLog" hidden></pre>
+          </section>
+
+          <section class="set-sec">
+            <div class="dev-head">
+              <h4 class="dlg-sub">Devices</h4>
+              <button type="button" id="newDevBtn" class="btn ghost">+ New device</button>
+            </div>
+            <div class="dev-cols">
+              <div id="deviceList" class="dev-list"></div>
+              <form id="devForm" class="dev-form">
+                <p id="devFormTitle" class="dev-form-title"></p>
+                <label>Name
+                  <input id="devNameInput" type="text" placeholder="Local docker, my VPS&hellip;">
+                </label>
+                <label>Host or domain
+                  <input id="hostInput" type="text" placeholder="127.0.0.1 or my-vps.example.com">
+                </label>
+                <div class="presets">
+                  <button type="button" class="preset" data-host="127.0.0.1">Localhost</button>
+                  <button type="button" class="preset" data-host="">VPS / remote</button>
+                </div>
+                <label>Password <small>(protects the desktop stream and agent API on that device)</small>
+                  <input id="vncPassInput" type="password" autocomplete="off">
+                </label>
+                <p class="hint">Each device is one Gut backend (agent :8000 &middot;
+                  desktop :6080) running at most one agent at a time. Rows show the
+                  backend's version and offer an update when a newer release exists.
+                  Click a row to edit it, or &ldquo;+ New device&rdquo; to add one.</p>
+                <menu>
+                  <button id="saveSettings" class="btn primary">Save</button>
+                </menu>
+              </form>
+            </div>
+          </section>
+
+          <section class="set-sec">
+            <h4 class="dlg-sub">General</h4>
+            <label class="check" title="Show the agent's working log (thoughts, tool calls, results) in the transcript">
+              <input type="checkbox" id="verboseToggle">
+              <span>Verbose working log
+                <small>Show thoughts, tool calls and results in the chat</small>
+              </span>
+            </label>
+          </section>
+
+          <section class="set-sec" id="updateBox" hidden>
+            <h4 class="dlg-sub">App</h4>
+            <p id="updateStatus" class="hint">…</p>
+            <div id="updateBar" class="ubar" hidden><span id="updateFill"></span></div>
+            <div class="presets">
+              <button type="button" id="updateAction" class="preset">Check for updates</button>
+            </div>
+          </section>
+
         </div>
       </div>
-      <div id="localBox" hidden>
-        <h4 class="dlg-sub">Local desktop</h4>
-        <p id="localStatus" class="hint">checking…</p>
-        <div class="presets">
-          <button type="button" id="localAction" class="preset">…</button>
-          <button type="button" id="localStop" class="preset" hidden>Stop</button>
-        </div>
-        <div class="local-keys">
-          <label>Anthropic API key
-            <input id="keyAnthropic" type="password" autocomplete="off" spellcheck="false">
-          </label>
-          <label>OpenAI API key
-            <input id="keyOpenai" type="password" autocomplete="off" spellcheck="false">
-          </label>
-          <label>Gemini API key
-            <input id="keyGemini" type="password" autocomplete="off" spellcheck="false">
-          </label>
-          <label>OpenRouter API key
-            <input id="keyOpenrouter" type="password" autocomplete="off" spellcheck="false">
-          </label>
-          <p class="hint">At least one provider key is required. Keys are
-            written to the local stack's .env on this machine only.</p>
-        </div>
-        <pre id="localLog" hidden></pre>
-      </div>
-      <div class="dev-head">
-        <h4 class="dlg-sub">Devices</h4>
-        <button type="button" id="newDevBtn" class="btn ghost">+ New device</button>
-      </div>
-      <div id="deviceList" class="dev-list"></div>
-      <p id="devFormTitle" class="dev-form-title"></p>
-      <label>Name
-        <input id="devNameInput" type="text" placeholder="Local docker, my VPS&hellip;">
-      </label>
-      <label>Host or domain
-        <input id="hostInput" type="text" placeholder="127.0.0.1 or my-vps.example.com">
-      </label>
-      <div class="presets">
-        <button type="button" class="preset" data-host="127.0.0.1">Localhost</button>
-        <button type="button" class="preset" data-host="">VPS / remote</button>
-      </div>
-      <label>Password <small>(protects the desktop stream and agent API on that device)</small>
-        <input id="vncPassInput" type="password" autocomplete="off">
-      </label>
-      <p class="hint">Each device is one Gut backend (agent :8000 &middot;
-        desktop :6080) running at most one agent at a time. Click a row to
-        edit it, or &ldquo;+ New device&rdquo; to add one.</p>
-      <menu>
-        <button type="button" id="cancelSettings" class="btn ghost">Cancel</button>
-        <button id="saveSettings" class="btn primary">Save</button>
-      </menu>
-    </form>
-  </dialog>
+    </section>
+  </main>
 
   <script type="module" src="app.js"></script>
 </body>

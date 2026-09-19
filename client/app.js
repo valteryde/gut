@@ -119,8 +119,6 @@ const cpConvRow = $('cpConvRow');
 const cpConv = $('cpConv');
 const cpLifeRow = $('cpLifeRow');
 const cpLife = $('cpLife');
-const takeoverBtn = $('takeoverBtn');
-const takeoverLabel = $('takeoverLabel');
 const takeoverBanner = $('takeoverBanner');
 const convTitleEl = $('convTitle');
 const chatInput = $('chatInput');
@@ -128,7 +126,7 @@ const screenStatusEl = $('screenStatus');
 const deviceSelect = $('deviceSelect');
 const modelSelect = $('modelSelect');
 const modelInfoEl = $('modelInfo');
-const settingsDialog = $('settingsDialog');
+const settingsPage = $('settingsPage');
 const deviceListEl = $('deviceList');
 const devNameInput = $('devNameInput');
 const hostInput = $('hostInput');
@@ -830,8 +828,6 @@ function switchDevice(id) {
   clearTranscript();
   takenOver = false;
   takeoverBanner.hidden = true;
-  takeoverLabel.textContent = 'Take over';
-  takeoverBtn.classList.remove('active');
   document.body.classList.remove('takeover');
   costHist.length = 0;
   drawSpark();
@@ -849,13 +845,10 @@ deviceSelect.onchange = () => switchDevice(deviceSelect.value);
 function setTakeover(on, silent = false) {
   takenOver = on;
   takeoverBanner.hidden = !on;
-  takeoverLabel.textContent = on ? 'Resume agent' : 'Take over';
-  takeoverBtn.classList.toggle('active', on);
   document.body.classList.toggle('takeover', on);
   if (!silent) send({ type: 'control', action: on ? 'pause' : 'resume' });
 }
 
-takeoverBtn.onclick = () => setTakeover(!takenOver);
 $('resumeBtn').onclick = () => setTakeover(false);
 stopBtn.onclick = () => send({ type: 'control', action: 'stop' });
 
@@ -870,6 +863,22 @@ $('screen').addEventListener('pointerdown', maybeAutoTakeover, true);
 $('screen').addEventListener('keydown', maybeAutoTakeover, true);
 
 // ── chat form ───────────────────────────────────────────────────────────
+// The composer grows with the draft up to a cap, then scrolls.
+const CHAT_INPUT_MAX_H = 160;
+function autosizeChatInput() {
+  chatInput.style.height = 'auto';
+  chatInput.style.height =
+    Math.min(chatInput.scrollHeight, CHAT_INPUT_MAX_H) + 'px';
+}
+chatInput.addEventListener('input', autosizeChatInput);
+// Enter sends, Shift+Enter inserts a newline.
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    $('chatForm').requestSubmit();
+  }
+});
+
 // Every message runs on the selected device with the conversation's model.
 // One agent per device: a busy device rejects (or the client short-circuits).
 $('chatForm').onsubmit = async (e) => {
@@ -878,6 +887,7 @@ $('chatForm').onsubmit = async (e) => {
   if (!text) return;
   if (awaitingAnswer) {
     chatInput.value = '';
+    autosizeChatInput();
     awaitingAnswer = false;
     chatInput.placeholder = TASK_PLACEHOLDER;
     send({ type: 'answer', text });
@@ -902,6 +912,7 @@ $('chatForm').onsubmit = async (e) => {
     }
   }
   chatInput.value = '';
+  autosizeChatInput();
   // Rendered when the daemon echoes the stored event back over the socket.
   send({ type: 'task', conversation_id: activeConvId, text });
 };
@@ -933,19 +944,143 @@ verboseToggle.onchange = () => {
 // window.gut exists only inside the Electron shell; it manages a local
 // Docker stack on this machine (see electron/localstack.js).
 const gut = window.gut || null;
+if (gut) {
+  document.body.classList.add('is-electron');
+  if (gut.platform === 'darwin') document.body.classList.add('is-mac');
+}
 const localBox = $('localBox');
 const localStatusEl = $('localStatus');
 const localActionBtn = $('localAction');
+const localRestartBtn = $('localRestart');
 const localStopBtn = $('localStop');
 const localLogEl = $('localLog');
 let localState = null;
+let localKeysSet = {};
+// Sticky status line — refreshLocal() keeps showing it until the next
+// action, so failures aren't wiped by the refresh that follows them.
+let localNote = null;
 
-const KEY_INPUTS = {
-  ANTHROPIC_API_KEY: $('keyAnthropic'),
-  OPENAI_API_KEY: $('keyOpenai'),
-  GEMINI_API_KEY: $('keyGemini'),
-  OPENROUTER_API_KEY: $('keyOpenrouter'),
-};
+// Provider keys for the local stack — one card per vendor (mirrors
+// PROVIDER_KEYS in electron/localstack.js; logos are the simple-icons
+// marks). Each card leads with the vendor's logo and the models its key
+// unlocks; "Add key" expands an inline paste field that writes straight
+// into the stack's .env via IPC — no desktop start required.
+const PROVIDERS = [
+  { key: 'ANTHROPIC_API_KEY', name: 'Anthropic',
+    models: 'Claude Sonnet 4.5 · Haiku 4.5',
+    icon: 'M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z' },
+  { key: 'OPENAI_API_KEY', name: 'OpenAI',
+    models: 'GPT-5 · GPT-4o',
+    icon: 'M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z' },
+  { key: 'GEMINI_API_KEY', name: 'Gemini',
+    models: 'Gemini 2.5 Pro · Flash',
+    icon: 'M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81' },
+  { key: 'DEEPSEEK_API_KEY', name: 'DeepSeek',
+    models: 'DeepSeek Chat — text only',
+    icon: 'M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45' },
+  { key: 'OPENROUTER_API_KEY', name: 'OpenRouter',
+    models: 'Claude · GPT · Qwen via one key',
+    icon: 'M16.778 1.844v1.919q-.569-.026-1.138-.032-.708-.008-1.415.037c-1.93.126-4.023.728-6.149 2.237-2.911 2.066-2.731 1.95-4.14 2.75-.396.223-1.342.574-2.185.798-.841.225-1.753.333-1.751.333v4.229s.768.108 1.61.333c.842.224 1.789.575 2.185.799 1.41.798 1.228.683 4.14 2.75 2.126 1.509 4.22 2.11 6.148 2.236.88.058 1.716.041 2.555.005v1.918l7.222-4.168-7.222-4.17v2.176c-.86.038-1.611.065-2.278.021-1.364-.09-2.417-.357-3.979-1.465-2.244-1.593-2.866-2.027-3.68-2.508.889-.518 1.449-.906 3.822-2.59 1.56-1.109 2.614-1.377 3.978-1.466.667-.044 1.418-.017 2.278.02v2.176L24 6.014Z' },
+];
+
+const keysBox = $('keysBox');
+const providerGrid = $('providerGrid');
+const providerCards = {};
+let editingKey = null;
+
+function provBtn(text, cls = '') {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = `btn ${cls}`.trim();
+  b.textContent = text;
+  return b;
+}
+
+async function saveProviderKey(key, value) {
+  try {
+    localKeysSet = await gut.saveLocalKeys({ [key]: value });
+  } catch (e) {
+    localNote = `Could not save the key: ${e?.message || 'error'}`;
+    refreshLocal();
+  }
+  editingKey = null;
+  renderProviderKeys();
+}
+
+function renderProviderKeys() {
+  for (const p of PROVIDERS) {
+    const c = providerCards[p.key];
+    const set = !!localKeysSet[p.key];
+    const editing = editingKey === p.key;
+    c.state.textContent = set ? 'Key saved' : 'No key';
+    c.state.classList.toggle('set', set);
+    // A refresh mid-edit must not wipe the paste field.
+    if (editing && c.actions.querySelector('.prov-key-input')) continue;
+    c.actions.innerHTML = '';
+    if (editing) {
+      const input = document.createElement('input');
+      input.className = 'prov-key-input';
+      input.dataset.envKey = p.key;
+      input.type = 'password';
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.placeholder = `Paste your ${p.name} key…`;
+      const save = provBtn('Save', 'primary');
+      const cancel = provBtn('Cancel', 'ghost');
+      const commit = () => {
+        const v = input.value.trim();
+        if (v) saveProviderKey(p.key, v);
+        else { editingKey = null; renderProviderKeys(); }
+      };
+      save.onclick = commit;
+      cancel.onclick = () => { editingKey = null; renderProviderKeys(); };
+      input.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(); }
+        else if (e.key === 'Escape') {
+          e.stopPropagation();  // don't close the page too
+          editingKey = null;
+          renderProviderKeys();
+        }
+      };
+      c.actions.append(input, save, cancel);
+      input.focus();
+    } else if (set) {
+      const replace = provBtn('Replace');
+      replace.onclick = () => { editingKey = p.key; renderProviderKeys(); };
+      const remove = provBtn('Remove', 'danger');
+      remove.onclick = () => {
+        if (confirm(`Remove the ${p.name} key? Its models stop working ` +
+                   'the next time the local desktop starts.')) {
+          saveProviderKey(p.key, '');
+        }
+      };
+      c.actions.append(replace, remove);
+    } else {
+      const add = provBtn(`Add ${p.name} key`);
+      add.classList.add('grow');
+      add.onclick = () => { editingKey = p.key; renderProviderKeys(); };
+      c.actions.append(add);
+    }
+  }
+}
+
+for (const p of PROVIDERS) {
+  const card = document.createElement('div');
+  card.className = 'prov-card';
+  card.innerHTML =
+    `<div class="prov-head">` +
+    `<svg class="prov-logo" viewBox="0 0 24 24" aria-hidden="true">` +
+    `<path d="${p.icon}"/></svg>` +
+    `<div class="prov-id"><div class="prov-name">${p.name}</div>` +
+    `<div class="prov-models">${p.models}</div></div>` +
+    `<span class="prov-state"></span></div>` +
+    `<div class="prov-actions"></div>`;
+  providerGrid.appendChild(card);
+  providerCards[p.key] = {
+    state: card.querySelector('.prov-state'),
+    actions: card.querySelector('.prov-actions'),
+  };
+}
 
 function notify(title, text) {
   if (!gut || !document.hidden || typeof Notification === 'undefined') return;
@@ -956,24 +1091,30 @@ function notify(title, text) {
 async function refreshLocal() {
   if (!gut) return;
   localBox.hidden = false;
+  keysBox.hidden = false;
   localState = await gut.localStatus();
-  const set = await gut.localKeys();
-  for (const [k, input] of Object.entries(KEY_INPUTS)) {
-    input.placeholder = set[k] ? '•••••• set' : 'not set';
-  }
+  localKeysSet = await gut.localKeys();
+  renderProviderKeys();
   if (localState.runtime === 'missing') {
-    localStatusEl.textContent =
+    localStatusEl.textContent = localNote ||
       'Docker not found — needed to run a desktop on this machine.';
     localActionBtn.textContent = 'Install container runtime';
     localStopBtn.hidden = true;
+    localRestartBtn.hidden = true;
   } else if (localState.stack === 'running') {
-    localStatusEl.textContent = `Local desktop is running (${localState.image}).`;
+    localStatusEl.textContent = localNote ||
+      `Local desktop is running (${localState.image})` +
+      (localState.agent === false ? ' — agent not answering on :8000' : '') +
+      '.';
     localActionBtn.textContent = 'Reconnect';
     localStopBtn.hidden = false;
+    localRestartBtn.hidden = false;
   } else {
-    localStatusEl.textContent = 'Docker is ready — start the local desktop.';
+    localStatusEl.textContent = localNote ||
+      'Docker is ready — start the local desktop.';
     localActionBtn.textContent = 'Start local desktop';
     localStopBtn.hidden = true;
+    localRestartBtn.hidden = true;
   }
 }
 
@@ -1061,31 +1202,35 @@ if (gut) {
   localActionBtn.onclick = async () => {
     if (!localState) return;
     localActionBtn.disabled = true;
+    localNote = null;
     localLogEl.hidden = false;
     localLogEl.textContent = '';
     try {
       if (localState.runtime === 'missing') {
         const r = await gut.installRuntime();
         if (r.needsManual) {
-          localStatusEl.textContent =
+          localNote =
             'Docker install docs opened — install it, then click again.';
         } else if (!r.ok) {
-          localStatusEl.textContent = `Install failed: ${r.error}`;
+          localNote = `Install failed: ${r.error}`;
         }
       } else if (localState.stack === 'running') {
         switchDevice('local');
       } else {
+        // Any key still sitting in an open paste field goes along too —
+        // start() writes it into .env before bringing the stack up.
         const keys = {};
-        for (const [k, input] of Object.entries(KEY_INPUTS)) {
-          if (input.value.trim()) keys[k] = input.value.trim();
+        for (const input of providerGrid.querySelectorAll('.prov-key-input')) {
+          const v = input.value.trim();
+          if (v) keys[input.dataset.envKey] = v;
         }
         localStatusEl.textContent = 'Starting local desktop…';
         const r = await gut.startLocal(keys);
         if (r.ok) {
           upsertLocalDevice(r.host, r.password);
-          for (const input of Object.values(KEY_INPUTS)) input.value = '';
+          editingKey = null;
         } else {
-          localStatusEl.textContent = `Start failed: ${r.error || 'see log'}`;
+          localNote = `Start failed: ${r.error || 'see log'}`;
         }
       }
     } finally {
@@ -1095,13 +1240,192 @@ if (gut) {
   };
 
   localStopBtn.onclick = async () => {
+    localNote = null;
     localStatusEl.textContent = 'Stopping…';
     await gut.stopLocal();
     refreshLocal();
   };
+
+  localRestartBtn.onclick = async () => {
+    localRestartBtn.disabled = true;
+    localNote = null;
+    localStatusEl.textContent = 'Restarting the local stack…';
+    localLogEl.hidden = false;
+    localLogEl.textContent = '';
+    try {
+      const r = await gut.restartLocal();
+      if (!r?.ok) {
+        localNote = `Restart failed: ${r?.error || 'see log'}`;
+      }
+    } finally {
+      localRestartBtn.disabled = false;
+      refreshLocal();
+    }
+  };
+}
+
+// ── backend versions & updates ──────────────────────────────────────────
+// Each device row is probed against the backend's public /api/version and
+// compared with the latest GitHub release (one tag drives the app, the
+// docker image and the deb). Where the install kind allows it the row gets
+// an update button: deb backends self-update via POST /api/update, the
+// Electron-managed local stack pulls a new image.
+const devInfo = {};        // id -> {version, install, offline, updating, …}
+let latestRelease = null;  // {version, url}
+
+function semverGt(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map(Number);
+  const pb = String(b).replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
+function devFetch(d, path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (d.vncPassword) headers.Authorization = `Bearer ${d.vncPassword}`;
+  return fetch(`${httpScheme}://${d.host}:${AGENT_PORT}${path}`,
+               { ...opts, headers });
+}
+
+async function probeDevice(d) {
+  // Mutate in place — a row may carry UI state (updating, updateError) that
+  // a probe must not wipe.
+  const cur = devInfo[d.id] || (devInfo[d.id] = {});
+  cur.pending = true;
+  try {
+    const r = await devFetch(d, '/api/version');
+    if (!r.ok) throw new Error(String(r.status));
+    const j = await r.json();
+    Object.assign(cur, { version: j.version, install: j.install,
+                         device: j.device, offline: false });
+  } catch (_) {
+    cur.offline = true;
+  }
+  cur.pending = false;
+}
+
+async function checkLatestRelease() {
+  try {
+    const r = await fetch(
+      'https://api.github.com/repos/valteryde/gut/releases/latest',
+      { headers: { Accept: 'application/vnd.github+json' } });
+    if (!r.ok) return;
+    const rel = await r.json();
+    const version = String(rel.tag_name || '').replace(/^v/, '');
+    if (version) latestRelease = { version, url: rel.html_url };
+  } catch (_) { /* offline or rate-limited */ }
+}
+
+function refreshDeviceInfo() {
+  Promise.all([checkLatestRelease(), ...cfg.devices.map(probeDevice)])
+    .then(() => { if (settingsOpen()) renderDeviceList(); });
+}
+
+// The update affordance for a device row, or null when nothing applies.
+function deviceUpdate(d, info) {
+  if (!info || info.offline || !info.version) return null;
+  if (info.updating) {
+    return { label: `${info.updateState || 'updating'}…`, enabled: false };
+  }
+  const isLocalDocker = gut && d.id === 'local' && info.install === 'docker';
+  if (isLocalDocker) {
+    const tag = (localState?.image || '').split(':').pop();
+    if (tag && tag !== 'latest' && semverGt(tag, info.version)) {
+      return { label: `↑ v${tag}`, enabled: true,
+        title: `Pull the v${tag} desktop image and restart the local stack` };
+    }
+    return null;
+  }
+  if (!latestRelease || !semverGt(latestRelease.version, info.version)) {
+    return null;
+  }
+  if (info.install === 'deb') {
+    return { label: `↑ v${latestRelease.version}`, enabled: true,
+      title: `Install gut-bot v${latestRelease.version} on ${d.host} — ` +
+             'the device disconnects for a moment while services restart' };
+  }
+  return { label: `v${latestRelease.version} out`, enabled: false,
+    title: 'Update the image or package on the host — this install kind ' +
+           'cannot self-update' };
+}
+
+async function updateDevice(d) {
+  const info = devInfo[d.id];
+  if (!info || info.updating) return;
+  const isLocalDocker = gut && d.id === 'local' && info.install === 'docker';
+  const target = isLocalDocker
+    ? (localState?.image || '').split(':').pop()
+    : latestRelease?.version;
+  if (!target) return;
+  info.updating = true;
+  delete info.updateError;
+  renderDeviceList();
+  try {
+    if (isLocalDocker) {
+      const r = await gut.updateLocal();
+      if (!r?.ok) throw new Error(r?.error || 'update failed');
+    } else {
+      const r = await devFetch(d, '/api/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: target }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+    }
+    await waitForVersion(d, target, info);
+  } catch (e) {
+    info.updateError = e.message || 'update failed';
+  } finally {
+    info.updating = false;
+    delete info.updateState;
+    await probeDevice(d);
+    if (settingsOpen()) renderDeviceList();
+  }
+}
+
+// The daemon drops mid-update while its services restart — poll the public
+// version endpoint until it answers on the target (or give up).
+async function waitForVersion(d, target, info) {
+  for (let i = 0; i < 48; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    let failed = null;
+    try {
+      const r = await devFetch(d, '/api/update');
+      if (r.ok) {
+        const s = await r.json();
+        if (s.state && s.state !== 'idle') info.updateState = s.state;
+        if (s.state === 'failed') failed = s.error || 'update failed';
+      }
+      await probeDevice(d);
+    } catch (_) { /* device down mid-restart — keep polling */ }
+    if (settingsOpen()) renderDeviceList();
+    if (failed) throw new Error(failed);
+    if (devInfo[d.id]?.version === target) return;
+  }
+  throw new Error('timed out — the device may still be updating');
 }
 
 // ── settings / device manager ───────────────────────────────────────────
+// Settings is a page, not a modal: it swaps in for the chat/desktop panes
+// so the sections (keys, local stack, devices) get the full window width.
+const settingsOpen = () => !settingsPage.hidden;
+
+function openSettings() {
+  settingsPage.hidden = false;
+  document.body.classList.add('settings-open');
+}
+
+function closeSettings() {
+  settingsPage.hidden = true;
+  document.body.classList.remove('settings-open');
+}
+
 // editingDevId === null means the form is in "new device" mode.
 let editingDevId = null;
 
@@ -1137,6 +1461,18 @@ function renderDeviceList() {
     label.type = 'button';
     label.className = 'dev-label';
     label.textContent = `${d.name} — ${d.host}`;
+    const info = devInfo[d.id];
+    if (!info) {
+      // Lazily probe rows rendered before the settings-open refresh lands.
+      probeDevice(d).then(() => {
+        if (settingsOpen()) renderDeviceList();
+      });
+    }
+    const ver = document.createElement('span');
+    ver.className = 'dev-ver';
+    ver.textContent = info?.offline ? '· offline'
+      : info?.version ? `· v${info.version}` : '';
+    label.appendChild(ver);
     if (d.id === activeDev().id) {
       const tag = document.createElement('span');
       tag.className = 'dev-active';
@@ -1144,6 +1480,21 @@ function renderDeviceList() {
       label.appendChild(tag);
     }
     label.onclick = () => fillDeviceForm(d);
+    const upd = deviceUpdate(d, info);
+    if (upd) {
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.className = 'dev-update';
+      up.textContent = upd.label;
+      up.title = upd.title || '';
+      up.disabled = !upd.enabled;
+      if (info?.updateError) {
+        up.title = `last attempt failed: ${info.updateError}`;
+        up.classList.add('failed');
+      }
+      up.onclick = (e) => { e.stopPropagation(); updateDevice(d); };
+      row.appendChild(up);
+    }
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'dev-del';
@@ -1171,12 +1522,19 @@ function removeDevice(id) {
 }
 
 $('settingsBtn').onclick = () => {
+  if (settingsOpen()) { closeSettings(); return; }
   fillDeviceForm(activeDev());
   refreshLocal();
-  settingsDialog.showModal();
+  refreshDeviceInfo();
+  openSettings();
 };
 
-document.querySelectorAll('.preset').forEach(btn => {
+$('settingsBack').onclick = closeSettings;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && settingsOpen() && !editingKey) closeSettings();
+});
+
+document.querySelectorAll('.preset[data-host]').forEach(btn => {
   btn.onclick = () => {
     hostInput.value = btn.dataset.host || '';
     if (!btn.dataset.host) hostInput.focus();
@@ -1184,9 +1542,9 @@ document.querySelectorAll('.preset').forEach(btn => {
 });
 
 newDevBtn.onclick = newDeviceForm;
-$('cancelSettings').onclick = () => settingsDialog.close();
 
-$('settingsForm').addEventListener('submit', () => {
+$('devForm').addEventListener('submit', (e) => {
+  e.preventDefault();
   const fields = {
     name: devNameInput.value.trim() || hostInput.value.trim() || 'Device',
     host: hostInput.value.trim() || '127.0.0.1',
@@ -1202,6 +1560,7 @@ $('settingsForm').addEventListener('submit', () => {
     saveDevices();
     populateDeviceSelect();
     switchDevice(d.id);
+    newDeviceForm();  // the page stays open — reset for the next add
     return;
   }
   const d = cfg.devices.find(d => d.id === editingDevId);
@@ -1216,6 +1575,7 @@ $('settingsForm').addEventListener('submit', () => {
     loadModels();
     loadConversations();
   }
+  renderDeviceList();
 });
 
 // ── chat pane width ─────────────────────────────────────────────────────
@@ -1226,8 +1586,11 @@ if (savedChatW) chatPane.style.width = savedChatW + 'px';
 let chatWTimer;
 new ResizeObserver(() => {
   clearTimeout(chatWTimer);
-  chatWTimer = setTimeout(
-    () => localStorage.setItem('gut.chatWidth', chatPane.offsetWidth), 200);
+  chatWTimer = setTimeout(() => {
+    // The pane reports 0 while the settings page hides it — don't persist that.
+    if (chatPane.offsetWidth)
+      localStorage.setItem('gut.chatWidth', chatPane.offsetWidth);
+  }, 200);
 }).observe(chatPane);
 
 // ── boot ────────────────────────────────────────────────────────────────
@@ -1239,13 +1602,16 @@ loadConversations();
 setInterval(loadModels, 30000);
 setTimeout(loadModels, 1500);
 
-// Electron first-run: nothing running yet → drop straight into the local
-// desktop setup panel.
+// Electron first-run: nothing configured yet → drop straight into the local
+// desktop setup panel. "Configured" = a provider key was saved or the device
+// list was touched — without that, a stopped stack pops this on every launch.
 if (gut) {
   refreshLocal().then(() => {
-    if (localState && localState.stack !== 'running' && cfg.devices.length <= 1) {
+    const fresh = !localStorage.getItem('gut.devices') &&
+      !Object.values(localKeysSet).some(Boolean);
+    if (fresh && localState && localState.stack !== 'running') {
       fillDeviceForm(activeDev());
-      settingsDialog.showModal();
+      openSettings();
     }
   });
 }

@@ -59,6 +59,10 @@ function createWindow() {
     minWidth: 960,
     minHeight: 600,
     title: 'gut',
+    // macOS: hide the native title bar; the in-page #topbar is the drag
+    // region and sits under the inset traffic lights.
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 14, y: 12 },
     backgroundColor: '#14161a',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -84,11 +88,16 @@ function createWindow() {
 app.whenReady().then(() => {
   ipcMain.handle('local:status', () => local.status());
   ipcMain.handle('local:keys', () => local.keysSet());
+  ipcMain.handle('local:save-keys', (_e, keys) => local.saveKeys(keys || {}));
   ipcMain.handle('local:install-runtime', (e) =>
     local.installRuntime((line) => e.sender.send('local:log', line)));
   ipcMain.handle('local:start', (e, keys) =>
     local.start(keys || {}, (line) => e.sender.send('local:log', line)));
   ipcMain.handle('local:stop', () => local.stop());
+  ipcMain.handle('local:restart', (e) =>
+    local.restart((line) => e.sender.send('local:log', line)));
+  ipcMain.handle('local:update', (e) =>
+    local.update((line) => e.sender.send('local:log', line)));
   ipcMain.handle('shell:open', (_e, url) => {
     if (/^https?:\/\//.test(String(url))) shell.openExternal(url);
   });
