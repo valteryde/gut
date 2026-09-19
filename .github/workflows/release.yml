@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Resolve version
+        shell: bash
         run: |
           V="${{ github.event.inputs.version || github.ref_name }}"
           echo "VERSION=${V#v}" >> "$GITHUB_ENV"
@@ -63,6 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Resolve version
+        shell: bash
         run: |
           V="${{ github.event.inputs.version || github.ref_name }}"
           echo "VERSION=${V#v}" >> "$GITHUB_ENV"
@@ -90,6 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Resolve version
+        shell: bash
         run: |
           V="${{ github.event.inputs.version || github.ref_name }}"
           echo "VERSION=${V#v}" >> "$GITHUB_ENV"
@@ -116,6 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Resolve version
+        shell: bash
         run: |
           V="${{ github.event.inputs.version || github.ref_name }}"
           echo "VERSION=${V#v}" >> "$GITHUB_ENV"
