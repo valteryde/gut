@@ -1,0 +1,22 @@
+[Unit]
+Description=Gut desktop agent (Xvfb + XFCE4 + VNC + agent daemon)
+After=gut-litellm.service
+Requires=gut-litellm.service
+
+[Service]
+Type=simple
+User=gut
+Group=gut
+Environment=HOME=/var/lib/gut
+Environment=DISPLAY=:0
+Environment=PATH=/opt/gut/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LITELLM_URL=http://127.0.0.1:4000
+Environment=GUT_DATA_DIR=/var/lib/gut/.gut
+EnvironmentFile=/etc/gut/gut-bot.env
+WorkingDirectory=/var/lib/gut
+ExecStart=/opt/gut/start.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

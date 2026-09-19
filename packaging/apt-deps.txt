@@ -1,0 +1,35 @@
+# Single source of truth for the desktop stack's system dependencies.
+# Consumed by:
+#   - backend/Dockerfile          (gut-desktop image)
+#   - packaging/build-deb.sh      (gut-bot .deb Depends: line)
+# Browser and postgres are handled per-format: the image picks google-chrome
+# (amd64) or chromium (arm64); the deb always uses chromium + postgresql.
+xvfb
+x11vnc
+websockify
+novnc
+xfce4
+xfce4-terminal
+dbus-x11
+libreoffice-writer
+libreoffice-calc
+libreoffice-impress
+scrot
+xdotool
+x11-utils
+xclip
+wmctrl
+python3
+python3-venv
+python3-pip
+python3-tk
+fonts-liberation
+fonts-dejavu-core
+fonts-noto-color-emoji
+xdg-utils
+curl
+wget
+ca-certificates
+gnupg
+sudo
+procps

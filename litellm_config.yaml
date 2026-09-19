@@ -1,0 +1,76 @@
+# LiteLLM proxy configuration for Gut.
+# Add/remove entries under model_list to taste — every `api_key` reads from
+# the environment, so keys stay in .env and out of this file.
+#
+# IMPORTANT for the agent: screenshot perception requires a *vision-capable*
+# model (claude-*, gpt-4o, gemini-*, qwen-vl, llava, …). Text-only models
+# will run but the agent will be blind.
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+
+litellm_settings:
+  # Keep request/response bodies out of spend logs by default.
+  store_prompts_in_spend_logs: false
+  # Generous timeout for long agent turns.
+  request_timeout: 600
+
+model_list:
+  # ── Direct providers (uncomment if you set the matching *_API_KEY) ────────
+  # - model_name: claude-sonnet-4-5
+  #   litellm_params:
+  #     model: anthropic/claude-sonnet-4-5-20250929
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+  #     max_tokens: 8192
+  #
+  # - model_name: gpt-4o
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: os.environ/OPENAI_API_KEY
+  #     max_tokens: 8192
+  #
+  # - model_name: gemini-2.5-pro
+  #   litellm_params:
+  #     model: gemini/gemini-2.5-pro
+  #     api_key: os.environ/GEMINI_API_KEY
+  #     max_tokens: 8192
+  #
+  # - model_name: deepseek-chat
+  #   litellm_params:
+  #     model: deepseek/deepseek-chat
+  #     api_key: os.environ/DEEPSEEK_API_KEY
+  #     max_tokens: 8192
+
+  # ── OpenRouter (one key → hundreds of models) ─────────────────────────────
+  # Any model from https://openrouter.ai/models works via
+  # `model: openrouter/<provider>/<model>`; keep to vision-capable ones.
+  - model_name: openrouter/claude-sonnet-4.5
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8192
+
+  - model_name: openrouter/gpt-5
+    litellm_params:
+      model: openrouter/openai/gpt-5
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8192
+
+  - model_name: openrouter/gemini-2.5-pro
+    litellm_params:
+      model: openrouter/google/gemini-2.5-pro
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8192
+
+  - model_name: openrouter/qwen3-vl
+    litellm_params:
+      model: openrouter/qwen/qwen3-vl-235b-a22b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8192
+
+  # ── Local / self-hosted example (uncomment and adapt) ─────────────────────
+  # - model_name: ollama-qwen-vl
+  #   litellm_params:
+  #     model: ollama/qwen2.5vl:7b
+  #     api_base: os.environ/OLLAMA_API_BASE

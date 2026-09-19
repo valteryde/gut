@@ -1,0 +1,35 @@
+{
+  "name": "gut",
+  "productName": "gut",
+  "version": "0.1.0",
+  "description": "Self-hosted AI desktop agent",
+  "main": "main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^37.4.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "dev.gut.app",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "preload.js", "localstack.js"],
+    "extraResources": [
+      { "from": "../client", "to": "client" }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dmg", "zip"]
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "linux": {
+      "category": "Utility",
+      "target": ["AppImage"]
+    }
+  }
+}

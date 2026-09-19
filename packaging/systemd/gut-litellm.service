@@ -1,0 +1,18 @@
+[Unit]
+Description=Gut LiteLLM proxy
+After=postgresql.service network.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=gut
+Group=gut
+EnvironmentFile=/etc/gut/gut-bot.env
+# Localhost-only: only the agent daemon talks to it, and the admin UI would
+# otherwise expose the master key to the LAN.
+ExecStart=/opt/gut/venv/bin/litellm --config /etc/gut/litellm.yaml --host 127.0.0.1 --port 4000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

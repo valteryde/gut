@@ -1,0 +1,77 @@
+name: gut
+
+# Dev compose — builds the backend image from source. End users get the
+# Electron app (which runs this same stack from prebuilt GHCR images) or the
+# gut-bot deb; there is no browser client anymore.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm-db-password}
+      POSTGRES_DB: litellm
+    volumes:
+      - litellm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:-litellm-db-password}@db:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+
+  desktop:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        GUT_VERSION: ${GUT_VERSION:-dev}
+    restart: unless-stopped
+    shm_size: 2gb
+    env_file: .env
+    environment:
+      DISPLAY: :0
+      RESOLUTION: ${RESOLUTION:-1024x768}
+      # One password protects both the desktop stream and the agent API.
+      VNC_PASSWORD: ${GUT_PASSWORD:-}
+      GUT_API_TOKEN: ${GUT_PASSWORD:-}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-sonnet-4-5}
+      DEVICE_NAME: ${DEVICE_NAME:-local}
+    ports:
+      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
+      - "127.0.0.1:${AGENT_PORT:-8000}:8000"
+    volumes:
+      - chrome-profile:/home/agent/.gut-chrome
+      - desktop-home:/home/agent
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+volumes:
+  litellm-pgdata:
+  chrome-profile:
+  desktop-home:

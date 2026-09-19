@@ -1,0 +1,1058 @@
+/* ── fonts (vendored at image build — see client/Dockerfile) ── */
+@font-face {
+  font-family: "DM Sans";
+  src: url("vendor/fonts/DMSans%5Bopsz%2Cwght%5D.ttf") format("truetype");
+  font-weight: 100 1000;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("vendor/fonts/JetBrainsMono%5Bwght%5D.ttf") format("truetype");
+  font-weight: 100 800;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("vendor/fonts/JetBrainsMono-Italic%5Bwght%5D.ttf") format("truetype");
+  font-weight: 100 800;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* ── design tokens ───────────────────────────────────────── */
+:root {
+  color-scheme: light;
+
+  /* warm paper */
+  --bg: #f4f0e7;
+  --surface: #fbf8f2;
+  --surface-2: #f3efe6;
+  --surface-3: #e9e4d9;
+  --line: #e3ded2;
+  --line-strong: #cfc9bb;
+  --text: #1e1d1a;
+  --text-2: #615e56;
+  --text-3: #918d83;
+
+  /* mint — the agent */
+  --mint: #5ee3bd;
+  --mint-hover: #4dd7af;
+  --mint-soft: #dcf5ec;
+  --mint-line: #a5e6d2;
+  --mint-ink: #146b50;
+  --on-mint: #0f2a22;
+
+  /* clay — the human */
+  --clay: #dd8f6b;
+  --clay-hover: #d27f5a;
+  --clay-soft: #f9e6db;
+  --clay-line: #ecc3ad;
+  --clay-ink: #9c4a29;
+  --on-clay: #2a1810;
+
+  /* trouble */
+  --bad: #b23a2e;
+  --bad-bg: #f8e5e1;
+  --bad-line: #e5b5ac;
+
+  --radius: 4px;
+  --radius-card: 6px;
+  --control-h: 32px;
+  --sans: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+body { display: flex; flex-direction: column; }
+
+::selection { background: var(--mint-soft); }
+
+/* small tracked-uppercase mono labels — the "eyebrow" */
+.msg .who,
+.typing-text,
+.screen-status,
+#topbar .btn,
+.screen-btn,
+.presets .preset,
+dialog label {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ── top bar ─────────────────────────────────────────────── */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  height: 56px;
+  padding: 0 20px;
+  flex: none;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 600;
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+
+/* two overlapping dots: mint agent, clay human */
+.brand .mark {
+  position: relative;
+  width: 20px;
+  height: 12px;
+  flex: none;
+}
+.brand .mark::before,
+.brand .mark::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+.brand .mark::before { left: 0; background: var(--mint); }
+.brand .mark::after {
+  right: 0;
+  background: var(--clay);
+  box-shadow: 0 0 0 2px var(--bg);
+}
+
+.topbar-controls {
+  margin-left: auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* ── controls ────────────────────────────────────────────── */
+select, input, button {
+  font: inherit;
+  color: inherit;
+  margin: 0;
+}
+
+select,
+input[type="text"],
+input[type="password"] {
+  height: var(--control-h);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 0 10px;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+:is(input[type="text"], input[type="password"]):hover { border-color: var(--text-3); }
+:is(select, input[type="text"], input[type="password"]):focus {
+  outline: none;
+  border-color: var(--mint-ink);
+  box-shadow: 0 0 0 3px var(--mint-soft);
+}
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  font-family: var(--mono);
+  font-size: 12px;
+  max-width: 260px;
+  cursor: pointer;
+  background-color: transparent;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M1 1l4 4 4-4' stroke='%23615e56' fill='none' stroke-width='1.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+select:hover { border-color: var(--text-3); }
+
+button:focus-visible {
+  outline: 2px solid var(--mint-ink);
+  outline-offset: 2px;
+}
+
+input::placeholder { color: var(--text-3); }
+
+.btn, button {
+  height: var(--control-h);
+  padding: 0 14px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+button:hover { background: var(--surface-2); }
+
+button.primary {
+  background: var(--mint);
+  border-color: var(--mint);
+  color: var(--on-mint);
+}
+button.primary:hover {
+  background: var(--mint-hover);
+  border-color: var(--mint-hover);
+}
+
+button.ghost {
+  border-color: transparent;
+  color: var(--text-2);
+}
+button.ghost:hover { background: var(--surface-3); color: var(--text); }
+
+button.danger { color: var(--bad); border-color: var(--bad-line); }
+button.danger:hover { background: var(--bad-bg); }
+
+/* hands control to the human … */
+button.human { color: var(--clay-ink); border-color: var(--clay-line); }
+button.human:hover { background: var(--clay-soft); }
+/* … and, once taken over, hands it back to the agent */
+button.human.active {
+  background: var(--mint);
+  border-color: var(--mint);
+  color: var(--on-mint);
+}
+button.human.active:hover {
+  background: var(--mint-hover);
+  border-color: var(--mint-hover);
+}
+
+/* ── usage meter ─────────────────────────────────────────── */
+/* pill in the top bar; hover/focus opens the breakdown card */
+.cost-wrap { position: relative; }
+
+.cost {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  cursor: default;
+}
+.cost:hover,
+.cost:focus-visible {
+  background: var(--surface-2);
+  color: var(--text);
+  outline: none;
+}
+.cost .ph { width: 14px; height: 14px; color: var(--text-3); }
+#costNum { font-weight: 600; }
+.cost-tok { color: var(--text-3); }
+/* mint flash as the number ticks up */
+.cost.tick { animation: cost-tick 0.7s ease-out; }
+@keyframes cost-tick {
+  0% {
+    background: var(--mint-soft);
+    color: var(--mint-ink);
+    box-shadow: 0 0 0 3px var(--mint-soft);
+  }
+  100% { box-shadow: 0 0 0 3px transparent; }
+}
+
+.cost-pop {
+  position: absolute;
+  top: calc(100% + 9px);
+  right: 0;
+  z-index: 20;
+  width: 214px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: 0 10px 30px rgba(30, 29, 26, 0.16);
+  font-size: 12.5px;
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition: opacity 0.15s, transform 0.15s;
+}
+.cost-wrap:hover .cost-pop,
+.cost-wrap:focus-within .cost-pop {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+.cp-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.cp-head span {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.cp-head b { font-family: var(--mono); font-size: 17px; font-weight: 600; }
+#costSpark {
+  display: block;
+  width: 100%;
+  height: 36px;
+  margin: 6px 0 8px;
+}
+#costSpark .line { fill: none; stroke: var(--mint-ink); stroke-width: 1.5; }
+#costSpark .fill { fill: var(--mint-soft); }
+.cp-rows { display: flex; flex-direction: column; gap: 3px; }
+.cp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-2);
+}
+.cp-row b { font-family: var(--mono); font-weight: 500; color: var(--text); }
+.cp-total {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+/* ── layout ──────────────────────────────────────────────── */
+main {
+  flex: 1;
+  display: flex;
+  gap: 14px;
+  padding: 0 16px 16px;
+  min-height: 0;
+}
+
+#chatPane {
+  width: 440px;
+  min-width: 340px;
+  max-width: 60vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  resize: horizontal;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ── agent status line ───────────────────────────────────── */
+#agentBar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 50px;
+  padding: 10px 12px 10px 8px;
+  flex: none;
+  border-bottom: 1px solid var(--line);
+}
+
+.agent-id {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+#convTitle {
+  font-weight: 500;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn.icon { padding: 0 9px; font-size: 15px; }
+
+#activityLine {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#activityLine:empty { display: none; }
+
+/* ── transcript ──────────────────────────────────────────── */
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 18px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+#messages:empty::before {
+  content: "Give the agent a task.";
+  display: block;
+  margin: 6px 0 8px;
+  font-size: 22px;
+  font-weight: 300;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+}
+#messages:empty::after {
+  content: "Sending starts a conversation on the selected device — reopen it anytime from ☰. The agent works the desktop on the right and checks in when it has something to say; click into the screen to take control.";
+  display: block;
+  max-width: 36ch;
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+.msg {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  column-gap: 12px;
+  align-items: baseline;
+  padding: 2px 0;
+  line-height: 22px;
+}
+.msg:not(.cont):not(:first-child) { margin-top: 14px; }
+
+.msg .who {
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.msg .body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-width: 0;
+}
+
+/* your own messages need no label — position and clay say "you";
+   the span stays in the DOM (visually hidden) for screen readers */
+.msg.user {
+  display: flex;
+  justify-content: flex-end;
+}
+.msg.user .who {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.msg.user .body {
+  max-width: 85%;
+  padding: 6px 12px;
+  background: var(--clay-soft);
+  border: 1px solid var(--clay-line);
+  border-radius: var(--radius-card);
+}
+
+/* agent-side entries drop the name column — colour and the clay band
+   already mark the speaker; the span stays in the DOM (visually hidden)
+   for screen readers */
+.msg.agent, .msg.file, .msg.image, .msg.question, .msg.typing {
+  grid-template-columns: minmax(0, 1fr);
+}
+.msg.agent .who, .msg.file .who, .msg.image .who,
+.msg.question .who, .msg.typing .who {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* errors keep their tag, but inline — no reserved column */
+.msg.error { display: flex; gap: 12px; align-items: baseline; }
+.msg.error .who { flex: none; color: var(--bad); }
+
+/* typing indicator: a transcript row pinned where the reply will land —
+   the two brand dots glide through each other horizontally, always
+   overlapping */
+.msg.typing .body { display: flex; align-items: center; gap: 8px; }
+.msg.typing .dots {
+  position: relative;
+  flex: none;
+  width: 11px;
+  height: 7px;
+}
+.msg.typing .dots::before,
+.msg.typing .dots::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  animation: dot-slide 2.4s ease-in-out infinite;
+}
+.msg.typing .dots::before { left: 0; background: var(--mint); }
+.msg.typing .dots::after {
+  left: 4px;
+  background: var(--clay);
+  animation-name: dot-slide-back;
+}
+/* non-running phases swap the dots for a text label */
+.msg.typing:not([data-phase="running"]) .dots { display: none; }
+.typing-text { color: var(--text-3); }
+.msg.typing[data-phase="waiting_user"] .typing-text,
+.msg.typing[data-phase="paused"] .typing-text { color: var(--clay-ink); }
+.typing-text:empty { display: none; }
+
+@keyframes dot-slide {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(4px); }
+}
+@keyframes dot-slide-back {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(-4px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg.typing .dots::before,
+  .msg.typing .dots::after { animation: none; }
+}
+
+/* full-bleed band: clay when the agent needs you */
+.msg.question {
+  margin-left: -18px;
+  margin-right: -18px;
+  padding: 10px 18px 10px 16px;
+  border-left: 2px solid var(--clay);
+  background: var(--clay-soft);
+}
+
+/* working log — hidden unless the verbose toggle is on. Verbose entries
+   never carry a label, so they drop the chat's 76px label column and run
+   as a compact full-width stream. */
+.verbose-only { display: none; }
+body.verbose .verbose-only { display: grid; }
+.msg.verbose-only {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 1px 0;
+}
+.msg.verbose-only .who { display: none; }
+/* a thought opens a new think→act beat — small gap groups each cycle */
+.msg.thought { margin-top: 10px; }
+
+.msg.thought .body,
+.msg.action .body {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 16px;
+  color: var(--text-2);
+}
+.msg.thought .body { font-style: italic; color: var(--text-3); }
+
+/* file + image deliveries */
+.file-note { margin: 0 0 8px; }
+
+.file-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  text-decoration: none;
+  transition: border-color 0.12s, background 0.12s;
+}
+.file-link:hover { background: var(--surface); border-color: var(--line-strong); }
+.file-name { font-family: var(--mono); font-size: 12px; }
+.file-size { font-size: 12px; color: var(--text-3); }
+
+.msg-img {
+  display: block;
+  max-width: 100%;
+  max-height: 300px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.img-caption { margin: 6px 0 0; font-size: 12.5px; color: var(--text-2); }
+
+/* ── conversation drawer ─────────────────────────────────── */
+#convDrawer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+.drawer-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 50px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 600;
+}
+.drawer-device { color: var(--text-3); font-weight: 400; }
+
+#convList {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+}
+
+.conv-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.conv-row:hover { background: var(--surface-2); }
+.conv-row.active { background: var(--mint-soft); }
+
+.conv-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.conv-title {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.run-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--mint);
+  box-shadow: 0 0 0 3px var(--mint-soft);
+  flex: none;
+}
+
+.conv-del {
+  flex: none;
+  height: 24px;
+  padding: 0 7px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 15px;
+}
+.conv-del:hover { color: var(--bad); background: transparent; }
+
+.conv-empty {
+  margin: 0;
+  padding: 14px 10px;
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* ── composer ────────────────────────────────────────────── */
+#chatForm {
+  flex: none;
+  padding: 14px 18px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.composer { display: flex; gap: 8px; }
+.composer :is(input, button) { height: 38px; }
+
+#chatInput {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border-color: var(--line);
+  padding: 0 12px;
+}
+#chatInput:focus { background: var(--surface); }
+
+/* device + model pickers: a status strip flush with the composer's bottom */
+.composer-meta {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 12px -18px -16px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: 0 0 var(--radius-card) var(--radius-card);
+}
+/* each picker is a ghost chip: phosphor icon + borderless select */
+.chip {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  padding: 0 4px 0 7px;
+  border-radius: var(--radius);
+  color: var(--text-3);
+  cursor: pointer;
+  min-width: 0;
+  flex: none;
+}
+.chip.grow { flex: 0 1 auto; }
+.chip:hover { background: var(--surface-3); }
+.chip:hover,
+.chip:focus-within { color: var(--text-2); }
+.chip:focus-within { box-shadow: 0 0 0 3px var(--mint-soft); }
+.chip .ph { width: 13px; height: 13px; flex: none; }
+.chip select {
+  height: 24px;
+  padding: 0 18px 0 3px;
+  border-color: transparent;
+  background-color: transparent;
+  background-position: right 3px center;
+  color: var(--text-2);
+  font-size: 11px;
+  min-width: 0;
+}
+.chip:hover select { color: var(--text); }
+.chip select:focus {
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+}
+.chip #deviceSelect { max-width: 130px; }
+.chip #modelSelect { max-width: none; }
+/* quiet one-liner describing the selected model, right edge of the strip */
+.model-info {
+  margin-left: auto;
+  padding-left: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* ── desktop pane ────────────────────────────────────────── */
+#desktopPane {
+  flex: 1;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+/* the frame shows who is driving */
+body[data-agent="running"] #desktopPane { border-color: var(--mint); }
+body.takeover #desktopPane { border-color: var(--clay); }
+
+/* takeover floats over the pane it controls, top-right */
+.screen-btn {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--surface);
+  box-shadow: 0 2px 10px rgba(30, 29, 26, 0.12);
+}
+.screen-btn .ph { width: 15px; height: 15px; flex: none; }
+.screen-btn .ic-bot { display: none; }
+.screen-btn.active .ic-hand { display: none; }
+.screen-btn.active .ic-bot { display: inline; }
+
+/* a slim gutter on every side keeps the stream framed — the ambient
+   backdrop shows through it, so the pane always reads as a letterbox */
+#screen {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  position: relative;
+  padding: 14px;
+  box-sizing: border-box;
+}
+#screen canvas { max-width: 100%; }
+#screen > div { position: relative; z-index: 1; }
+
+/* a hairline edge separates the stream from the backdrop — a soft drop
+   shadow just reads as a dirty halo against the light desktop */
+#screen > div canvas {
+  background: var(--surface-2);
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--line);
+}
+
+/* blurred echo of the stream behind noVNC's canvas (ambient letterbox) */
+#screenBackdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  filter: blur(48px) saturate(1.35) brightness(0.75);
+}
+
+.screen-status {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  color: var(--text-2);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  pointer-events: none;
+}
+.screen-status:empty { display: none; }
+
+#takeoverBanner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--clay-soft);
+  border: 1px solid var(--clay-line);
+  color: var(--clay-ink);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 6px 6px 14px;
+  border-radius: var(--radius);
+  white-space: nowrap;
+}
+#takeoverBanner button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  background: var(--mint);
+  border-color: var(--mint);
+  color: var(--on-mint);
+}
+#takeoverBanner button:hover {
+  background: var(--mint-hover);
+  border-color: var(--mint-hover);
+}
+
+/* ── settings dialog ─────────────────────────────────────── */
+dialog {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 24px;
+  width: 400px;
+}
+dialog::backdrop { background: rgba(30, 29, 26, 0.4); }
+
+dialog h3 {
+  margin: 0 0 16px;
+  font-size: 22px;
+  font-weight: 300;
+  letter-spacing: -0.015em;
+}
+dialog label {
+  display: block;
+  margin: 18px 0 0;
+  color: var(--text-3);
+}
+dialog label small {
+  font-size: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+}
+dialog input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
+}
+#hostInput { font-family: var(--mono); font-size: 12.5px; }
+dialog .hint {
+  color: var(--text-3);
+  font-size: 12.5px;
+  margin: 14px 0 0;
+}
+
+/* ── electron: local desktop box (settings dialog) ─────────── */
+#localBox {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-top: 18px;
+}
+#localBox .dlg-sub { margin: 0 0 8px; }
+#localStatus { margin-top: 0; }
+.local-keys label { margin-top: 10px; font-size: 12.5px; }
+.local-keys input { font-family: var(--mono); font-size: 12px; }
+#localLog {
+  margin: 12px 0 0;
+  max-height: 140px;
+  overflow: auto;
+  background: var(--surface-2, rgba(0,0,0,.15));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-3);
+}
+dialog menu {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0;
+  margin: 24px 0 0;
+}
+
+.presets {
+  display: flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.presets .preset {
+  flex: 1;
+  height: 30px;
+  border: 0;
+  border-radius: 0;
+  color: var(--text-2);
+}
+.presets .preset + .preset { border-left: 1px solid var(--line-strong); }
+.presets .preset:hover { background: var(--surface-2); color: var(--text); }
+
+/* device manager rows */
+dialog .dlg-sub {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+dialog label.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  color: var(--text);
+  cursor: pointer;
+}
+dialog label.check input {
+  display: inline-block;
+  width: auto;
+  margin: 0;
+  accent-color: var(--mint-ink);
+}
+dialog label.check small {
+  display: block;
+  font-family: var(--sans);
+  color: var(--text-3);
+}
+.dev-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 22px 0 14px;
+}
+.dev-head .dlg-sub { margin: 0; }
+#newDevBtn { flex: none; }
+#newDevBtn.active {
+  border-color: var(--mint-ink);
+  background: var(--mint-soft);
+  color: var(--text);
+}
+.dev-form-title {
+  margin: 16px 0 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mint-ink);
+}
+.dev-active {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: var(--mint-soft);
+  color: var(--mint-ink);
+  font-size: 10px;
+}
+.dev-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+.dev-row { display: flex; gap: 6px; }
+.dev-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dev-row.editing .dev-label {
+  border-color: var(--mint-ink);
+  background: var(--mint-soft);
+}
+.dev-del { flex: none; width: 32px; padding: 0; color: var(--text-3); }
+.dev-del:hover { color: var(--bad); }
+
+/* narrow screens: chat on top */
+@media (max-width: 760px) {
+  main { flex-direction: column; gap: 10px; padding: 0 10px 10px; }
+  #chatPane {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    height: 46%;
+    resize: none;
+  }
+  .cost { display: none; }
+}

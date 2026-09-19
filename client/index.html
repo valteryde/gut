@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gut — AI desktop</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="topbar">
+    <span class="brand"><span class="mark" aria-hidden="true"></span>gut</span>
+
+    <div class="topbar-controls">
+      <div class="cost-wrap">
+        <span id="costPill" class="cost" tabindex="0" title="Session spend — hover for the breakdown">
+          <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M184,89.57V84c0-25.08-37.83-44-88-44S8,58.92,8,84v40c0,20.89,26.25,37.49,64,42.46V172c0,25.08,37.83,44,88,44s88-18.92,88-44V132C248,111.3,222.58,94.68,184,89.57ZM232,132c0,13.22-30.79,28-72,28-3.73,0-7.43-.13-11.08-.37C170.49,151.77,184,139,184,124V105.74C213.87,110.19,232,122.27,232,132ZM72,150.25V126.46A183.74,183.74,0,0,0,96,128a183.74,183.74,0,0,0,24-1.54v23.79A163,163,0,0,1,96,152,163,163,0,0,1,72,150.25Zm96-40.32V124c0,8.39-12.41,17.4-32,22.87V123.5C148.91,120.37,159.84,115.71,168,109.93ZM96,56c41.21,0,72,14.78,72,28s-30.79,28-72,28S24,97.22,24,84,54.79,56,96,56ZM24,124V109.93c8.16,5.78,19.09,10.44,32,13.57v23.37C36.41,141.4,24,132.39,24,124Zm64,48v-4.17c2.63.1,5.29.17,8,.17,3.88,0,7.67-.13,11.39-.35A121.92,121.92,0,0,0,120,171.41v23.46C100.41,189.4,88,180.39,88,172Zm48,26.25V174.4a179.48,179.48,0,0,0,24,1.6,183.74,183.74,0,0,0,24-1.54v23.79a165.45,165.45,0,0,1-48,0Zm64-3.38V171.5c12.91-3.13,23.84-7.79,32-13.57V172C232,180.39,219.59,189.4,200,194.87Z"/></svg>
+          <span id="costNum">$0.00</span><span id="costTok" class="cost-tok"></span>
+        </span>
+        <div id="costPop" class="cost-pop">
+          <div class="cp-head"><span>This session</span><b id="cpSession">$0.00</b></div>
+          <svg id="costSpark" viewBox="0 0 168 36" preserveAspectRatio="none" hidden>
+            <path id="costSparkFill" class="fill"></path>
+            <path id="costSparkLine" class="line"></path>
+          </svg>
+          <div class="cp-rows">
+            <div class="cp-row"><span>Tokens in</span><b id="cpIn">0</b></div>
+            <div class="cp-row"><span>Tokens out</span><b id="cpOut">0</b></div>
+            <div class="cp-row" id="cpConvRow" hidden><span>This conversation</span><b id="cpConv">$0.00</b></div>
+          </div>
+          <div class="cp-row cp-total" id="cpLifeRow" hidden><span>All-time</span><b id="cpLife">$0.00</b></div>
+        </div>
+      </div>
+      <button id="settingsBtn" class="btn ghost" title="Settings and devices">Settings</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="chatPane">
+      <div id="agentBar">
+        <button id="convBtn" class="btn ghost icon" title="Conversations on this device">☰</button>
+        <div class="agent-id">
+          <span id="convTitle">New conversation</span>
+          <span id="activityLine"></span>
+        </div>
+      </div>
+
+      <div id="convDrawer" hidden>
+        <div class="drawer-head">
+          <span>Conversations <span id="drawerDevice" class="drawer-device"></span></span>
+          <button id="newConvBtn" class="btn primary">+ New</button>
+        </div>
+        <div id="convList"></div>
+      </div>
+
+      <div id="messages"></div>
+
+      <form id="chatForm" autocomplete="off">
+        <div class="composer">
+          <input id="chatInput" type="text" placeholder="Describe a task&hellip;" autofocus>
+          <button type="button" id="stopBtn" class="btn danger" title="Stop the agent" hidden>Stop</button>
+          <button type="submit" id="sendBtn" class="btn primary">Send</button>
+        </div>
+        <div class="composer-meta">
+          <label class="chip" title="Device — which desktop environment runs your messages">
+            <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M208,40H48A24,24,0,0,0,24,64V176a24,24,0,0,0,24,24h72v16H96a8,8,0,0,0,0,16h64a8,8,0,0,0,0-16H136V200h72a24,24,0,0,0,24-24V64A24,24,0,0,0,208,40ZM48,56H208a8,8,0,0,1,8,8v80H40V64A8,8,0,0,1,48,56ZM208,184H48a8,8,0,0,1-8-8V160H216v16A8,8,0,0,1,208,184Z"/></svg>
+            <select id="deviceSelect"></select>
+          </label>
+          <label class="chip grow" title="Agent model for this conversation">
+            <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32-32V80A32,32,0,0,0,200,48Zm16,144a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V80A16,16,0,0,1,56,64H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24ZM72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z"/></svg>
+            <select id="modelSelect"></select>
+          </label>
+          <span id="modelInfo" class="model-info"></span>
+        </div>
+      </form>
+    </section>
+
+    <section id="desktopPane">
+      <div id="screen"></div>
+      <button id="takeoverBtn" class="btn human screen-btn" title="Pause the agent and drive the desktop yourself">
+        <svg class="ph ic-hand" viewBox="0 0 256 256" aria-hidden="true"><path d="M196,88a27.86,27.86,0,0,0-13.35,3.39A28,28,0,0,0,144,74.7V44a28,28,0,0,0-56,0v80l-3.82-6.13A28,28,0,0,0,35.73,146l4.67,8.23C74.81,214.89,89.05,240,136,240a88.1,88.1,0,0,0,88-88V116A28,28,0,0,0,196,88Zm12,64a72.08,72.08,0,0,1-72,72c-37.63,0-47.84-18-81.68-77.68l-4.69-8.27,0-.05A12,12,0,0,1,54,121.61a11.88,11.88,0,0,1,6-1.6,12,12,0,0,1,10.41,6,1.76,1.76,0,0,0,.14.23l18.67,30A8,8,0,0,0,104,152V44a12,12,0,0,1,24,0v68a8,8,0,0,0,16,0V100a12,12,0,0,1,24,0v20a8,8,0,0,0,16,0v-4a12,12,0,0,1,24,0Z"/></svg>
+        <svg class="ph ic-bot" viewBox="0 0 256 256" aria-hidden="true"><path d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32-32V80A32,32,0,0,0,200,48Zm16,144a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V80A16,16,0,0,1,56,64H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24ZM72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z"/></svg>
+        <span id="takeoverLabel">Take over</span>
+      </button>
+      <div id="takeoverBanner" hidden>
+        You have control &mdash; agent paused
+        <button id="resumeBtn">Resume agent</button>
+      </div>
+      <div id="screenStatus" class="screen-status">connecting&hellip;</div>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" id="settingsForm">
+      <h3>Settings</h3>
+      <label class="check" title="Show the agent's working log (thoughts, tool calls, results) in the transcript">
+        <input type="checkbox" id="verboseToggle">
+        <span>Verbose working log
+          <small>Show thoughts, tool calls and results in the chat</small>
+        </span>
+      </label>
+      <div id="localBox" hidden>
+        <h4 class="dlg-sub">Local desktop</h4>
+        <p id="localStatus" class="hint">checking…</p>
+        <div class="presets">
+          <button type="button" id="localAction" class="preset">…</button>
+          <button type="button" id="localStop" class="preset" hidden>Stop</button>
+        </div>
+        <div class="local-keys">
+          <label>Anthropic API key
+            <input id="keyAnthropic" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <label>OpenAI API key
+            <input id="keyOpenai" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <label>Gemini API key
+            <input id="keyGemini" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <label>OpenRouter API key
+            <input id="keyOpenrouter" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <p class="hint">At least one provider key is required. Keys are
+            written to the local stack's .env on this machine only.</p>
+        </div>
+        <pre id="localLog" hidden></pre>
+      </div>
+      <div class="dev-head">
+        <h4 class="dlg-sub">Devices</h4>
+        <button type="button" id="newDevBtn" class="btn ghost">+ New device</button>
+      </div>
+      <div id="deviceList" class="dev-list"></div>
+      <p id="devFormTitle" class="dev-form-title"></p>
+      <label>Name
+        <input id="devNameInput" type="text" placeholder="Local docker, my VPS&hellip;">
+      </label>
+      <label>Host or domain
+        <input id="hostInput" type="text" placeholder="127.0.0.1 or my-vps.example.com">
+      </label>
+      <div class="presets">
+        <button type="button" class="preset" data-host="127.0.0.1">Localhost</button>
+        <button type="button" class="preset" data-host="">VPS / remote</button>
+      </div>
+      <label>Password <small>(protects the desktop stream and agent API on that device)</small>
+        <input id="vncPassInput" type="password" autocomplete="off">
+      </label>
+      <p class="hint">Each device is one Gut backend (agent :8000 &middot;
+        desktop :6080) running at most one agent at a time. Click a row to
+        edit it, or &ldquo;+ New device&rdquo; to add one.</p>
+      <menu>
+        <button type="button" id="cancelSettings" class="btn ghost">Cancel</button>
+        <button id="saveSettings" class="btn primary">Save</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

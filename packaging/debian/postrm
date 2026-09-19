@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  purge)
+    systemctl daemon-reload 2>/dev/null || true
+    deluser --quiet gut 2>/dev/null || true
+    rm -rf /var/lib/gut /etc/gut
+    # LiteLLM's postgres data is left in place — drop manually if unwanted:
+    #   su postgres -c "dropdb litellm; dropuser litellm"
+  ;;
+  remove|upgrade)
+    systemctl daemon-reload 2>/dev/null || true
+  ;;
+esac
+
+#DEBHELPER#
+exit 0

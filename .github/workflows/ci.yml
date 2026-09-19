@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build desktop image
+        run: docker build -f backend/Dockerfile --build-arg GUT_VERSION=ci -t gut-test .
+      - name: Smoke test — agent daemon answers /api/version
+        run: |
+          docker run -d --name gut -p 127.0.0.1:8000:8000 \
+            -e LITELLM_URL=http://127.0.0.1:1 gut-test
+          for i in $(seq 1 36); do
+            curl -sf http://127.0.0.1:8000/api/version && exit 0
+            sleep 5
+          done
+          docker logs gut
+          exit 1
+
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 deb inside debian:trixie
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src debian:trixie \
+            bash packaging/build-deb.sh 0.0.0-ci amd64 dist
+      - name: Install check (no systemd in container — services skipped)
+        run: |
+          docker run --rm -v "$PWD/dist:/dist" debian:trixie sh -c '
+            apt-get update -qq &&
+            apt-get install -y -qq /dist/gut-bot_0.0.0-ci_amd64.deb &&
+            gut-bot version && test -x /usr/bin/gut-bot &&
+            test -f /opt/gut/agent_daemon.py'
+
+  electron:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax check + package
+        working-directory: electron
+        run: |
+          node --check main.js && node --check preload.js && node --check localstack.js
+          npm install --no-audit --no-fund
+          npx electron-builder --dir --publish never

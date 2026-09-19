@@ -1,0 +1,95 @@
+#!/bin/sh
+set -e
+
+rand() { LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | head -c "${1:-24}"; }
+
+case "$1" in
+  configure)
+    # Unprivileged user owning the desktop session.
+    if ! getent passwd gut >/dev/null 2>&1; then
+      adduser --system --group --home /var/lib/gut --shell /bin/bash gut
+    fi
+    mkdir -p /var/lib/gut/Desktop /var/lib/gut/Documents /var/lib/gut/.gut-chrome
+    chown -R gut:gut /var/lib/gut
+
+    # Generated secrets — written once, kept across upgrades.
+    mkdir -p /etc/gut
+    if [ ! -f /etc/gut/gut-bot.env ]; then
+      PASS="$(rand 24)"
+      PGPASS="$(rand 24)"
+      MASTER="sk-$(rand 48)"
+      HOST="$(hostname)"
+      cat > /etc/gut/gut-bot.env <<EOF
+# gut-bot environment — generated at install time.
+# One password protects the desktop stream AND the agent API — it is what
+# you type into the Gut app's device settings.
+VNC_PASSWORD=${PASS}
+GUT_API_TOKEN=${PASS}
+
+LITELLM_MASTER_KEY=${MASTER}
+POSTGRES_PASSWORD=${PGPASS}
+DATABASE_URL=postgresql://litellm:${PGPASS}@127.0.0.1:5432/litellm
+
+RESOLUTION=1024x768
+UI_SCALE=1.0
+DEVICE_NAME=${HOST}
+# DEFAULT_MODEL=openrouter/claude-sonnet-4.5
+
+# Provider keys (BYOK) — fill whichever you use, then:
+#   systemctl restart gut-litellm
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+GEMINI_API_KEY=
+DEEPSEEK_API_KEY=
+OPENROUTER_API_KEY=
+EOF
+      chown root:gut /etc/gut/gut-bot.env
+      chmod 640 /etc/gut/gut-bot.env
+    fi
+    . /etc/gut/gut-bot.env
+
+    # Postgres role/db for LiteLLM spend tracking (idempotent). Skipped with
+    # a warning when postgres can't be reached (e.g. installing in a chroot).
+    systemctl start postgresql 2>/dev/null || service postgresql start 2>/dev/null || true
+    i=0
+    while [ $i -lt 15 ]; do
+      su -s /bin/sh postgres -c "pg_isready -q" >/dev/null 2>&1 && break
+      i=$((i + 1)); sleep 1
+    done
+    if su -s /bin/sh postgres -c "pg_isready -q" >/dev/null 2>&1; then
+      su -s /bin/sh postgres -c \
+        "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='litellm'\" | grep -q 1" \
+        || su -s /bin/sh postgres -c "createuser litellm"
+      su -s /bin/sh postgres -c \
+        "psql -c \"ALTER USER litellm WITH PASSWORD '${POSTGRES_PASSWORD}'\""
+      su -s /bin/sh postgres -c \
+        "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='litellm'\" | grep -q 1" \
+        || su -s /bin/sh postgres -c "createdb -O litellm litellm"
+    else
+      echo "gut-bot: postgres not reachable — db setup skipped; rerun" \
+           "'dpkg-reconfigure gut-bot' once it is up" >&2
+    fi
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload
+      systemctl enable gut-litellm.service gut-bot.service >/dev/null 2>&1 || true
+      systemctl restart gut-litellm.service gut-bot.service || true
+    fi
+
+    IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    cat <<EOF
+
+  gut-bot is up.
+    agent api : http://${IP:-<host>}:8000
+    desktop   : http://${IP:-<host>}:6080
+    password  : ${VNC_PASSWORD}
+
+  Add at least one model provider key in /etc/gut/gut-bot.env, then
+  'systemctl restart gut-litellm'. Re-print this panel with: gut-bot info
+
+EOF
+  ;;
+esac
+
+#DEBHELPER#
+exit 0

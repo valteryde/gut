@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    systemctl stop gut-bot.service gut-litellm.service 2>/dev/null || true
+    systemctl disable gut-bot.service gut-litellm.service 2>/dev/null || true
+  ;;
+  upgrade)
+    systemctl stop gut-bot.service gut-litellm.service 2>/dev/null || true
+  ;;
+esac
+
+#DEBHELPER#
+exit 0

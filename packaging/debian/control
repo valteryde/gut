@@ -1,0 +1,16 @@
+Package: gut-bot
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Gut <https://github.com/valteryde/gut>
+Section: net
+Priority: optional
+Depends: @DEPS@
+Description: Self-hosted AI desktop agent backend
+ A headless Linux desktop (Xvfb + XFCE4 + Chromium + LibreOffice) governed by
+ a vision-enabled agent, streamed over noVNC. Ships the agent daemon
+ (REST + WebSocket on :8000), the desktop stream (:6080) and a LiteLLM proxy
+ (:4000, localhost-only) with Postgres-backed spend tracking.
+ .
+ After install, `gut-bot info` prints the address and generated password;
+ point the Gut desktop app at it as a device.
+Homepage: https://github.com/valteryde/gut

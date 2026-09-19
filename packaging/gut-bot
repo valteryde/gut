@@ -1,0 +1,40 @@
+#!/bin/sh
+# gut-bot — manage this machine's Gut backend.
+# usage: gut-bot [info|status|start|stop|restart|logs|version]
+
+ENV_FILE=/etc/gut/gut-bot.env
+
+load_env() {
+  if [ ! -r "$ENV_FILE" ]; then
+    echo "gut-bot: cannot read $ENV_FILE — run with sudo" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+}
+
+cmd="${1:-info}"
+case "$cmd" in
+  info)
+    load_env
+    IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "gut-bot $(cat /opt/gut/VERSION 2>/dev/null || echo '?') — ${DEVICE_NAME:-$(hostname)}"
+    echo "  agent api : http://${IP:-<host>}:8000"
+    echo "  desktop   : http://${IP:-<host>}:6080"
+    echo "  password  : ${VNC_PASSWORD:-<unset>}"
+    echo "  litellm   : http://127.0.0.1:4000 (localhost only)"
+    echo
+    echo "config    : $ENV_FILE (add provider API keys there)"
+    echo "services  : gut-bot.service, gut-litellm.service"
+    ;;
+  status)   systemctl status gut-bot.service gut-litellm.service ;;
+  start)    systemctl start gut-litellm.service gut-bot.service ;;
+  stop)     systemctl stop gut-bot.service gut-litellm.service ;;
+  restart)  systemctl restart gut-litellm.service gut-bot.service ;;
+  logs)     journalctl -u gut-bot.service -u gut-litellm.service "${@:2}" ;;
+  version)  cat /opt/gut/VERSION ;;
+  *)
+    echo "usage: gut-bot [info|status|start|stop|restart|logs|version]" >&2
+    exit 2
+    ;;
+esac
