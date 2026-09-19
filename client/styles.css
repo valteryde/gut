@@ -936,6 +936,39 @@ dialog .hint {
   word-break: break-all;
   color: var(--text-3);
 }
+
+/* ── app updates ─────────────────────────────────────────── */
+#updateBox {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-top: 18px;
+}
+#updateBox .dlg-sub { margin: 0 0 8px; }
+#updateStatus { margin-top: 0; }
+.ubar {
+  height: 4px;
+  margin-top: 10px;
+  border-radius: 2px;
+  background: var(--surface-2, rgba(0,0,0,.15));
+  overflow: hidden;
+}
+.ubar span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--mint, #7fd8be);
+  transition: width .25s ease;
+}
+#settingsDot.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--mint, #7fd8be);
+  vertical-align: middle;
+}
 dialog menu {
   display: flex;
   justify-content: flex-end;

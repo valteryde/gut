@@ -33,7 +33,7 @@
           <div class="cp-row cp-total" id="cpLifeRow" hidden><span>All-time</span><b id="cpLife">$0.00</b></div>
         </div>
       </div>
-      <button id="settingsBtn" class="btn ghost" title="Settings and devices">Settings</button>
+      <button id="settingsBtn" class="btn ghost" title="Settings and devices">Settings<span id="settingsDot" class="dot" hidden></span></button>
     </div>
   </header>
 
@@ -101,6 +101,14 @@
           <small>Show thoughts, tool calls and results in the chat</small>
         </span>
       </label>
+      <div id="updateBox" hidden>
+        <h4 class="dlg-sub">App</h4>
+        <p id="updateStatus" class="hint">…</p>
+        <div id="updateBar" class="ubar" hidden><span id="updateFill"></span></div>
+        <div class="presets">
+          <button type="button" id="updateAction" class="preset">Check for updates</button>
+        </div>
+      </div>
       <div id="localBox" hidden>
         <h4 class="dlg-sub">Local desktop</h4>
         <p id="localStatus" class="hint">checking…</p>

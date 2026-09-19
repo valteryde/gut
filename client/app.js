@@ -989,7 +989,69 @@ function upsertLocalDevice(host, password) {
   switchDevice('local');
 }
 
+// ── electron: app updates ───────────────────────────────────────────────
+// Custom updater (electron/updater.js): downloads the release zip, swaps
+// the .app, relaunches — no Apple developer account needed.
+const updateBox = $('updateBox');
+const updateStatusEl = $('updateStatus');
+const updateActionBtn = $('updateAction');
+const updateBar = $('updateBar');
+const updateFill = $('updateFill');
+const settingsDot = $('settingsDot');
+let lastUpdateState = null;
+
+function renderUpdateState(s) {
+  if (!gut || !s) return;
+  lastUpdateState = s;
+  updateBox.hidden = false;
+  updateBar.hidden = s.status !== 'downloading';
+  updateActionBtn.disabled = s.status === 'checking' || s.status === 'downloading';
+  settingsDot.hidden = !(s.status === 'available' || s.status === 'downloaded');
+  switch (s.status) {
+    case 'checking':
+      updateStatusEl.textContent = 'Checking for updates…';
+      break;
+    case 'none':
+      updateStatusEl.textContent = 'gut is up to date.';
+      updateActionBtn.textContent = 'Check again';
+      break;
+    case 'available':
+      updateStatusEl.textContent = `gut v${s.version} is available.`;
+      updateActionBtn.textContent = 'Download update';
+      break;
+    case 'downloading': {
+      const p = s.progress || {};
+      updateFill.style.width = `${p.percent || 0}%`;
+      const mb = (n) => `${(n / 1e6).toFixed(0)} MB`;
+      updateStatusEl.textContent = p.total
+        ? `Downloading update — ${mb(p.transferred)} / ${mb(p.total)}`
+        : 'Downloading update…';
+      updateActionBtn.textContent = 'Downloading…';
+      break;
+    }
+    case 'downloaded':
+      updateStatusEl.textContent = `gut v${s.version || ''} downloaded — restart to apply.`;
+      updateActionBtn.textContent = 'Restart & update';
+      break;
+    case 'error':
+      updateStatusEl.textContent = `Update failed: ${s.error}`;
+      updateActionBtn.textContent = 'Retry';
+      break;
+    default:
+      updateStatusEl.textContent = 'Updates are checked in released builds.';
+      updateActionBtn.textContent = 'Check for updates';
+  }
+}
+
 if (gut) {
+  gut.onUpdateState(renderUpdateState);
+  gut.updateState().then(renderUpdateState);
+  updateActionBtn.onclick = () => {
+    const s = lastUpdateState?.status;
+    if (s === 'downloaded') gut.installUpdate();
+    else if (s === 'available') gut.downloadUpdate();
+    else gut.checkUpdate();
+  };
   gut.onLocalLog((line) => {
     localLogEl.hidden = false;
     localLogEl.textContent += `${line}\n`;

@@ -33,6 +33,12 @@ starts the stack and adds `127.0.0.1` as a device. Paste at least one model
 provider key (Anthropic / OpenAI / Gemini / OpenRouter) in Settings → Local
 desktop and you're running.
 
+**Updates:** the app checks GitHub Releases on launch (and every 6h) and
+offers new versions in Settings → App. On macOS it self-updates: downloads
+the release zip, swaps the `.app` bundle via a detached script and strips
+the quarantine bit — no Apple developer account or code signing needed.
+On Windows/Linux the button opens the release page instead.
+
 ### The backend on a server (`gut-bot`)
 
 On a Debian/Ubuntu machine or VPS — no Docker, no compose:

@@ -11,4 +11,10 @@ contextBridge.exposeInMainWorld('gut', {
   stopLocal: () => ipcRenderer.invoke('local:stop'),
   openExternal: (url) => ipcRenderer.invoke('shell:open', url),
   onLocalLog: (cb) => ipcRenderer.on('local:log', (_e, line) => cb(line)),
+  updateState: () => ipcRenderer.invoke('update:state'),
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  onUpdateState: (cb) =>
+    ipcRenderer.on('update:state', (_e, s) => cb(s)),
 });
