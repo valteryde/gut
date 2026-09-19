@@ -6,6 +6,8 @@
   "main": "main.js",
   "license": "MIT",
   "scripts": {
+    "postinstall": "node scripts/brand-electron.cjs",
+    "icons": "scripts/make-icons.sh",
     "start": "electron .",
     "dist": "electron-builder"
   },
@@ -16,19 +18,23 @@
   "build": {
     "appId": "dev.gut.app",
     "directories": { "output": "dist" },
-    "files": ["main.js", "preload.js", "localstack.js"],
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "files": ["main.js", "preload.js", "localstack.js", "updater.js"],
     "extraResources": [
       { "from": "../client", "to": "client" }
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "resources/icon.icns",
       "target": ["dmg", "zip"]
     },
     "win": {
+      "icon": "resources/icon.png",
       "target": ["nsis"]
     },
     "linux": {
       "category": "Utility",
+      "icon": "resources/icon.png",
       "target": ["AppImage"]
     }
   }
