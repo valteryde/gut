@@ -118,6 +118,15 @@ function keysSet() {
   return Object.fromEntries(PROVIDER_KEYS.map((k) => [k, !!env[k]]));
 }
 
+// The actual key values in .env — the app's own key store imports them so
+// a key entered once can be pushed to other devices without re-pasting.
+function keyValues() {
+  const env = readEnv();
+  return Object.fromEntries(PROVIDER_KEYS
+    .map((k) => [k, env[k]])
+    .filter(([, v]) => v && String(v).trim()));
+}
+
 // Non-destructive .env write: update only the given KEY=VALUE lines and
 // keep everything else (comments, secrets, port overrides) untouched.
 // Used for the dev repo's .env, which is hand-maintained.
@@ -472,4 +481,4 @@ async function update(log) {
 
 module.exports =
   { status, installRuntime, start, stop, restart, update, keysSet,
-    saveKeys };
+    keyValues, saveKeys };

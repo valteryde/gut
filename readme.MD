@@ -171,6 +171,13 @@ reports it via `GET /api/version`.
   work — the daemon registers them the same way at boot — and a pushed key
   overrides an env key for that provider. The app's own local stack is the
   exception: its keys go into the stack's `.env` on this machine.
+- **Local key store.** Keys you paste are also remembered by the app itself
+  (localStorage, next to the device passwords), and the Electron app folds
+  the local stack's `.env` keys in too — so a key used on one backend can
+  be pushed to another without re-pasting. The "Saved on this computer"
+  bar in Settings → Provider keys lists what's stored: push all to the
+  selected device, push one via a card's "Use saved key", or forget one.
+  Remote daemons never return key values, so only the app holds a copy.
 - **Architecture**: the Docker image ships Google Chrome on amd64 and Debian's
   `chromium` on arm64; gut-bot always uses `chromium` (Google doesn't publish
   an apt repo the deb can depend on). `google-chrome` is aliased either way.
@@ -198,7 +205,9 @@ administers the proxy.
 Provider keys entered in the app are uploaded to the device they belong to
 and stored there (the daemon's data dir plus LiteLLM's internal DB) — the
 agent needs them to call model providers, and anyone with the device
-password can read that store. They travel over plain HTTP like everything
+password can read that store. The app also keeps a copy locally so keys
+can be pushed to other devices (the "Saved on this computer" store in
+Settings → Provider keys). They travel over plain HTTP like everything
 else on :8000, so push keys only on networks you trust or put a TLS proxy
 in front.
 

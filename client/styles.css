@@ -215,6 +215,9 @@ button:focus-visible {
 }
 button:hover { background: var(--surface-2); }
 
+button:disabled { opacity: 0.45; cursor: default; }
+button:disabled:hover { background: transparent; }
+
 button.primary {
   background: var(--mint);
   border-color: var(--mint);
@@ -1024,6 +1027,35 @@ body.settings-open #desktopPane { display: none; }
   font-family: var(--mono);
   font-size: 12px;
 }
+
+/* the app's own key store — saved locally, pushed to devices on demand */
+.keystore {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+}
+.keystore-list {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.keystore-chip {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+#keystorePush { flex: none; }
 
 /* ── electron: local desktop ───────────────────────────────── */
 #localStatus, #updateStatus { margin-top: 4px; }

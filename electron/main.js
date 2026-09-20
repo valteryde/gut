@@ -88,6 +88,7 @@ function createWindow() {
 app.whenReady().then(() => {
   ipcMain.handle('local:status', () => local.status());
   ipcMain.handle('local:keys', () => local.keysSet());
+  ipcMain.handle('local:key-values', () => local.keyValues());
   ipcMain.handle('local:save-keys', (_e, keys) => local.saveKeys(keys || {}));
   ipcMain.handle('local:install-runtime', (e) =>
     local.installRuntime((line) => e.sender.send('local:log', line)));

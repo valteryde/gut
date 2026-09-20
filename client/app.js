@@ -1072,7 +1072,36 @@ const keysHintEl = $('keysHint');
 const keyStatusEl = $('keyStatus');
 const providerGrid = $('providerGrid');
 const providerCards = {};
+const keystoreBar = $('keystoreBar');
+const keystoreList = $('keystoreList');
+const keystorePush = $('keystorePush');
 let editingKey = null;
+
+// ── local key store ─────────────────────────────────────────────────────
+// Keys entered in the app are also kept on this computer (localStorage,
+// next to the device passwords) so a key used on one backend can be pushed
+// to another without re-pasting it. Nothing leaves the machine until an
+// explicit push; remote daemons never hand key values back.
+let vault = loadVault();
+
+function loadVault() {
+  try {
+    const v = JSON.parse(localStorage.getItem('gut.keystore') || '{}');
+    return Object.fromEntries(Object.entries(v).filter(
+      ([k, val]) => PROVIDERS.some(p => p.key === k) && String(val).trim()));
+  } catch (_) { return {}; }
+}
+
+function saveVault() {
+  localStorage.setItem('gut.keystore', JSON.stringify(vault));
+}
+
+function vaultSet(key, value) {
+  value = String(value || '').trim();
+  if (value) vault[key] = value;
+  else delete vault[key];
+  saveVault();
+}
 // Where the cards are pointing and what the device reported. 'local' mode:
 // Electron writes the local stack's .env via IPC. 'remote': the daemon's
 // /api/keys endpoint — keys are uploaded to and stored on that machine.
@@ -1114,7 +1143,8 @@ function updateKeysHeader() {
       hint = `Keys are stored on ${name} (${d.host}) — they upload over ` +
         'plain HTTP and are saved on that machine, so the agent there ' +
         'can call model providers. Anyone with the device password can ' +
-        'change them.';
+        'change them. Keys you paste are also remembered on this ' +
+        'computer, ready to push to other devices.';
       break;
     case 'auth':
       hint = `${name} requires its device password before the app can ` +
@@ -1155,6 +1185,17 @@ async function refreshKeys() {
   if (gut && d.id === 'local') {
     keyMode = 'local';
     try { localKeysSet = await gut.localKeys(); } catch (_) {}
+    // The local stack's .env is readable from here — fold its keys into
+    // the app's own store so they can be pushed to other devices.
+    try {
+      const vals = gut.localKeyValues ? await gut.localKeyValues() : {};
+      let changed = false;
+      for (const p of PROVIDERS) {
+        const v = String(vals[p.key] || '').trim();
+        if (v && vault[p.key] !== v) { vault[p.key] = v; changed = true; }
+      }
+      if (changed) saveVault();
+    } catch (_) { /* older shell without the bridge */ }
     renderProviderKeys();
     return;
   }
@@ -1180,11 +1221,56 @@ async function refreshKeys() {
   renderProviderKeys();
 }
 
+// POST a {ENV_KEY: value} map to a remote device's /api/keys and fold the
+// response back into the UI (remoteKeys, the row's key badge, the model
+// picker). Sets keyNote; returns true when the device stored the keys.
+async function pushKeysRemote(d, keys, okNote) {
+  const name = d.name || d.host;
+  let r;
+  try {
+    r = await devFetch(d, '/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys }),
+    });
+  } catch (_) {
+    keyNote = `Could not reach ${name} — nothing was changed.`;
+    return false;
+  }
+  if (r.status === 404 || r.status === 405) {
+    keyMode = 'old';  // daemon predates /api/keys
+    keyNote = null;
+    return false;
+  }
+  if (!r.ok) {
+    keyNote = `Save failed (HTTP ${r.status}) — nothing was changed.`;
+    return false;
+  }
+  const j = await r.json();
+  remoteKeys = j.keys || remoteKeys;
+  keyNote = j.applied === false
+    ? `Saved on ${name}, but the model router rejected it — the ` +
+      `device keeps retrying (${j.error || 'unknown error'}).`
+    : okNote;
+  // LiteLLM applies DB models on a short poll — refresh the picker
+  // now and once more after the change has landed.
+  loadModels();
+  setTimeout(loadModels, 8000);
+  const info = devInfo[d.id];
+  if (info) {
+    info.keys =
+      Object.values(remoteKeys).filter(k => k && k.set).length;
+    if (settingsOpen()) renderDeviceList();
+  }
+  return true;
+}
+
 async function saveProviderKey(key, value) {
   const d = keyDev();
   if (keyMode === 'local') {
     try {
       localKeysSet = await gut.saveLocalKeys({ [key]: value });
+      if (value) vaultSet(key, value);  // keep it for other devices too
       keyNote = null;
     } catch (e) {
       keyNote = `Could not save the key: ${e?.message || 'error'}`;
@@ -1207,46 +1293,79 @@ async function saveProviderKey(key, value) {
   keyNote = value ? `Uploading the ${p.name} key to ${name}…`
                   : `Removing the ${p.name} key from ${name}…`;
   renderProviderKeys();
-  try {
-    const r = await devFetch(d, '/api/keys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keys: { [key]: value } }),
-    });
-    if (r.status === 404 || r.status === 405) {
-      keyMode = 'old';
-      keyNote = null;
-    } else if (!r.ok) {
-      keyNote = `Save failed (HTTP ${r.status}) — nothing was changed.`;
-    } else {
-      const j = await r.json();
-      remoteKeys = j.keys || remoteKeys;
-      keyNote = j.applied === false
-        ? `Saved on ${name}, but the model router rejected it — the ` +
-          `device keeps retrying (${j.error || 'unknown error'}).`
-        : value ? `${p.name} key is now on ${name} — its models show ` +
-                  'up in the picker within a few seconds.'
-                : `${p.name} key removed from ${name}.`;
-      // LiteLLM applies DB models on a short poll — refresh the picker
-      // now and once more after the change has landed.
-      loadModels();
-      setTimeout(loadModels, 8000);
-      const info = devInfo[d.id];
-      if (info) {
-        info.keys =
-          Object.values(remoteKeys).filter(k => k && k.set).length;
-        if (settingsOpen()) renderDeviceList();
-      }
-    }
-  } catch (_) {
-    keyNote = `Could not reach ${name} — nothing was changed.`;
-  }
+  const ok = await pushKeysRemote(d, { [key]: value },
+    value ? `${p.name} key is now on ${name} — its models show ` +
+            'up in the picker within a few seconds.'
+          : `${p.name} key removed from ${name}.`);
+  if (ok && value) vaultSet(key, value);
   editingKey = null;
   renderProviderKeys();
 }
 
+// Push every key in the local store to the device the cards point at —
+// one shot for a fresh VPS. Only adds/overwrites; the device's other
+// keys are untouched.
+keystorePush.onclick = async () => {
+  const d = keyDev();
+  const keys = {};
+  for (const p of PROVIDERS) if (vault[p.key]) keys[p.key] = vault[p.key];
+  if (!Object.keys(keys).length) return;
+  const name = d.name || d.host;
+  if (keyMode === 'local') {
+    try {
+      localKeysSet = await gut.saveLocalKeys(keys);
+      keyNote = 'Saved keys written to the local stack’s .env — ' +
+        'they apply on its next start.';
+    } catch (e) {
+      keyNote = `Could not save the keys: ${e?.message || 'error'}`;
+    }
+    renderProviderKeys();
+    return;
+  }
+  if (keyMode !== 'remote') return;
+  const names = PROVIDERS.filter(p => keys[p.key])
+    .map(p => p.name).join(', ');
+  if (!confirm(
+      `Push your saved keys (${names}) to ${name} (${d.host})?\n\n` +
+      'They are sent over plain HTTP and stored on that machine, ' +
+      'replacing keys already set for these providers.')) return;
+  keyNote = `Pushing saved keys to ${name}…`;
+  renderProviderKeys();
+  await pushKeysRemote(d, keys,
+    `Saved keys are now on ${name} — its models show up in the ` +
+    'picker within a few seconds.');
+  editingKey = null;
+  renderProviderKeys();
+};
+
 function renderProviderKeys() {
   updateKeysHeader();
+  // The app's own key store — visible even when the target device can't
+  // be managed right now, since the copy lives on this computer.
+  const saved = PROVIDERS.filter(p => vault[p.key]);
+  keystoreBar.hidden = !saved.length;
+  if (saved.length) {
+    keystoreList.innerHTML = '';
+    keystoreList.append('Saved on this computer:');
+    for (const p of saved) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'keystore-chip';
+      chip.textContent = `${p.name} ×`;
+      chip.title = `Forget the saved ${p.name} key`;
+      chip.onclick = () => {
+        if (confirm(`Forget the ${p.name} key saved on this computer? ` +
+                   'Devices that already have it keep their copy.')) {
+          vaultSet(p.key, '');
+          renderProviderKeys();
+        }
+      };
+      keystoreList.appendChild(chip);
+    }
+    const d = keyDev();
+    keystorePush.textContent = `Push all to ${d.name || d.host}`;
+    keystorePush.disabled = keyMode !== 'local' && keyMode !== 'remote';
+  }
   const manageable = keyMode === 'local' || keyMode === 'remote';
   // When keys can't be managed right now the five identical dead cards are
   // just noise — collapse to the single status line in the header.
@@ -1312,8 +1431,17 @@ function renderProviderKeys() {
         c.actions.append(remove);
       }
     } else {
-      const add = provBtn(`Add ${p.name} key`);
-      add.classList.add('grow');
+      const saved = vault[p.key];
+      if (saved) {
+        const use = provBtn('Use saved key');
+        use.classList.add('grow');
+        use.title = `Push the ${p.name} key saved on this computer ` +
+          `to ${keyDev().name || keyDev().host}`;
+        use.onclick = () => saveProviderKey(p.key, saved);
+        c.actions.append(use);
+      }
+      const add = provBtn(saved ? 'Paste a key…' : `Add ${p.name} key`);
+      add.classList.add(saved ? 'ghost' : 'grow');
       add.onclick = () => { editingKey = p.key; renderProviderKeys(); };
       c.actions.append(add);
     }
@@ -1483,6 +1611,7 @@ if (gut) {
         localStatusEl.textContent = 'Starting local desktop…';
         const r = await gut.startLocal(keys);
         if (r.ok) {
+          for (const [k, v] of Object.entries(keys)) vaultSet(k, v);
           upsertLocalDevice(r.host, r.password);
           editingKey = null;
         } else {

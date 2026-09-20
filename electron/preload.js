@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('gut', {
   platform: process.platform,
   localStatus: () => ipcRenderer.invoke('local:status'),
   localKeys: () => ipcRenderer.invoke('local:keys'),
+  localKeyValues: () => ipcRenderer.invoke('local:key-values'),
   saveLocalKeys: (keys) => ipcRenderer.invoke('local:save-keys', keys),
   installRuntime: () => ipcRenderer.invoke('local:install-runtime'),
   startLocal: (keys) => ipcRenderer.invoke('local:start', keys),
