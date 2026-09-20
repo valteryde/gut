@@ -149,6 +149,11 @@ const devFormTitle = $('devFormTitle');
 const newDevBtn = $('newDevBtn');
 const saveSettingsBtn = $('saveSettings');
 const stopBtn = $('stopBtn');
+const sendBtn = $('sendBtn');
+const attachBtn = $('attachBtn');
+const attachTray = $('attachTray');
+const filePicker = $('filePicker');
+const dropVeil = $('dropVeil');
 const verboseToggle = $('verboseToggle');
 const activityEl = $('activityLine');
 const convDrawer = $('convDrawer');
@@ -254,6 +259,53 @@ function fmtSize(n) {
   return `${n} B`;
 }
 
+const FILE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>' +
+  '<path d="M14 2v6h6"/></svg>';
+
+// An attachment chip: file icon + name (+ size when known). `removable`
+// adds the × used by the composer's staging tray.
+function attachChip(f, removable, onRemove) {
+  const chip = document.createElement('span');
+  chip.className = 'att';
+  chip.insertAdjacentHTML('beforeend', FILE_ICON);
+  const nm = document.createElement('span');
+  nm.className = 'nm';
+  nm.textContent = f.name;
+  chip.appendChild(nm);
+  if (f.size != null) {
+    const sz = document.createElement('span');
+    sz.className = 'sz';
+    sz.textContent = fmtSize(f.size);
+    chip.appendChild(sz);
+  }
+  if (removable) {
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'rm';
+    rm.title = 'Remove';
+    rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" ' +
+      'stroke="currentColor" stroke-width="2.4" stroke-linecap="round">' +
+      '<path d="M18 6L6 18M6 6l12 12"/></svg>';
+    rm.onclick = onRemove;
+    chip.appendChild(rm);
+  }
+  return chip;
+}
+
+// Your own message: clay bubble with the text plus a chip per attachment.
+function addUserMsg(m) {
+  const { body } = entry('user', 'You');
+  if (m.text) body.appendChild(document.createTextNode(m.text));
+  if (m.files && m.files.length) {
+    const tray = document.createElement('div');
+    tray.className = 'atts';
+    for (const f of m.files) tray.appendChild(attachChip(f, false));
+    body.appendChild(tray);
+  }
+}
+
 function addFileMsg(m) {
   const { body } = entry('file', agentName);
   if (m.note) {
@@ -302,7 +354,7 @@ function addImageMsg(m) {
 function renderEvent(m, live) {
   switch (m.type) {
     case 'user':
-      addMsg('user', m.text, 'You');
+      addUserMsg(m);
       break;
     case 'agent_msg':
       addMsg('agent', m.text, agentName);
@@ -903,6 +955,7 @@ function switchDevice(id) {
   convFetchId = null;
   pendingLive = [];
   conversations = [];
+  clearStaged();  // staged files target the old device's backend
   activeConvId = localStorage.getItem(convKey(dev.id)) || null;
   activeConvDevId = activeConvId ? dev.id : null;
   clearTranscript();
@@ -953,7 +1006,10 @@ function autosizeChatInput() {
   chatInput.style.height =
     Math.min(chatInput.scrollHeight, CHAT_INPUT_MAX_H) + 'px';
 }
-chatInput.addEventListener('input', autosizeChatInput);
+chatInput.addEventListener('input', () => {
+  autosizeChatInput();
+  syncSendBtn();
+});
 // Enter sends, Shift+Enter inserts a newline.
 chatInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -962,18 +1018,143 @@ chatInput.addEventListener('keydown', (e) => {
   }
 });
 
+// ── attachments ─────────────────────────────────────────────────────────
+// Files stage as chips/thumbnails in the composer, then ride along on the
+// task/answer ws message as base64. The daemon saves them under ~/uploads
+// on the device (see save_attachments in agent_daemon.py).
+const ATTACH_MAX_BYTES = 9 * 1024 * 1024;    // mirrors SEND_FILE_MAX_BYTES
+const ATTACH_TOTAL_BYTES = 12 * 1024 * 1024; // ws frames cap at 16 MB incl. b64
+const MAX_ATTACHMENTS = 8;                   // mirrors the daemon
+let stagedFiles = [];  // {name, size, mime, file, url?}
+
+function syncSendBtn() {
+  sendBtn.disabled = !chatInput.value.trim() && !stagedFiles.length;
+}
+
+function renderAttachTray() {
+  attachTray.innerHTML = '';
+  stagedFiles.forEach((f, i) => {
+    const isImg = f.mime.startsWith('image/');
+    const chip = attachChip(f, true, () => {
+      const [gone] = stagedFiles.splice(i, 1);
+      if (gone.url) URL.revokeObjectURL(gone.url);
+      renderAttachTray();
+    });
+    if (isImg) {
+      chip.classList.add('img');
+      chip.querySelector('svg').remove();
+      const img = document.createElement('img');
+      img.src = f.url;
+      img.alt = f.name;
+      chip.prepend(img);
+    }
+    attachTray.appendChild(chip);
+  });
+  syncSendBtn();
+}
+
+function stageFiles(list) {
+  let rejected = 0;
+  let total = stagedFiles.reduce((s, f) => s + f.size, 0);
+  for (const f of list) {
+    if (stagedFiles.length >= MAX_ATTACHMENTS) {
+      addMsg('error', `at most ${MAX_ATTACHMENTS} files per message`, 'Error');
+      break;
+    }
+    if (f.size > ATTACH_MAX_BYTES || total + f.size > ATTACH_TOTAL_BYTES) {
+      rejected++;
+      continue;
+    }
+    total += f.size;
+    stagedFiles.push({
+      name: f.name || 'file', size: f.size,
+      mime: f.type || 'application/octet-stream', file: f,
+      url: f.type.startsWith('image/') ? URL.createObjectURL(f) : null,
+    });
+  }
+  if (rejected) {
+    addMsg('error',
+      `${rejected} file${rejected > 1 ? 's' : ''} skipped — ` +
+      `${ATTACH_MAX_BYTES / 1e6} MB each, ` +
+      `${ATTACH_TOTAL_BYTES / 1e6} MB total per message`, 'Error');
+  }
+  renderAttachTray();
+}
+
+function clearStaged() {
+  for (const f of stagedFiles) if (f.url) URL.revokeObjectURL(f.url);
+  stagedFiles = [];
+  renderAttachTray();
+}
+
+const fileToB64 = (f) => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1]);
+  r.onerror = () => rej(r.error);
+  r.readAsDataURL(f);
+});
+
+async function encodeStaged() {
+  const out = [];
+  for (const f of stagedFiles) {
+    out.push({ name: f.name, mime: f.mime, data: await fileToB64(f.file) });
+  }
+  return out;
+}
+
+attachBtn.onclick = () => filePicker.click();
+filePicker.onchange = () => {
+  stageFiles([...filePicker.files]);
+  filePicker.value = '';
+};
+
+// Pasted screenshots/files go straight into the draft.
+chatInput.addEventListener('paste', (e) => {
+  if (e.clipboardData && e.clipboardData.files.length) {
+    e.preventDefault();
+    stageFiles([...e.clipboardData.files]);
+  }
+});
+
+// Drag anywhere over the chat pane; the veil marks the drop target.
+let dragDepth = 0;
+chatPane.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  if (++dragDepth === 1) dropVeil.hidden = false;
+});
+chatPane.addEventListener('dragover', (e) => e.preventDefault());
+chatPane.addEventListener('dragleave', () => {
+  if (--dragDepth <= 0) { dragDepth = 0; dropVeil.hidden = true; }
+});
+chatPane.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropVeil.hidden = true;
+  stageFiles([...e.dataTransfer.files]);
+  chatInput.focus();
+});
+
 // Every message runs on the selected device with the conversation's model.
 // One agent per device: a busy device rejects (or the client short-circuits).
 $('chatForm').onsubmit = async (e) => {
   e.preventDefault();
   const text = chatInput.value.trim();
-  if (!text) return;
+  if (!text && !stagedFiles.length) return;
+  let files;
+  try {
+    files = await encodeStaged();
+  } catch (_) {
+    addMsg('error', 'could not read an attachment — remove it and retry',
+      'Error');
+    return;
+  }
   if (awaitingAnswer) {
     chatInput.value = '';
     autosizeChatInput();
     awaitingAnswer = false;
     chatInput.placeholder = TASK_PLACEHOLDER;
-    send({ type: 'answer', text });
+    send({ type: 'answer', text, files });
+    clearStaged();
     return;
   }
   // Rejected sends keep the draft so it isn't lost.
@@ -997,8 +1178,10 @@ $('chatForm').onsubmit = async (e) => {
   chatInput.value = '';
   autosizeChatInput();
   // Rendered when the daemon echoes the stored event back over the socket.
-  send({ type: 'task', conversation_id: activeConvId, text });
+  send({ type: 'task', conversation_id: activeConvId, text, files });
+  clearStaged();
 };
+syncSendBtn();
 
 // ── conversation drawer ─────────────────────────────────────────────────
 $('convBtn').onclick = () => {

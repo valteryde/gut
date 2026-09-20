@@ -63,23 +63,34 @@
       </div>
 
       <form id="chatForm" autocomplete="off">
-        <div class="composer">
+        <div class="composer-card">
+          <div id="attachTray" class="atts"></div>
           <textarea id="chatInput" rows="1" placeholder="Describe a task&hellip;" autofocus></textarea>
-          <button type="button" id="stopBtn" class="btn danger" title="Stop the agent" hidden>Stop</button>
-          <button type="submit" id="sendBtn" class="btn primary">Send</button>
+          <div class="composer-bar">
+            <button type="button" id="attachBtn" class="ibtn"
+                    title="Attach files — or drop them anywhere on the chat">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            </button>
+            <label class="chip" title="Device — which desktop environment runs your messages">
+              <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M208,40H48A24,24,0,0,0,24,64V176a24,24,0,0,0,24,24h72v16H96a8,8,0,0,0,0,16h64a8,8,0,0,0,0-16H136V200h72a24,24,0,0,0,24-24V64A24,24,0,0,0,208,40ZM48,56H208a8,8,0,0,1,8,8v80H40V64A8,8,0,0,1,48,56ZM208,184H48a8,8,0,0,1-8-8V160H216v16A8,8,0,0,1,208,184Z"/></svg>
+              <select id="deviceSelect"></select>
+            </label>
+            <label class="chip grow" title="Agent model for this conversation">
+              <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32,32H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24ZM72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z"/></svg>
+              <select id="modelSelect"></select>
+            </label>
+            <span id="modelInfo" class="model-info"></span>
+            <button type="button" id="stopBtn" class="ibtn danger" title="Stop the agent" hidden>
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            </button>
+            <button type="submit" id="sendBtn" class="sendbtn" title="Send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </button>
+          </div>
         </div>
-        <div class="composer-meta">
-          <label class="chip" title="Device — which desktop environment runs your messages">
-            <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M208,40H48A24,24,0,0,0,24,64V176a24,24,0,0,0,24,24h72v16H96a8,8,0,0,0,0,16h64a8,8,0,0,0,0-16H136V200h72a24,24,0,0,0,24-24V64A24,24,0,0,0,208,40ZM48,56H208a8,8,0,0,1,8,8v80H40V64A8,8,0,0,1,48,56ZM208,184H48a8,8,0,0,1-8-8V160H216v16A8,8,0,0,1,208,184Z"/></svg>
-            <select id="deviceSelect"></select>
-          </label>
-          <label class="chip grow" title="Agent model for this conversation">
-            <svg class="ph" viewBox="0 0 256 256" aria-hidden="true"><path d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32-32V80A32,32,0,0,0,200,48Zm16,144a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V80A16,16,0,0,1,56,64H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24ZM72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z"/></svg>
-            <select id="modelSelect"></select>
-          </label>
-          <span id="modelInfo" class="model-info"></span>
-        </div>
+        <input type="file" id="filePicker" multiple hidden>
       </form>
+      <div id="dropVeil" class="drop-veil" hidden>Drop files to attach</div>
     </section>
 
     <section id="desktopPane">

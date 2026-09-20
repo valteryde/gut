@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gut — composer mockups</title>
+<link rel="stylesheet" href="../client/styles.css">
+<style>
+  /* ── mock scaffolding (not part of the proposals) ─────────── */
+  body { padding: 30px 34px 70px; }
+  h1 { margin: 0 0 4px; font-size: 26px; font-weight: 300; letter-spacing: -0.015em; }
+  .lede { margin: 0 0 6px; color: var(--text-2); max-width: 78ch; }
+  .keys { margin: 0 0 34px; color: var(--text-3); font-size: 12px; }
+  .keys b {
+    font-family: var(--mono); font-size: 11px; font-weight: 500;
+    color: var(--text-2); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px;
+  }
+  .mock-grid { display: flex; flex-wrap: wrap; gap: 44px 40px; align-items: flex-start; }
+  .mock { width: 480px; flex: none; }
+  .mock > h2 { margin: 0 0 3px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .mock > h2 .tag {
+    margin-left: 7px; padding: 1px 8px; vertical-align: 2px;
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--mint-ink); background: var(--mint-soft);
+    border: 1px solid var(--mint-line); border-radius: 99px;
+  }
+  .mock > h2 .tag.dim { color: var(--text-3); background: var(--surface-2); border-color: var(--line); }
+  .mock > .notes { margin: 0 0 14px; color: var(--text-3); font-size: 12.5px; line-height: 1.5; }
+
+  /* fake chat pane, same width feel as the real one */
+  .pane {
+    width: 480px; height: 600px;
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    overflow: hidden;
+    position: relative;
+  }
+  .mockbar {
+    flex: none; display: flex; align-items: center; gap: 10px;
+    min-height: 50px; padding: 10px 14px 10px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .mockbar .t { font-weight: 500; font-size: 15px; letter-spacing: -0.01em; }
+  .mockbar .s {
+    font-family: var(--mono); font-size: 11.5px; color: var(--text-3);
+  }
+  .mockmsgs { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px; }
+
+  /* drag overlay — shared by all variants */
+  .drop-veil {
+    position: absolute; inset: 8px; z-index: 9;
+    display: none; align-items: center; justify-content: center;
+    border: 2px dashed var(--mint-ink); border-radius: var(--radius-card);
+    background: rgba(220, 245, 236, 0.9);
+    color: var(--mint-ink);
+    font-family: var(--mono); font-size: 11px; font-weight: 500;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    pointer-events: none;
+  }
+  .pane.dragging .drop-veil { display: flex; }
+
+  /* ── shared composer pieces ───────────────────────────────── */
+  /* staged attachment chips / thumbnails */
+  .atts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .atts:empty { display: none; }
+  .att {
+    display: flex; align-items: center; gap: 7px;
+    height: 32px; padding: 0 4px 0 9px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font-family: var(--mono); font-size: 11px; color: var(--text-2);
+    max-width: 240px;
+  }
+  .att .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .att > svg { width: 13px; height: 13px; flex: none; color: var(--text-3); }
+  .att .sz { color: var(--text-3); flex: none; }
+  .att .rm {
+    width: 18px; height: 18px; padding: 0; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    border: 0; border-radius: 3px; background: transparent; color: var(--text-3);
+  }
+  .att .rm:hover { background: transparent; color: var(--bad); }
+  .att .rm svg { width: 10px; height: 10px; }
+  .att.img { height: 40px; padding: 2px 4px 2px 2px; }
+  .att.img img {
+    width: 36px; height: 36px; display: block;
+    object-fit: cover; border-radius: 3px; border: 1px solid var(--line);
+  }
+
+  /* square ghost icon button (attach etc.) */
+  .ibtn {
+    width: 30px; height: 30px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 0; border-radius: 6px; background: transparent; color: var(--text-2);
+  }
+  .ibtn:hover { background: var(--surface-3); color: var(--text); }
+  .ibtn svg { width: 17px; height: 17px; }
+
+  /* round send button */
+  .sendbtn {
+    width: 30px; height: 30px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 0; border-radius: 50%;
+    background: var(--mint); color: var(--on-mint);
+    transition: background 0.12s, color 0.12s;
+  }
+  .sendbtn:hover { background: var(--mint-hover); }
+  .sendbtn:disabled { background: var(--surface-3); color: var(--text-3); }
+  .sendbtn svg { width: 15px; height: 15px; }
+
+  .mini-info {
+    font-size: 11px; color: var(--text-3);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    min-width: 0; padding: 0 6px;
+  }
+
+  /* textarea mimic of today's #chatInput (for baseline + variant C) */
+  .mockta {
+    flex: 1; min-width: 0;
+    background: var(--surface-2); border-color: var(--line);
+    padding: 8px 12px; line-height: 20px;
+    height: 38px; min-height: 38px; max-height: 160px;
+    resize: none; overflow-y: auto;
+  }
+  .mockta:focus { background: var(--surface); }
+
+  /* ══ VARIANT A — unified card ══════════════════════════════ */
+  .comp-a { flex: none; padding: 12px 14px 14px; border-top: 1px solid var(--line); }
+  .comp-a .box {
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--line-strong); border-radius: 10px;
+    transition: border-color 0.12s, box-shadow 0.12s;
+  }
+  .comp-a .box:focus-within {
+    border-color: var(--mint-ink);
+    box-shadow: 0 0 0 3px var(--mint-soft);
+  }
+  .comp-a .atts { padding: 10px 10px 0; }
+  .comp-a textarea {
+    border: 0; background: transparent; height: auto;
+    padding: 11px 12px 4px; line-height: 20px;
+    min-height: 40px; max-height: 160px; resize: none;
+  }
+  .comp-a textarea:focus { outline: none; box-shadow: none; }
+  .comp-a .tbar { display: flex; align-items: center; gap: 2px; padding: 4px 6px 6px; }
+  .comp-a .tbar .chip { height: 24px; }
+  .comp-a .spacer { flex: 1; min-width: 6px; }
+
+  /* ══ VARIANT B — floating composer ═════════════════════════ */
+  .pane-b .mockmsgs { padding-bottom: 110px; }
+  .comp-b { position: absolute; left: 12px; right: 12px; bottom: 10px; z-index: 4; }
+  .comp-b .box {
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--line-strong); border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(30, 29, 26, 0.16);
+    transition: border-color 0.12s, box-shadow 0.12s;
+  }
+  .comp-b .box:focus-within {
+    border-color: var(--mint-ink);
+    box-shadow: 0 10px 30px rgba(30, 29, 26, 0.16), 0 0 0 3px var(--mint-soft);
+  }
+  .comp-b .atts { padding: 10px 10px 0; }
+  .comp-b textarea {
+    border: 0; background: transparent; height: auto;
+    padding: 12px 14px 4px; line-height: 20px;
+    min-height: 42px; max-height: 160px; resize: none;
+  }
+  .comp-b textarea:focus { outline: none; box-shadow: none; }
+  .comp-b .tbar { display: flex; align-items: center; gap: 2px; padding: 4px 8px 8px; }
+  .comp-b .tbar .chip { height: 24px; }
+  .comp-b .spacer { flex: 1; min-width: 6px; }
+  .comp-b .hint {
+    margin-top: 7px; text-align: center;
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
+    color: var(--text-3);
+  }
+
+  /* ══ VARIANT C — refined split (evolution of today) ════════ */
+  .comp-c { flex: none; padding: 12px 14px 14px; border-top: 1px solid var(--line); }
+  .comp-c .atts { margin-bottom: 8px; }
+  .comp-c .row { display: flex; gap: 8px; align-items: flex-end; }
+  .comp-c .row .ibtn { height: 38px; width: 34px; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+  .comp-c .row .ibtn:hover { border-color: var(--text-3); background: var(--surface-2); }
+  .comp-c .row .sendbtn { width: 38px; height: 38px; border-radius: var(--radius); }
+  .comp-c .row .sendbtn svg { width: 16px; height: 16px; }
+  /* meta strip identical to today's — the old .composer-meta styles were
+     removed from styles.css when variant A shipped, so they're inlined here */
+  .composer-meta {
+    display: flex; align-items: center; gap: 2px;
+    padding: 4px 10px;
+    border-top: 1px solid var(--line);
+    background: var(--surface-2);
+    border-radius: 0 0 var(--radius-card) var(--radius-card);
+  }
+  .composer-meta .model-info { margin-left: auto; margin-right: 0; padding-left: 8px; }
+  .comp-c .composer-meta { margin: 12px -14px -14px; }
+
+  /* ══ BASELINE — today's composer ═══════════════════════════ */
+  .comp-now { flex: none; padding: 14px 18px 16px; border-top: 1px solid var(--line); }
+  .comp-now .composer { display: flex; gap: 8px; align-items: flex-end; }
+  .comp-now .composer button { height: 38px; }
+  .comp-now .composer-meta { margin: 12px -18px -16px; }
+</style>
+</head>
+<body>
+
+<h1>Composer rework — mockups</h1>
+<p class="lede">Four live mockups of the send field. Each pane below is clickable:
+  type and press <b>Enter</b> to "send", use the attach button, <b>drag files onto
+  a pane</b>, or <b>paste an image</b> — staged files show as chips/thumbnails and
+  send with the message.</p>
+<p class="keys"><b>⏎</b> send &nbsp;·&nbsp; <b>⇧⏎</b> newline &nbsp;·&nbsp; drop files anywhere on a pane &nbsp;·&nbsp; ⌘V paste image &nbsp;·&nbsp; × removes an attachment</p>
+
+<div class="mock-grid">
+
+  <!-- ── baseline ─────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>Current <span class="tag dim">baseline</span></h2>
+    <p class="notes">What ships today, for comparison. No file support.</p>
+    <div class="pane" data-variant="now">
+      <div class="mockbar"><span class="t">Set up the demo project</span><span class="s">Claude · working</span></div>
+      <div class="mockmsgs">
+        <div class="msg user"><span class="who">You</span><div class="body">Scaffold a fresh vite project and open it in the browser</div></div>
+        <div class="msg agent"><span class="who">Claude</span><div class="body">On it — creating the project on the desktop now.</div></div>
+      </div>
+      <form class="comp-now" autocomplete="off">
+        <div class="composer">
+          <textarea class="mockta" rows="1" placeholder="Describe a task…"></textarea>
+          <button type="button" class="btn danger" hidden>Stop</button>
+          <button type="submit" class="btn primary" data-send>Send</button>
+        </div>
+        <div class="composer-meta">
+          <label class="chip"><select><option>Local docker</option></select></label>
+          <label class="chip grow"><select><option>claude-sonnet-4-5</option></select></label>
+          <span class="model-info">top pick for desktop control · vision ✓</span>
+        </div>
+      </form>
+      <input type="file" class="picker" multiple hidden>
+      <div class="drop-veil">Drop files to attach</div>
+    </div>
+  </section>
+
+  <!-- ── variant A ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>A — Unified card <span class="tag">chosen — shipped</span></h2>
+    <p class="notes">Everything lives inside one bordered card: attachments on top,
+      borderless textarea, then a toolbar row with attach, the device/model chips,
+      and a round send button. The meta strip folds into the card, so the whole
+      composer reads as a single control. Familiar from modern chat apps, still
+      quiet enough for the paper theme.</p>
+    <div class="pane" data-variant="a">
+      <div class="mockbar"><span class="t">Set up the demo project</span><span class="s">Claude · working</span></div>
+      <div class="mockmsgs">
+        <div class="msg user"><span class="who">You</span><div class="body">Scaffold a fresh vite project and open it in the browser</div></div>
+        <div class="msg agent"><span class="who">Claude</span><div class="body">On it — creating the project on the desktop now.</div></div>
+      </div>
+      <form class="comp-a" autocomplete="off">
+        <div class="box">
+          <div class="atts"></div>
+          <textarea rows="1" placeholder="Describe a task…"></textarea>
+          <div class="tbar">
+            <button type="button" class="ibtn" data-attach title="Attach files">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            </button>
+            <label class="chip" title="Device"><select><option>Local docker</option></select></label>
+            <label class="chip grow" title="Model"><select><option>claude-sonnet-4-5</option></select></label>
+            <span class="mini-info">vision ✓ · 200k ctx</span>
+            <span class="spacer"></span>
+            <button type="button" class="ibtn" hidden title="Stop">■</button>
+            <button type="submit" class="sendbtn" data-send title="Send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </button>
+          </div>
+        </div>
+      </form>
+      <input type="file" class="picker" multiple hidden>
+      <div class="drop-veil">Drop files to attach</div>
+    </div>
+  </section>
+
+  <!-- ── variant B ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>B — Floating composer</h2>
+    <p class="notes">The composer floats over the transcript on a soft shadow with a
+      larger radius — the most "app-like" option. Same interior as A (attach, chips,
+      round send) plus a mono hint line underneath. Trade-off: it overlaps the last
+      message row and is the biggest visual departure from the current flat style.</p>
+    <div class="pane pane-b" data-variant="b">
+      <div class="mockbar"><span class="t">Set up the demo project</span><span class="s">Claude · working</span></div>
+      <div class="mockmsgs">
+        <div class="msg user"><span class="who">You</span><div class="body">Scaffold a fresh vite project and open it in the browser</div></div>
+        <div class="msg agent"><span class="who">Claude</span><div class="body">On it — creating the project on the desktop now.</div></div>
+      </div>
+      <form class="comp-b" autocomplete="off">
+        <div class="box">
+          <div class="atts"></div>
+          <textarea rows="1" placeholder="Describe a task…"></textarea>
+          <div class="tbar">
+            <button type="button" class="ibtn" data-attach title="Attach files">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <label class="chip" title="Device"><select><option>Local docker</option></select></label>
+            <label class="chip grow" title="Model"><select><option>claude-sonnet-4-5</option></select></label>
+            <span class="spacer"></span>
+            <button type="submit" class="sendbtn" data-send title="Send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="hint">drop files to attach · ⇧⏎ newline</div>
+      </form>
+      <input type="file" class="picker" multiple hidden>
+      <div class="drop-veil">Drop files to attach</div>
+    </div>
+  </section>
+
+  <!-- ── variant C ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>C — Refined split</h2>
+    <p class="notes">Smallest structural change: keeps today's input row and meta
+      strip, adds a bordered attach button to the left, a staged-file tray above the
+      input, and swaps the Send label for a square arrow button. Least modern, but
+      also the least churn — every existing selector survives.</p>
+    <div class="pane" data-variant="c">
+      <div class="mockbar"><span class="t">Set up the demo project</span><span class="s">Claude · working</span></div>
+      <div class="mockmsgs">
+        <div class="msg user"><span class="who">You</span><div class="body">Scaffold a fresh vite project and open it in the browser</div></div>
+        <div class="msg agent"><span class="who">Claude</span><div class="body">On it — creating the project on the desktop now.</div></div>
+      </div>
+      <form class="comp-c" autocomplete="off">
+        <div class="atts"></div>
+        <div class="row">
+          <button type="button" class="ibtn" data-attach title="Attach files">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <textarea class="mockta" rows="1" placeholder="Describe a task…"></textarea>
+          <button type="button" class="btn danger" hidden>Stop</button>
+          <button type="submit" class="sendbtn" data-send title="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+        </div>
+        <div class="composer-meta">
+          <label class="chip"><select><option>Local docker</option></select></label>
+          <label class="chip grow"><select><option>claude-sonnet-4-5</option></select></label>
+          <span class="model-info">top pick for desktop control · vision ✓</span>
+        </div>
+      </form>
+      <input type="file" class="picker" multiple hidden>
+      <div class="drop-veil">Drop files to attach</div>
+    </div>
+  </section>
+
+</div>
+
+<p class="keys" style="margin-top:44px">Wire note (implementation, same for all): files upload to the device
+  alongside the <b>task</b> ws message — either base64 in the payload or a multipart
+  POST that returns paths — and the daemon drops them under <b>~/uploads</b> and
+  tells the agent where they landed.</p>
+
+<script>
+const FILE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+const X_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+const DEMO_IMG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72">' +
+  '<rect width="72" height="72" fill="#a5e6d2"/>' +
+  '<circle cx="48" cy="20" r="7" fill="#fbf8f2"/>' +
+  '<path d="M0 72 L26 30 L40 50 L50 40 L72 72 Z" fill="#146b50"/></svg>');
+
+const fmtSize = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB`
+  : n >= 1e3 ? `${(n / 1e3).toFixed(1)} KB` : `${n} B`;
+
+function setupPane(pane) {
+  const form = pane.querySelector('form');
+  const ta = pane.querySelector('textarea');
+  const atts = pane.querySelector('.atts');
+  const picker = pane.querySelector('.picker');
+  const msgs = pane.querySelector('.mockmsgs');
+  const sendBtn = pane.querySelector('[data-send]');
+  const supportsFiles = !!atts;
+  let staged = [];
+
+  const autosize = () => {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+  };
+  ta.addEventListener('input', () => { autosize(); syncSend(); });
+
+  const syncSend = () => {
+    if (sendBtn.classList.contains('sendbtn')) {
+      sendBtn.disabled = !ta.value.trim() && !staged.length;
+    }
+  };
+
+  function renderAtts() {
+    if (!atts) return;
+    atts.innerHTML = '';
+    staged.forEach((f, i) => {
+      const chip = document.createElement('span');
+      const isImg = f.type && f.type.startsWith('image/');
+      chip.className = 'att' + (isImg ? ' img' : '');
+      if (isImg) {
+        const img = document.createElement('img');
+        img.src = f.url;
+        chip.appendChild(img);
+      } else {
+        chip.insertAdjacentHTML('beforeend', FILE_ICON);
+      }
+      const nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = f.name;
+      const sz = document.createElement('span');
+      sz.className = 'sz';
+      sz.textContent = fmtSize(f.size || 0);
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'rm';
+      rm.innerHTML = X_ICON;
+      rm.title = 'Remove';
+      rm.onclick = () => { staged.splice(i, 1); renderAtts(); };
+      chip.append(nm, sz, rm);
+      atts.appendChild(chip);
+    });
+    syncSend();
+  }
+
+  function stage(fileList) {
+    if (!supportsFiles) return;
+    for (const f of fileList) {
+      staged.push({
+        name: f.name, size: f.size, type: f.type,
+        url: f.type.startsWith('image/') ? URL.createObjectURL(f) : null,
+      });
+    }
+    renderAtts();
+    ta.focus();
+  }
+
+  // attach button -> picker
+  pane.querySelectorAll('[data-attach]').forEach(b =>
+    b.addEventListener('click', () => picker.click()));
+  picker.addEventListener('change', () => {
+    stage([...picker.files]); picker.value = '';
+  });
+
+  // paste images/files straight into the draft
+  ta.addEventListener('paste', (e) => {
+    if (e.clipboardData && e.clipboardData.files.length) {
+      e.preventDefault();
+      stage([...e.clipboardData.files]);
+    }
+  });
+
+  // drag & drop anywhere on the pane
+  let depth = 0;
+  pane.addEventListener('dragenter', (e) => {
+    if (!supportsFiles) return;
+    e.preventDefault(); depth++;
+    pane.classList.add('dragging');
+  });
+  pane.addEventListener('dragover', (e) => e.preventDefault());
+  pane.addEventListener('dragleave', () => {
+    if (--depth <= 0) { depth = 0; pane.classList.remove('dragging'); }
+  });
+  pane.addEventListener('drop', (e) => {
+    e.preventDefault(); depth = 0;
+    pane.classList.remove('dragging');
+    stage([...e.dataTransfer.files]);
+  });
+
+  function send() {
+    const text = ta.value.trim();
+    if (!text && !staged.length) return;
+    const div = document.createElement('div');
+    div.className = 'msg user';
+    div.innerHTML = '<span class="who">You</span>';
+    const body = document.createElement('div');
+    body.className = 'body';
+    if (text) body.appendChild(document.createTextNode(text));
+    if (staged.length) {
+      const tray = document.createElement('div');
+      tray.className = 'atts';
+      tray.style.marginTop = text ? '7px' : '0';
+      staged.forEach((f) => {
+        const chip = document.createElement('span');
+        chip.className = 'att' + (f.type && f.type.startsWith('image/') ? ' img' : '');
+        if (chip.classList.contains('img')) {
+          const img = document.createElement('img');
+          img.src = f.url; chip.appendChild(img);
+        } else chip.insertAdjacentHTML('beforeend', FILE_ICON);
+        const nm = document.createElement('span');
+        nm.className = 'nm'; nm.textContent = f.name;
+        chip.appendChild(nm);
+        tray.appendChild(chip);
+      });
+      body.appendChild(tray);
+    }
+    div.appendChild(body);
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+    ta.value = ''; autosize();
+    staged = []; renderAtts();
+    ta.focus();
+  }
+
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault(); send();
+    }
+  });
+  form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
+
+  // seed demo attachments so the file UI is visible without interaction
+  if (supportsFiles) {
+    staged = [
+      { name: 'screenshot-2026-09-20.png', size: 494_236,
+        type: 'image/png', url: DEMO_IMG },
+      { name: 'q3-report.pdf', size: 1_286_400, type: 'application/pdf' },
+    ];
+    renderAtts();
+  }
+  syncSend();
+}
+
+document.querySelectorAll('.pane').forEach(setupPane);
+</script>
+</body>
+</html>

@@ -680,41 +680,139 @@ body.verbose .verbose-only { display: grid; }
 }
 
 /* ── composer ────────────────────────────────────────────── */
+/* One card holds everything: staged attachments, the borderless input, and
+   a toolbar row (attach, device/model chips, stop/send). */
 #chatForm {
   flex: none;
-  padding: 14px 18px 16px;
+  padding: 12px 14px 14px;
   border-top: 1px solid var(--line);
 }
 
-.composer { display: flex; gap: 8px; align-items: flex-end; }
-.composer button { height: 38px; }
+.composer-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.composer-card:focus-within {
+  border-color: var(--mint-ink);
+  box-shadow: 0 0 0 3px var(--mint-soft);
+}
 
 #chatInput {
-  flex: 1;
-  min-width: 0;
-  background: var(--surface-2);
-  border-color: var(--line);
-  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  height: auto;
+  padding: 11px 12px 4px;
   line-height: 20px;
-  height: 38px;
-  min-height: 38px;
+  min-height: 40px;
   max-height: 160px;
   resize: none;
   overflow-y: auto;
 }
-#chatInput:focus { background: var(--surface); }
+#chatInput:focus { outline: none; box-shadow: none; }
 
-/* device + model pickers: a status strip flush with the composer's bottom */
-.composer-meta {
+.composer-bar {
   display: flex;
   align-items: center;
   gap: 2px;
-  margin: 12px -18px -16px;
-  padding: 4px 10px;
-  border-top: 1px solid var(--line);
-  background: var(--surface-2);
-  border-radius: 0 0 var(--radius-card) var(--radius-card);
+  padding: 4px 6px 6px;
 }
+
+/* square ghost icon buttons (attach, stop) */
+.ibtn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+}
+.ibtn:hover { background: var(--surface-3); color: var(--text); }
+.ibtn.danger { color: var(--bad); }
+.ibtn.danger:hover { background: var(--bad-bg); }
+.ibtn svg { width: 17px; height: 17px; }
+
+/* round send button */
+.sendbtn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--mint);
+  color: var(--on-mint);
+  transition: background 0.12s, color 0.12s;
+}
+.sendbtn:hover { background: var(--mint-hover); }
+.sendbtn:disabled { background: var(--surface-3); color: var(--text-3); }
+.sendbtn svg { width: 15px; height: 15px; }
+
+/* staged + sent attachment chips */
+.atts { display: flex; flex-wrap: wrap; gap: 6px; }
+.atts:empty { display: none; }
+#attachTray { padding: 10px 10px 0; }
+.att {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 4px 0 9px;
+  max-width: 240px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+.att > svg { width: 13px; height: 13px; flex: none; color: var(--text-3); }
+.att .nm {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.att .sz { color: var(--text-3); flex: none; }
+.att .rm {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-3);
+}
+.att .rm:hover { background: transparent; color: var(--bad); }
+.att .rm svg { width: 10px; height: 10px; }
+.att.img { height: 40px; padding: 2px 4px 2px 2px; }
+.att.img img {
+  width: 36px;
+  height: 36px;
+  display: block;
+  object-fit: cover;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+}
+/* attachments inside your own sent bubble ride on the clay card */
+.msg.user .atts { margin-top: 6px; }
+.msg.user .body > .atts:first-child { margin-top: 0; }
+.msg.user .att { background: var(--surface); border-color: var(--clay-line); }
+
 /* each picker is a ghost chip: phosphor icon + borderless select */
 .chip {
   display: flex;
@@ -752,16 +850,38 @@ body.verbose .verbose-only { display: grid; }
 }
 .chip #deviceSelect { max-width: 130px; }
 .chip #modelSelect { max-width: none; }
-/* quiet one-liner describing the selected model, right edge of the strip */
+/* quiet one-liner describing the selected model — sits left of the bar,
+   shrinkable so the send/stop buttons always keep their room */
 .model-info {
-  margin-left: auto;
-  padding-left: 8px;
+  margin-right: auto;
+  padding: 0 6px;
   font-size: 11px;
   color: var(--text-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  flex: 0 1 auto;
+}
+
+/* drag-over veil covering the whole chat pane */
+.drop-veil {
+  position: absolute;
+  inset: 8px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--mint-ink);
+  border-radius: var(--radius-card);
+  background: rgba(220, 245, 236, 0.9);
+  color: var(--mint-ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  pointer-events: none;
 }
 
 /* ── desktop pane ────────────────────────────────────────── */

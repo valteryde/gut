@@ -104,6 +104,14 @@ INSTALL_KIND = _install_kind()
 # volume (or ~/.gut outside docker) so they survive container rebuilds.
 GUT_DATA_DIR = Path(os.environ.get("GUT_DATA_DIR") or Path.home() / ".gut")
 CONV_DIR = GUT_DATA_DIR / "conversations"
+# Files the user attaches in the composer land on the desktop itself, where
+# the agent's file/shell tools can read them (paths are relative to home).
+UPLOAD_DIR = Path(os.environ.get("GUT_UPLOAD_DIR") or HOME_DIR / "uploads")
+MAX_ATTACHMENTS = 8
+# Base64 inflates ~33%; keep the ws message comfortably under uvicorn's
+# 16 MB frame cap.
+ATTACH_TOTAL_MAX_BYTES = int(
+    os.environ.get("ATTACH_TOTAL_MAX_BYTES", str(12 * 1024 * 1024)))
 # Self-update status file (deb installs) — written by the detached updater
 # script, read by GET /api/update.
 UPDATE_STATUS_FILE = GUT_DATA_DIR / "update.json"
@@ -142,6 +150,9 @@ Talking to the user — act like a teammate, not a live feed:
   chat attachment. Paths are relative to {home}.
 - send_image: show the user an image — a file, or a fresh screenshot when no
   path is given.
+- Files the user attaches to a message are saved under {home}/uploads/ — the
+  message text lists the exact paths; open them with run_command or the file
+  tools. Attached images are also shown to you inline.
 - ask_user: pause for input only when blocked on something only a human can
   provide — a decision, credential, 2FA or CAPTCHA. Never for information
   visible on screen, and never just because you're stuck — brainstorm more
@@ -313,8 +324,10 @@ def conv_append_event(cid: str, event: dict) -> int | None:
     meta["events"] = seq
     meta["updated_at"] = time.time()
     if not meta.get("title") and event.get("type") == "user":
-        first_line = str(event.get("text") or "").strip().splitlines()[0]
-        meta["title"] = first_line[:80] or "Conversation"
+        lines = str(event.get("text") or "").strip().splitlines()
+        files = event.get("files") or []
+        fallback = files[0]["name"] if files else "Conversation"
+        meta["title"] = (lines[0][:80] if lines else "") or fallback
     rec = {"seq": seq, "ts": meta["updated_at"]}
     rec.update({k: v for k, v in event.items()
                 if k not in ("seq", "conversation_id")})
@@ -1321,6 +1334,70 @@ def _resolve_path(path_str: str) -> Path | str:
     return p
 
 
+def save_attachments(files) -> tuple[list[dict], str | None]:
+    """Decode client attachments and write them under ~/uploads.
+
+    Returns (saved, error). Each saved entry: {name, size, mime, path, b64};
+    on error nothing is delivered and the caller rejects the whole message so
+    the client keeps its draft.
+    """
+    if not isinstance(files, list):
+        return [], "bad attachments payload"
+    if len(files) > MAX_ATTACHMENTS:
+        return [], f"too many attachments — {MAX_ATTACHMENTS} max"
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return [], f"upload dir unavailable: {e}"
+    saved = []
+    total = 0
+    for f in files or []:
+        if not isinstance(f, dict):
+            return [], "bad attachments payload"
+        name = Path(str(f.get("name") or "file")).name.lstrip(".") or "file"
+        try:
+            raw = base64.b64decode(str(f.get("data") or ""), validate=True)
+        except Exception:
+            return [], f"could not decode attachment “{name}”"
+        total += len(raw)
+        if len(raw) > SEND_FILE_MAX_BYTES:
+            return [], (f"“{name}” is over the "
+                        f"{SEND_FILE_MAX_BYTES // int(1e6)} MB limit")
+        if total > ATTACH_TOTAL_MAX_BYTES:
+            return [], ("attachments total over the "
+                        f"{ATTACH_TOTAL_MAX_BYTES // int(1e6)} MB limit")
+        p = UPLOAD_DIR / name
+        stem, suffix = p.stem, p.suffix
+        n = 1
+        while p.exists():
+            p = UPLOAD_DIR / f"{stem}-{n}{suffix}"
+            n += 1
+        try:
+            p.write_bytes(raw)
+        except OSError as e:
+            return [], f"could not save “{name}”: {e}"
+        saved.append({
+            "name": p.name, "size": len(raw), "path": str(p),
+            "mime": str(f.get("mime") or
+                        mimetypes.guess_type(p.name)[0] or
+                        "application/octet-stream"),
+            "b64": base64.b64encode(raw).decode()})
+    return saved, None
+
+
+def attach_note(saved: list[dict]) -> str:
+    """Tell the model where its attachments landed on the desktop."""
+    listing = "\n".join(f"- {f['path']} ({f['size']} bytes)" for f in saved)
+    return f"[attached files, saved on the desktop:\n{listing}]"
+
+
+def event_files(saved: list[dict]) -> list[dict]:
+    """File metadata for the transcript event (no payload — the file itself
+    already lives on the device)."""
+    return [{"name": f["name"], "size": f["size"], "mime": f["mime"]}
+            for f in saved]
+
+
 async def send_file(path_str: str, note: str = "") -> str:
     p = _resolve_path(path_str or "")
     if isinstance(p, str):
@@ -1496,7 +1573,7 @@ def prune_images(messages: list, keep: int = SCREENSHOT_HISTORY) -> None:
             if seen > keep:
                 block.clear()
                 block.update({"type": "text",
-                              "text": "[earlier screenshot omitted]"})
+                              "text": "[earlier image omitted]"})
 
 
 def cache_friendly() -> bool:
@@ -1598,7 +1675,8 @@ async def llm_request(http: httpx.AsyncClient, messages: list) -> httpx.Response
     raise RuntimeError("llm_request exhausted retries without a response")
 
 
-async def agent_loop(conv_id: str, task_text: str) -> None:
+async def agent_loop(conv_id: str, task_text: str,
+                     attachments: list[dict] | None = None) -> None:
     state.stop = False
     state.paused = False
     await broadcast({"type": "status", "state": "running",
@@ -1616,10 +1694,15 @@ async def agent_loop(conv_id: str, task_text: str) -> None:
         {"role": "system", "content": SYSTEM_PROMPT.format(
             res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR)}]
     sanitize_context(messages)
-    messages.append({"role": "user", "content": [
-        {"type": "text", "text": task_text},
-        screenshot_block(force=True),
-    ]})
+    content = [{"type": "text", "text": task_text}]
+    # Attached images go inline so the model sees them directly; other files
+    # are referenced by path in the task text (attach_note).
+    for f in attachments or []:
+        if f["mime"].startswith("image/"):
+            content.append({"type": "image_url", "image_url": {
+                "url": f"data:{f['mime']};base64,{f['b64']}"}})
+    content.append(screenshot_block(force=True))
+    messages.append({"role": "user", "content": content})
     done = False
     recent_sigs, unchanged_streak, stuck_rescues = deque(maxlen=10), 0, 0
     try:
@@ -1806,20 +1889,41 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
                  "text": f"device is busy on “{title}” — stop it first"}))
             return
         text = str(msg.get("text", ""))
+        saved, err = save_attachments(msg.get("files") or [])
+        if err:
+            await ws.send_text(json.dumps({"type": "error", "text": err}))
+            return
+        if not text.strip() and not saved:
+            return
         state.conversation_id = cid
         state.model = str(meta.get("model") or state.model)
-        seq = conv_append_event(cid, {"type": "user", "text": text})
-        await broadcast({"type": "user", "text": text,
-                         "conversation_id": cid, "seq": seq})
-        state.task = asyncio.create_task(agent_loop(cid, text))
+        event = {"type": "user", "text": text}
+        if saved:
+            event["files"] = event_files(saved)
+        seq = conv_append_event(cid, event)
+        await broadcast({**event, "conversation_id": cid, "seq": seq})
+        if saved:
+            text = f"{text}\n\n{attach_note(saved)}" if text \
+                else attach_note(saved)
+        state.task = asyncio.create_task(agent_loop(cid, text, saved))
     elif mtype == "answer":
         if state.pending_answer is not None and not state.pending_answer.done():
             text = str(msg.get("text", ""))
+            saved, err = save_attachments(msg.get("files") or [])
+            if err:
+                await ws.send_text(json.dumps({"type": "error", "text": err}))
+                return
             cid = state.conversation_id
             if cid and state.running:
-                seq = conv_append_event(cid, {"type": "user", "text": text})
-                await broadcast({"type": "user", "text": text,
-                                 "conversation_id": cid, "seq": seq})
+                event = {"type": "user", "text": text}
+                if saved:
+                    event["files"] = event_files(saved)
+                seq = conv_append_event(cid, event)
+                await broadcast({**event, "conversation_id": cid, "seq": seq})
+            if saved:
+                paths = ", ".join(f["path"] for f in saved)
+                text = f"{text}\n[attached files: {paths}]" if text \
+                    else f"[attached files: {paths}]"
             state.pending_answer.set_result(text)
     elif mtype == "control":
         action = msg.get("action")

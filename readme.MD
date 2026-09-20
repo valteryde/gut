@@ -16,6 +16,7 @@ An open-source, vendor-neutral AI desktop environment governed by a vision-enabl
 - **Live Dollar & Token Cost Tracking:** Transparent spend tracking per session and lifetime via LiteLLM metrics.
 - **Dual-Control Human Takeover:** The agent acts autonomously via mouse and keyboard simulation, but you can click into the live desktop screen at any second to handle 2FA, logins, or CAPTCHAs.
 - **Teammate-Style Chat:** Quiet by default — the agent messages you when it has something worth saying: milestone updates (`send_message`), clarifying questions (`ask_user`), file deliverables (`send_file`), inline screenshots (`send_image`), and a wrap-up summary when done (`task_complete`). Flip the **verbose** toggle to watch the full working log (thoughts, tool calls, results) live. The app raises a native notification when the agent finishes or needs you.
+- **File attachments:** Attach files from the composer (paperclip, drag-and-drop onto the chat, or paste an image). They're saved under `~/uploads` on the device and the agent reads them from there; attached images are also shown to the model inline.
 
 ---
 
@@ -134,9 +135,9 @@ reports it via `GET /api/version`.
   model (claude-*, gpt-4o/5, gemini-*, qwen-vl, …). `DEFAULT_MODEL` sets the
   agent's starting model.
 - **Model picker annotations.** Each option shows the model's price per 1M
-  tokens (input/output, from LiteLLM's pricing map); the line under the
-  composer adds a quality note, vision support and context size for the
-  selected model. Models missing from the pricing map show no price.
+  tokens (input/output, from LiteLLM's pricing map); the composer bar adds a
+  quality note, vision support and context size for the selected model.
+  Models missing from the pricing map show no price.
 - **Browser tools via CDP.** Chrome always launches with DevTools on
   localhost:9222 (profile at `~/.gut-chrome`), so the agent reads the DOM and
   clicks elements by `#ref` instead of guessing pixels. **Never publish port
