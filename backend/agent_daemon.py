@@ -2002,7 +2002,13 @@ if curl -fsSL -o sums.txt "$BASE/SHA256SUMS.txt"; then
   fi
 fi
 say installing
-sudo -n apt-get install -y "$TMP/pkg.deb" >/dev/null 2>&1 || { say failed "install failed"; exit 1; }
+# Noninteractive: a changed conffile (e.g. litellm.yaml) otherwise makes
+# dpkg prompt on a dead stdin and leaves the package half-configured with
+# the services stopped. confdef/confold keep the installed config; the new
+# template lands alongside as .dpkg-new.
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+  "$TMP/pkg.deb" >/dev/null 2>&1 || { say failed "install failed"; exit 1; }
 say done
 rm -rf "$TMP"
 """
