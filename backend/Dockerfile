@@ -62,6 +62,7 @@ RUN ARCH="$(dpkg --print-architecture)" && \
         printf '%s\n' \
             '#!/bin/sh' \
             'exec '"$L"'.real --no-sandbox --disable-setuid-sandbox \' \
+            '    --no-first-run --no-default-browser-check \' \
             '    --remote-debugging-address=127.0.0.1 \' \
             '    --remote-allow-origins=* \' \
             '    --remote-debugging-port="${CDP_PORT:-9222}" \' \
@@ -71,7 +72,7 @@ RUN ARCH="$(dpkg --print-architecture)" && \
             > "$L" && \
         chmod +x "$L" ; \
     else \
-        printf 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-setuid-sandbox --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --remote-debugging-port=${CDP_PORT:-9222} --user-data-dir=${HOME}/.gut-chrome --force-device-scale-factor=${UI_SCALE:-1.25}"\n' \
+        printf 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-setuid-sandbox --no-first-run --no-default-browser-check --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --remote-debugging-port=${CDP_PORT:-9222} --user-data-dir=${HOME}/.gut-chrome --force-device-scale-factor=${UI_SCALE:-1.25}"\n' \
             > /etc/chromium.d/no-sandbox ; \
     fi
 

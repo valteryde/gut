@@ -175,6 +175,9 @@ PYEOF
     # agent's browser_* tools die with it. Provisions real Chrome on amd64
     # (deferred past the apt lock) and pins the session's default browser to
     # the /usr/local/bin/google-chrome wrapper. Never fatal.
+    # A fresh stamp file guarantees this install's provision attempt can't be
+    # throttled by a stamp left over from a previous run.
+    rm -f /var/lib/gut/.gut/browser-provision.try
     /opt/gut/ensure-browser.sh \
       || echo "gut-bot: browser provisioning failed — continuing" >&2
 

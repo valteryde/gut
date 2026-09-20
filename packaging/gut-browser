@@ -20,6 +20,7 @@
 # Chromium-family candidates above it.
 
 CHROME_FLAGS="--no-sandbox --disable-setuid-sandbox \
+--no-first-run --no-default-browser-check \
 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' \
 --remote-debugging-port=${CDP_PORT:-9222} \
 --user-data-dir=${HOME:-/var/lib/gut}/.gut-chrome \
@@ -29,14 +30,19 @@ is_snap() {
   case "$(readlink -f "$1" 2>/dev/null)" in
     /snap/*|/var/lib/snapd/*) return 0 ;;
   esac
-  # Ubuntu's transitional debs leave a shell script that defers to the snap
-  head -c 4096 "$1" 2>/dev/null | grep -q 'snap run'
+  # Ubuntu's transitional debs leave a shell script that defers to the snap —
+  # it execs /snap/bin/chromium directly and never spells out "snap run".
+  head -c 4096 "$1" 2>/dev/null | grep -qE 'snap run|/snap/|snapd|snap install'
 }
 
 # A browser that can't even print its version (missing libs, truncated
 # payload) is worse than absent — it would exec-fail or hang mid-launch.
+# A snap stub can still print a version ending in "snap" when probed as
+# root, so reject that output too.
 runnable() {
-  timeout 15 "$1" --version >/dev/null 2>&1
+  out="$(timeout 15 "$1" --version 2>/dev/null)" || return 1
+  case "$out" in *[Ss]nap*) return 1 ;; esac
+  return 0
 }
 
 # CDP-capable candidates, best first: real Chrome, Chrome for Testing

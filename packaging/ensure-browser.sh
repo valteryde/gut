@@ -49,13 +49,27 @@ is_snap() {
   case "$(readlink -f "$1" 2>/dev/null)" in
     /snap/*|/var/lib/snapd/*) return 0 ;;
   esac
-  head -c 4096 "$1" 2>/dev/null | grep -q 'snap run'
+  # Ubuntu's stub execs /snap/bin/chromium directly — it never spells out
+  # "snap run", so look for any /snap/ or snapd reference in the wrapper.
+  head -c 4096 "$1" 2>/dev/null | grep -qE 'snap run|/snap/|snapd|snap install'
 }
 
 # Actually run it — an extracted-but-dependency-broken browser must count as
-# absent so the next provisioning attempt repairs it.
+# absent so the next provisioning attempt repairs it. The snap stub passes
+# `--version` as root (snap-confine only refuses the gut service cgroup) and
+# prints a version ending in "snap", so reject that output too.
 runnable() {
-  timeout 15 "$1" --version >/dev/null 2>&1
+  out="$(timeout 15 "$1" --version 2>/dev/null)" || return 1
+  case "$out" in *[Ss]nap*) return 1 ;; esac
+  return 0
+}
+
+# apt runs unattended here (postinst, start.sh, daemon kick) — a conffile
+# prompt on a dead stdin would hang the provisioner while it holds the lock.
+export DEBIAN_FRONTEND=noninteractive
+apt_install() {
+  apt-get install -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
 find_cdp_browser() {
@@ -105,13 +119,13 @@ chrome_deps() {
            libxss1 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
            libatspi2.0-0t64 libatspi2.0-0 libdrm2 libexpat1 libcairo2 \
            libpango-1.0-0 libpangocairo-1.0-0 fonts-liberation; do
-    apt-get install -y "$p" >/dev/null 2>&1
+    apt_install "$p" >/dev/null 2>&1
   done
 }
 
 try_chrome_deb() {  # amd64 only
   wget -q -T 30 -O "$CHROME_DEB" "$CHROME_URL" || { rm -f "$CHROME_DEB"; return 1; }
-  if apt-get install -y "$CHROME_DEB"; then
+  if apt_install "$CHROME_DEB"; then
     rm -f "$CHROME_DEB"; return 0
   fi
   warn "apt install of chrome deb failed — extracting payload (no repo/deps)"
@@ -170,13 +184,15 @@ try_firefox() {
   printf 'Package: firefox*\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
     > /etc/apt/preferences.d/mozilla
   apt-get update -qq >/dev/null 2>&1 || true
-  apt-get install -y firefox >/dev/null 2>&1 || { warn "firefox: install failed"; return 1; }
+  apt_install firefox >/dev/null 2>&1 || { warn "firefox: install failed"; return 1; }
   log "installed firefox from packages.mozilla.org"
 }
 
 # ── worker mode: run the normal path once the apt lock is free ────────────
+# Bounded wait — a wedged apt holder must not park this worker forever; on
+# timeout the apt_busy check below simply defers again.
 if [ "${1:-}" = "--deferred" ]; then
-  python3 - <<'PY' 2>/dev/null || sleep 30
+  timeout 900 python3 - <<'PY' 2>/dev/null || sleep 30
 import fcntl
 f = open("/var/lib/dpkg/lock-frontend", "w")
 fcntl.lockf(f, fcntl.LOCK_EX)
@@ -205,11 +221,12 @@ if ! find_cdp_browser >/dev/null; then
   last="$(cat "$STAMP" 2>/dev/null || echo 0)"
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
   if [ $((now - last)) -ge 1800 ]; then
-    echo "$now" > "$STAMP"
     arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
     if apt_busy; then
       # Inside the deb's own apt transaction: hand off to a transient unit
       # that waits for the lock; without systemd do the lock-free parts.
+      # No stamp is written here — the deferred worker re-checks freshness
+      # itself, and a fresh stamp would make it skip the install entirely.
       if [ -d /run/systemd/system ]; then
         log "inside apt transaction — deferring provisioning"
         systemd-run --unit=gut-browser-install \
@@ -217,10 +234,12 @@ if ! find_cdp_browser >/dev/null; then
           /opt/gut/ensure-browser.sh --deferred \
           || warn "systemd-run failed — browser provisioning deferred to next start"
       else
+        echo "$now" > "$STAMP"
         log "no systemd — lock-free provisioning only"
         try_chrome_for_testing || warn "cft fallback failed"
       fi
     else
+      echo "$now" > "$STAMP"
       log "no usable browser — provisioning ($arch)"
       [ "$arch" = amd64 ] && { try_chrome_deb || warn "chrome deb failed"; }
       find_cdp_browser >/dev/null || try_chrome_for_testing || true
