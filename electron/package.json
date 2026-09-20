@@ -26,7 +26,11 @@
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "resources/icon.icns",
-      "target": ["dmg", "zip"]
+      "target": ["dmg", "zip"],
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "gut connects to Gut backends on your local network — the desktop stream and agent API run on machines you point it at.",
+        "NSBonjourServices": ["_http._tcp", "_ws._tcp"]
+      }
     },
     "win": {
       "icon": "resources/icon.png",
