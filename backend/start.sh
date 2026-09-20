@@ -106,8 +106,11 @@ if [ ! -s "$TLS_CERT" ] || [ ! -s "$TLS_KEY" ]; then
 fi
 export GUT_TLS_CERT="$TLS_CERT" GUT_TLS_KEY="$TLS_KEY"
 
-echo "[gut] starting websockify/noVNC on :6080 (+ TLS on :6443)"
-websockify --web /usr/share/novnc 6080 localhost:5900 &
+# The daemon multiplexes the public :6080 itself — plain websockify parks on
+# a loopback port and TLS ClientHellos get routed to the :6443 listener, so
+# the encrypted stream works wherever plain :6080 already reaches.
+echo "[gut] starting websockify/noVNC (plain loopback :6081, TLS :6443)"
+websockify --web /usr/share/novnc 127.0.0.1:6081 localhost:5900 &
 if [ -s "$TLS_CERT" ] && [ -s "$TLS_KEY" ]; then
   websockify --web /usr/share/novnc --cert "$TLS_CERT" --key "$TLS_KEY" \
     "${GUT_NOVNC_TLS_PORT:-6443}" localhost:5900 &
@@ -131,6 +134,10 @@ for _ in $(seq 1 120); do
     sleep 1
 done
 
-echo "[gut] starting agent daemon on :${GUT_HTTP_PORT:-8000} (+ TLS on :${GUT_TLS_PORT:-8443})"
+# uvicorn listens on loopback only; the daemon multiplexes the public
+# :8000 between plain HTTP and TLS (same for :6080 above), so the pinned
+# TLS transport works anywhere the plain ports reach.
+export GUT_UVICORN_PORT="${GUT_UVICORN_PORT:-8001}"
+echo "[gut] starting agent daemon on :${GUT_HTTP_PORT:-8000} (+ TLS; uvicorn loopback :${GUT_UVICORN_PORT})"
 cd /opt/gut
-exec uvicorn agent_daemon:app --host 0.0.0.0 --port "${GUT_HTTP_PORT:-8000}"
+exec uvicorn agent_daemon:app --host 127.0.0.1 --port "$GUT_UVICORN_PORT"

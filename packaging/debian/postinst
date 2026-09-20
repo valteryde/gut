@@ -33,6 +33,9 @@ DATABASE_URL=postgresql://litellm:${PGPASS}@127.0.0.1:5432/litellm
 RESOLUTION=1024x768
 UI_SCALE=1.0
 DEVICE_NAME=${HOST}
+# Optional: point the agent's web_search at a SearXNG instance you host
+# (gut-bot ships none — unset = built-in DuckDuckGo fallback).
+# SEARXNG_URL=http://127.0.0.1:8888
 # WALLPAPER_HUE=    # 0-360: pin the desktop wallpaper color (default: derived from DEVICE_NAME)
 # DEFAULT_MODEL=openrouter/claude-sonnet-4.5
 
@@ -179,8 +182,8 @@ PYEOF
     cat <<EOF
 
   gut-bot is up.
-    agent api : https://${IP:-<host>}:8443
-    desktop   : https://${IP:-<host>}:6443
+    agent api : https://${IP:-<host>}:8000  (plain :8000 too)
+    desktop   : https://${IP:-<host>}:6080  (plain :6080 too)
     password  : ${VNC_PASSWORD}
 
   Add this machine in the app, then paste model provider keys in

@@ -41,6 +41,11 @@ try:
 except ImportError:  # websockets<13
     from websockets import connect as ws_connect
 
+try:
+    import tcpmux
+except ImportError:  # running as a package (uvicorn backend.agent_daemon)
+    tcpmux = None
+
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://localhost:4000").rstrip("/")
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5")
@@ -125,11 +130,32 @@ NOVNC_TLS_PORT = int(os.environ.get("GUT_NOVNC_TLS_PORT", "6443"))
 # start.sh passes the same var to uvicorn's --port so overrides stay in
 # sync (AGENT_PORT in .env only moves the host-side compose mapping).
 HTTP_PORT = int(os.environ.get("GUT_HTTP_PORT", "8000"))
+# When start.sh parks uvicorn on a loopback-only port (GUT_UVICORN_PORT),
+# this process multiplexes the public ports itself: TLS ClientHellos get
+# routed to the :8443/:6443 terminators, everything else to the plain
+# backends — so pinned TLS works wherever the plain ports already reach,
+# no extra firewall holes or port forwards needed.
+UVICORN_PORT = int(os.environ.get("GUT_UVICORN_PORT", "0"))
+BACKEND_PORT = UVICORN_PORT or HTTP_PORT
+MUX = bool(UVICORN_PORT)
+NOVNC_PORT = int(os.environ.get("GUT_NOVNC_PORT", "6080"))
+NOVNC_PLAIN_PORT = int(os.environ.get("GUT_NOVNC_PLAIN_PORT", "6081"))
 TLS_FP = None  # sha256 of the cert the proxy actually presents
+TLS_ERR = None  # why TLS is down, when it is — surfaced via /api/hello
 # Files the user attaches in the composer land on the desktop itself, where
 # the agent's file/shell tools can read them (paths are relative to home).
 UPLOAD_DIR = Path(os.environ.get("GUT_UPLOAD_DIR") or HOME_DIR / "uploads")
 MAX_ATTACHMENTS = 8
+# Per-run cleanup: a deterministic sweep (close tabs/windows/processes the
+# run created, wipe ~/scratch) followed by a short janitor LLM pass for
+# residue the sweep can't see. GUT_CLEANUP=off disables both.
+GUT_CLEANUP = os.environ.get("GUT_CLEANUP", "on").lower() not in (
+    "off", "0", "false", "no")
+JANITOR_MAX_STEPS = int(os.environ.get("JANITOR_MAX_STEPS", "10"))
+SCRATCH_DIR = HOME_DIR / "scratch"
+# Baseline of what was running when a task started, persisted so a daemon
+# restart mid-run still lets the next boot sweep that run's leftovers.
+RUN_STATE_FILE = GUT_DATA_DIR / "run_state.json"
 # Base64 inflates ~33%; keep the ws message comfortably under uvicorn's
 # 16 MB frame cap.
 ATTACH_TOTAL_MAX_BYTES = int(
@@ -2060,6 +2086,7 @@ def _ensure_tls_cert() -> None:
     """Self-signed cert for the pinned-TLS listener. start.sh already does
     this for docker/gut-bot (websockify needs the files too); this fallback
     covers bare `uvicorn agent_daemon:app` dev runs."""
+    global TLS_ERR
     if TLS_CERT.exists() and TLS_KEY.exists():
         return
     cn = re.sub(r"[^A-Za-z0-9._-]", "", DEVICE_NAME) or "device"
@@ -2073,6 +2100,7 @@ def _ensure_tls_cert() -> None:
             check=True, capture_output=True)
         TLS_KEY.chmod(0o600)
     except (OSError, subprocess.CalledProcessError) as e:
+        TLS_ERR = f"cert generation failed ({e})"
         print(f"[gut] TLS cert generation failed ({e}) — TLS disabled")
 
 
@@ -2095,7 +2123,7 @@ async def _tls_bridge(client_r: asyncio.StreamReader,
                       client_w: asyncio.StreamWriter) -> None:
     try:
         local_r, local_w = await asyncio.open_connection(
-            "127.0.0.1", HTTP_PORT)
+            "127.0.0.1", BACKEND_PORT)
     except OSError:
         client_w.close()
         return
@@ -2104,18 +2132,24 @@ async def _tls_bridge(client_r: asyncio.StreamReader,
 
 async def _start_tls_proxy():
     """TLS-terminating forwarder onto the plain uvicorn socket."""
-    global TLS_FP
+    global TLS_FP, TLS_ERR
     _ensure_tls_cert()
     try:
         der = ssl.PEM_cert_to_DER_cert(TLS_CERT.read_text())
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(TLS_CERT, TLS_KEY)
     except (OSError, ValueError, ssl.SSLError) as e:
+        TLS_ERR = f"cert unusable ({e})"
         print(f"[gut] TLS unavailable ({e}) — plain HTTP only")
         return None
     TLS_FP = hashlib.sha256(der).hexdigest()
-    srv = await asyncio.start_server(_tls_bridge, "0.0.0.0", TLS_PORT,
-                                     ssl=ctx)
+    try:
+        srv = await asyncio.start_server(_tls_bridge, "0.0.0.0", TLS_PORT,
+                                         ssl=ctx)
+    except OSError as e:
+        TLS_ERR = f"cannot bind :{TLS_PORT} ({e})"
+        print(f"[gut] TLS listener failed ({e}) — plain HTTP only")
+        return None
     print(f"[gut] TLS listener on :{TLS_PORT} (self-signed, pinned by the app)")
     return srv
 
@@ -2129,6 +2163,24 @@ async def lifespan(_app: FastAPI):
     except OSError as e:
         print(f"[gut] conversation dir {CONV_DIR} unavailable: {e}")
     tls_srv = await _start_tls_proxy()
+    # Port multiplexers (see tcpmux): uvicorn and plain websockify sit on
+    # loopback internals; the public ports carry plain AND TLS so encrypted
+    # transport works wherever the plain ports already reach.
+    mux_srvs = []
+    if MUX:
+        if tcpmux is None:
+            # uvicorn is parked on loopback — without the mux nothing can
+            # reach the API at all, so die loudly instead of limping.
+            raise RuntimeError("tcpmux.py missing but GUT_UVICORN_PORT is "
+                               "set — broken install")
+        try:
+            mux_srvs = [
+                await tcpmux.start_mux(HTTP_PORT, TLS_PORT, BACKEND_PORT),
+                await tcpmux.start_mux(NOVNC_PORT, NOVNC_TLS_PORT,
+                                       NOVNC_PLAIN_PORT)]
+        except OSError as e:
+            print(f"[gut] port mux failed ({e}) — public ports unproxied")
+            mux_srvs = []
     state.litellm_key = await provision_key()
     sync_task = asyncio.create_task(model_sync_loop())
     print(f"[gut] agent ready, model={state.model}")
@@ -2138,6 +2190,8 @@ async def lifespan(_app: FastAPI):
         sync_task.cancel()
         if tls_srv:
             tls_srv.close()
+        for srv in mux_srvs:
+            srv.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -2214,14 +2268,18 @@ async def api_hello(n: str = ""):
     makes every answer single-use so replays can't pin stale certs.
     """
     if not TLS_FP:
-        raise HTTPException(404, "this backend has no TLS listener")
+        raise HTTPException(
+            404, TLS_ERR or "this backend has no TLS listener")
     mac = None
     if GUT_API_TOKEN:
         mac = hmac.new(GUT_API_TOKEN.encode(),
                        f"gut-tls-pin:{TLS_FP}:{n}".encode(),
                        hashlib.sha256).hexdigest()
+    # With the mux running, TLS rides the same public ports as plain HTTP —
+    # advertise those so pairing works wherever :8000/:6080 already reach.
     return {"cert_sha256": TLS_FP, "mac": mac,
-            "port": TLS_PORT, "vnc_port": NOVNC_TLS_PORT}
+            "port": HTTP_PORT if MUX else TLS_PORT,
+            "vnc_port": NOVNC_PORT if MUX else NOVNC_TLS_PORT}
 
 
 def _update_status() -> dict:

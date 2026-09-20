@@ -123,10 +123,10 @@ reports it via `GET /api/version`.
 
 | Port | Service |
 |---|---|
-| 8443 | Agent daemon over TLS — same API as :8000, self-signed cert pinned by the app |
-| 6443 | noVNC / websockify desktop stream over TLS — requires the device password |
-| 8000 | Agent daemon, plain HTTP — kept for older clients and the `/api/hello` pairing handshake |
-| 6080 | noVNC desktop stream, plain — kept for older clients |
+| 8000 | Agent daemon — plain HTTP **and** TLS multiplexed on one port (ClientHello sniff), so pinned TLS works wherever :8000 already reaches |
+| 6080 | noVNC desktop stream — plain **and** TLS multiplexed the same way |
+| 8443 | Agent daemon over TLS, dedicated listener — kept for older clients |
+| 6443 | noVNC / websockify desktop stream over TLS — kept for older clients |
 | 4000 | LiteLLM proxy (admin UI at `/ui`) — localhost-only in gut-bot |
 
 ---
@@ -214,8 +214,12 @@ pairing and expose only the version, device name and cert fingerprint. Keep
 `LITELLM_MASTER_KEY` secret — it administers the proxy.
 
 **Transport encryption.** Every backend generates a persistent self-signed
-cert at boot and serves the agent API + desktop stream over TLS on `:8443`
-/`:6443` (the plain `:8000`/`:6080` ports stay for older clients). There is
+cert at boot and serves the agent API + desktop stream over TLS. The public
+`:8000`/`:6080` ports carry **both** transports — the daemon peeks at the
+first byte (a TLS ClientHello starts with `0x16`, HTTP/WS with ASCII) and
+routes accordingly — so encryption works wherever the plain ports already
+reach, no extra firewall rules or forwards needed. Dedicated `:8443`/`:6443`
+listeners stay up for older clients. There is
 no CA and nothing to provision: on first connect the app fetches the
 unauthenticated `/api/hello` — the cert fingerprint plus
 `HMAC(device password, fingerprint + nonce)` — opens a provisional TLS

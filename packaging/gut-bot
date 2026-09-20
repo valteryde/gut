@@ -19,8 +19,8 @@ case "$cmd" in
     load_env
     IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     echo "gut-bot $(cat /opt/gut/VERSION 2>/dev/null || echo '?') — ${DEVICE_NAME:-$(hostname)}"
-    echo "  agent api : https://${IP:-<host>}:8443"
-    echo "  desktop   : https://${IP:-<host>}:6443"
+    echo "  agent api : https://${IP:-<host>}:8000  (plain :8000 too)"
+    echo "  desktop   : https://${IP:-<host>}:6080  (plain :6080 too)"
     echo "  password  : ${VNC_PASSWORD:-<unset>}"
     echo "  litellm   : http://127.0.0.1:4000 (localhost only)"
     echo

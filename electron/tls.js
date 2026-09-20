@@ -58,7 +58,15 @@ async function tlsHandshake(host, password, pins, httpPort = 8000) {
     const r = await fetch(
       `http://${host}:${httpPort}/api/hello?n=${nonce}`,
       { signal: AbortSignal.timeout(5000) });
-    if (r.status === 404) return { ok: false, unsupported: true };
+    if (r.status === 404) {
+      // Newer daemons explain why TLS is down in the detail; genuinely old
+      // backends just return FastAPI's "Not Found".
+      let detail = '';
+      try { detail = String((await r.json()).detail || ''); } catch (_) {}
+      return { ok: false, unsupported: true,
+               error: detail && detail !== 'Not Found'
+                 ? `backend TLS unavailable: ${detail}` : '' };
+    }
     if (!r.ok) return { ok: false, error: `hello returned ${r.status}` };
     hello = await r.json();
   } catch (e) {

@@ -63,6 +63,7 @@ rm -f "$DLREQS"
 # ── payload ───────────────────────────────────────────────────────────────
 install -m755 "$ROOT/backend/start.sh" "$STAGE/opt/gut/start.sh"
 install -m644 "$ROOT/backend/agent_daemon.py" "$STAGE/opt/gut/agent_daemon.py"
+install -m644 "$ROOT/backend/tcpmux.py" "$STAGE/opt/gut/tcpmux.py"
 install -m644 "$ROOT/backend/requirements.txt" "$STAGE/opt/gut/requirements.txt"
 install -m644 "$ROOT/packaging/litellm-requirements.txt" \
             "$STAGE/opt/gut/litellm-requirements.txt"
