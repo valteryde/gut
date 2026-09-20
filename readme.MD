@@ -247,3 +247,13 @@ git tag v0.4.0 && git push --tags
 arm64), builds `gut-bot` debs for both architectures inside `debian:trixie`
 containers, builds the Electron app for macOS/Windows/Linux, and attaches
 everything plus checksums to a GitHub Release.
+
+**macOS signing:** the app is self-signed — no Apple developer account.
+Run `packaging/make-signing-cert.sh` once and set the `MAC_CSC_LINK` /
+`MAC_CSC_PASSWORD` secrets it prints; `release.yml` then signs every mac
+build with the same cert. This matters beyond cosmetics: macOS ties
+privacy grants (Local Network, …) to the code signature, and adhoc builds
+get a new identity each release — so every update silently revokes the
+grant and the app loses its backends. A stable cert keeps the grant alive
+across updates. Without the secrets the build still works, just stays
+adhoc-signed.

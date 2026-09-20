@@ -126,6 +126,45 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # A stable signature keeps the app's TCC identity identical across
+      # builds — adhoc-signed builds get a new cdhash every release, so
+      # macOS revokes Local Network (and friends) on every update and the
+      # app silently loses its backends. The cert is self-signed (no Apple
+      # account): Gatekeeper still won't trust it, but install/update
+      # strip quarantine anyway. Secrets via packaging/make-signing-cert.sh
+      - name: Import mac signing cert
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_PASSWORD: ${{ secrets.MAC_CSC_PASSWORD }}
+        run: |
+          if [ -z "$MAC_CSC_LINK" ]; then
+            echo "MAC_CSC_LINK not set — mac build stays adhoc-signed" \
+              "(privacy grants reset on every update)"
+            exit 0
+          fi
+          KC=gut-sign.keychain
+          KCPW=gh-actions
+          echo "$MAC_CSC_LINK" | base64 -d > /tmp/gut-sign.p12
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          security import /tmp/gut-sign.p12 -k "$KC" -P "$MAC_CSC_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" \
+            $(security list-keychains -d user | tr -d '"')
+          # Self-signed root isn't trusted by default — trust it or
+          # find-identity -p codesigning won't return it to electron-builder.
+          security find-certificate -c "gut self-signed" -p "$KC" \
+            > /tmp/gut-sign-cert.pem
+          security add-trusted-cert -r trustRoot \
+            -k "$KC" /tmp/gut-sign-cert.pem
+          security find-identity -v -p codesigning
+          echo "CSC_NAME=gut self-signed" >> "$GITHUB_ENV"
+          echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
       - name: Stamp version + build
         working-directory: electron
         run: |
