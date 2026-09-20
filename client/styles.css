@@ -560,6 +560,107 @@ body.verbose .verbose-only { display: grid; }
 }
 .msg.thought .body { font-style: italic; color: var(--text-3); }
 
+/* plan card — the agent's share_plan, kept in the transcript */
+.msg.plan .body {
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--mint);
+  border-radius: var(--radius-card);
+  font-size: 13.5px;
+}
+
+/* compaction divider — marks where older history was summarized away */
+.msg.compact {
+  display: flex;
+  align-items: center;
+}
+.msg.compact .who { display: none; }
+.msg.compact .body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.msg.compact .body::before,
+.msg.compact .body::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* pinned checklist card — the agent's update_todos list, live above the
+   transcript */
+#todoCard {
+  flex: none;
+  margin: 10px 12px 0;
+  background: var(--surface);
+  border: 1px solid var(--mint-line);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+#todoHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-2);
+  text-align: left;
+  cursor: pointer;
+}
+#todoHead .chev {
+  width: 13px;
+  height: 13px;
+  color: var(--text-3);
+  transition: transform 0.15s;
+}
+#todoCard.collapsed #todoHead .chev { transform: rotate(-90deg); }
+#todoCount {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+#todoList {
+  list-style: none;
+  margin: 0;
+  padding: 0 12px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#todoCard.collapsed #todoList { display: none; }
+.todo-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+.todo-mark {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+.todo-item.in_progress { color: var(--text); }
+.todo-item.in_progress .todo-mark { color: var(--mint-ink); }
+.todo-item.pending { color: var(--text-2); }
+.todo-item.done { color: var(--text-3); }
+.todo-item.done .todo-mark { color: var(--mint-ink); }
+.todo-item.done .todo-text { text-decoration: line-through; }
+
 /* file + image deliveries */
 .file-note { margin: 0 0 8px; }
 

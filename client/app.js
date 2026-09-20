@@ -238,6 +238,10 @@ const convDrawer = $('convDrawer');
 const convList = $('convList');
 const drawerDevice = $('drawerDevice');
 const chatPane = $('chatPane');
+const todoCard = $('todoCard');
+const todoHead = $('todoHead');
+const todoList = $('todoList');
+const todoCount = $('todoCount');
 
 let rfb = null;
 let chatWs = null;
@@ -256,6 +260,7 @@ let lastSeq = 0;                 // highest seq rendered in the transcript
 let convFetchId = null;          // conversation currently being refetched
 let pendingLive = [];            // live events arrived during a refetch
 let convListTimer = 0;
+let todoCollapsed = localStorage.getItem('gut.todos.collapsed') === '1';
 
 const convKey = (devId) => `gut.conv.${devId}`;
 
@@ -448,14 +453,28 @@ function renderEvent(m, live) {
       addImageMsg(m);
       break;
     case 'thought':
-      addVerbose('thought', (m.text || '').trim());
+      addVerbose('thought', `${m.agent ? m.agent + ' · ' : ''}${(m.text || '').trim()}`);
       break;
     case 'action':
-      addVerbose('action', `▶ ${m.tool} ${JSON.stringify(m.args)}`);
-      if (live) activityEl.textContent = `${agentName} · ▶ ${m.tool}`;
+      addVerbose('action', `▶ ${m.agent ? m.agent + '·' : ''}${m.tool} ${JSON.stringify(m.args)}`);
+      if (live) activityEl.textContent = `${m.agent || agentName} · ▶ ${m.tool}`;
       break;
     case 'action_result':
-      addVerbose('action', `✓ ${m.tool}: ${(m.result || '').trim()}`);
+      addVerbose('action', `✓ ${m.agent ? m.agent + '·' : ''}${m.tool}: ${(m.result || '').trim()}`);
+      break;
+    case 'subagent':
+      addVerbose('action', `◈ ${m.name} ${m.state}` +
+        (m.result ? ` — ${String(m.result).trim()}` : ''));
+      if (live) activityEl.textContent = `${agentName} · helper ${m.name} ${m.state}`;
+      break;
+    case 'cleanup':
+      addVerbose('thought', m.text || '');
+      break;
+    case 'plan':
+      addMsg('plan', m.text, `${agentName} · plan`);
+      break;
+    case 'compact':
+      entry('compact').body.textContent = m.text || 'context compacted';
       break;
     case 'question':
       addMsg('question', m.text, agentName);
@@ -476,6 +495,7 @@ function renderEvent(m, live) {
 const STATE_LABEL = {
   waiting_user: 'needs you',
   paused: 'paused',
+  cleanup: 'tidying up',
 };
 
 function setAgentState(s) {
@@ -747,6 +767,39 @@ function renderConvList() {
   updateConvCost();
 }
 
+// The agent's update_todos checklist, pinned above the transcript. State
+// lives on the device (per conversation) — it arrives live as `todos`
+// socket events and is restored from GET /api/conversations on open.
+const TODO_MARK = { pending: '○', in_progress: '◐', done: '●' };
+
+function renderTodoCard(items) {
+  const list = Array.isArray(items) ? items : [];
+  todoCard.hidden = !list.length;
+  todoCard.classList.toggle('collapsed', todoCollapsed);
+  todoList.innerHTML = '';
+  let done = 0;
+  for (const it of list) {
+    if (it.status === 'done') done++;
+    const li = document.createElement('li');
+    li.className = `todo-item ${it.status || 'pending'}`;
+    const mark = document.createElement('span');
+    mark.className = 'todo-mark';
+    mark.textContent = TODO_MARK[it.status] || TODO_MARK.pending;
+    const txt = document.createElement('span');
+    txt.className = 'todo-text';
+    txt.textContent = it.content || '';
+    li.append(mark, txt);
+    todoList.appendChild(li);
+  }
+  todoCount.textContent = list.length ? `${done}/${list.length}` : '';
+}
+
+todoHead.onclick = () => {
+  todoCollapsed = !todoCollapsed;
+  localStorage.setItem('gut.todos.collapsed', todoCollapsed ? '1' : '0');
+  todoCard.classList.toggle('collapsed', todoCollapsed);
+};
+
 function clearTranscript(title) {
   messagesEl.innerHTML = '';
   lastEntryKey = null;
@@ -755,6 +808,7 @@ function clearTranscript(title) {
   awaitingAnswer = false;
   chatInput.placeholder = TASK_PLACEHOLDER;
   convTitleEl.textContent = title || 'New conversation';
+  renderTodoCard([]);
   updateTyping();
 }
 
@@ -773,6 +827,7 @@ async function openConversation(id) {
     clearTranscript(c.meta.title);
     convModel = c.meta.model || null;
     if (convModel) syncModel(convModel);
+    renderTodoCard(c.todos);
     for (const ev of c.events) {
       if (ev.seq) lastSeq = Math.max(lastSeq, ev.seq);
       renderEvent(ev, false);
@@ -847,7 +902,8 @@ async function deleteConversation(id) {
 // Status/cost also carry conversation_id but are channel noise, not history.
 const TRANSCRIPT_TYPES = new Set([
   'user', 'agent_msg', 'done', 'file', 'image',
-  'thought', 'action', 'action_result', 'question', 'error',
+  'thought', 'action', 'action_result', 'question', 'error', 'cleanup',
+  'subagent', 'plan', 'compact',
 ]);
 
 // A transcript event arrives tagged with (conversation_id, seq). Render it
@@ -919,6 +975,13 @@ function connectChat() {
         break;
       case 'conversations':
         scheduleConvReload();
+        break;
+      case 'todos':
+        // Live checklist state — not a transcript event; the fetched
+        // conversation already carries the latest list during a refetch.
+        if (m.conversation_id === activeConvId && convFetchId !== activeConvId) {
+          renderTodoCard(m.items);
+        }
         break;
       case 'cost':
         setCost(m);
