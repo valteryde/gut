@@ -184,13 +184,20 @@ const MODEL_NOTES = [
 ];
 
 const TASK_PLACEHOLDER = 'Describe a task…';
+const QUEUE_PLACEHOLDER =
+  'Queue a message — ⌘/Ctrl+Enter sends it to the agent now…';
+
+function syncPlaceholder() {
+  chatInput.placeholder = awaitingAnswer
+    ? `Reply to ${agentName}…`
+    : agentPhase === 'idle' ? TASK_PLACEHOLDER : QUEUE_PLACEHOLDER;
+}
 
 function setAgentName(model) {
   const m = String(model || '');
   const match = AGENT_NAMES.find(([re]) => re.test(m));
   agentName = match ? match[1] : DEFAULT_NAME;
-  chatInput.placeholder =
-    awaitingAnswer ? `Reply to ${agentName}…` : TASK_PLACEHOLDER;
+  syncPlaceholder();
   updateTyping();
 }
 
@@ -227,6 +234,7 @@ const devFormTitle = $('devFormTitle');
 const newDevBtn = $('newDevBtn');
 const saveSettingsBtn = $('saveSettings');
 const stopBtn = $('stopBtn');
+const steerBtn = $('steerBtn');
 const sendBtn = $('sendBtn');
 const attachBtn = $('attachBtn');
 const attachTray = $('attachTray');
@@ -257,17 +265,18 @@ let activeConvDevId = null;      // device that conversation lives on
 let convModel = null;            // model bound to the viewed conversation
 let runningConvId = null;        // conversation the device is working on
 let lastSeq = 0;                 // highest seq rendered in the transcript
+
+// Messages sent while the agent works queue on the device — the echoed
+// transcript event carries `queued`, and the badge clears on `dequeue`.
+const queuedSeqs = new Map();    // "conv:seq" -> mode, mirrors the daemon
+const queuedEls = new Map();     // "conv:seq" -> badge element
+const qkey = (conv, seq) => `${conv}:${seq}`;
 let convFetchId = null;          // conversation currently being refetched
 let pendingLive = [];            // live events arrived during a refetch
 let convListTimer = 0;
 let todoCollapsed = localStorage.getItem('gut.todos.collapsed') === '1';
 
 const convKey = (devId) => `gut.conv.${devId}`;
-
-function convTitle(id) {
-  const c = conversations.find(c => c.id === id);
-  return (c && c.title) || 'another conversation';
-}
 
 // ── transcript ──────────────────────────────────────────────────────────
 // Typing indicator — not a transcript entry but a live row pinned to the
@@ -377,6 +386,40 @@ function attachChip(f, removable, onRemove) {
   return chip;
 }
 
+// Tag under a mid-run message: "sent to the agent" once steered into the
+// run, "queued" while it waits for the run to finish — with send-now and
+// drop controls on the queued state.
+function queueTag(mode, cid, seq) {
+  const tag = document.createElement('span');
+  tag.className = 'qtag';
+  if (mode === 'steer') {
+    tag.textContent = '⚡ sent to the agent';
+  } else {
+    tag.appendChild(document.createTextNode('queued'));
+    if (seq != null && cid === runningConvId) {
+      const now = document.createElement('button');
+      now.type = 'button';
+      now.textContent = '· send now';
+      now.title = "Push it into the run at the agent's next step";
+      now.onclick = () => {
+        send({ type: 'control', action: 'deliver', seq });
+        now.disabled = true;
+      };
+      tag.appendChild(now);
+    }
+    if (seq != null) {
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = '· drop';
+      rm.title = 'Remove from the queue';
+      rm.onclick = () => send({ type: 'control', action: 'dequeue', seq });
+      tag.appendChild(rm);
+    }
+  }
+  if (seq != null) queuedEls.set(qkey(cid, seq), tag);
+  return tag;
+}
+
 // Your own message: clay bubble with the text plus a chip per attachment.
 function addUserMsg(m) {
   const { body } = entry('user', 'You');
@@ -387,6 +430,10 @@ function addUserMsg(m) {
     for (const f of m.files) tray.appendChild(attachChip(f, false));
     body.appendChild(tray);
   }
+  const cid = m.conversation_id || activeConvId;
+  const mode = m.queued ||
+    (m.seq != null ? queuedSeqs.get(qkey(cid, m.seq)) : null);
+  if (mode) body.appendChild(queueTag(mode, cid, m.seq));
 }
 
 function addFileMsg(m) {
@@ -503,7 +550,9 @@ function setAgentState(s) {
   agentPhase = s;
   document.body.dataset.agent = s;
   stopBtn.hidden = !(s === 'running' || s === 'waiting_user' || s === 'paused');
+  steerBtn.hidden = s === 'idle';
   if (s === 'idle') activityEl.textContent = '';
+  syncPlaceholder();
   updateTyping();
 }
 
@@ -807,7 +856,7 @@ function clearTranscript(title) {
   lastSeq = 0;
   convModel = null;
   awaitingAnswer = false;
-  chatInput.placeholder = TASK_PLACEHOLDER;
+  syncPlaceholder();
   convTitleEl.textContent = title || 'New conversation';
   renderTodoCard([]);
   updateTyping();
@@ -911,6 +960,11 @@ const TRANSCRIPT_TYPES = new Set([
 // when viewing that conversation — deduped against replayed history — or
 // nudge the drawer when it belongs to another conversation.
 function handleTranscriptEvent(m) {
+  // Queue tracking runs before the conversation filter — a message queued
+  // on another conversation still needs its badge when it's opened later.
+  if (m.queued && m.seq != null) {
+    queuedSeqs.set(qkey(m.conversation_id, m.seq), m.queued);
+  }
   if (m.conversation_id !== activeConvId) {
     scheduleConvReload();
     return;
@@ -952,6 +1006,12 @@ function connectChat() {
     switch (m.type) {
       case 'hello':
         runningConvId = m.running_conversation || null;
+        // The daemon's queue is the truth — a reconnect re-syncs it.
+        queuedSeqs.clear();
+        queuedEls.clear();
+        for (const q of m.queue || []) {
+          if (q.seq != null) queuedSeqs.set(qkey(q.conv, q.seq), q.mode);
+        }
         setAgentState(m.state);
         if (m.model && (!activeConvId || runningConvId === activeConvId)) {
           syncModel(m.model);
@@ -986,6 +1046,24 @@ function connectChat() {
         break;
       case 'cost':
         setCost(m);
+        break;
+      case 'dequeue':
+        // A queued message was delivered into context (or dropped) — its
+        // badge comes off the transcript bubble.
+        for (const it of m.items || []) {
+          const k = qkey(it.conv || activeConvId, it.seq);
+          queuedSeqs.delete(k);
+          const tag = queuedEls.get(k);
+          queuedEls.delete(k);
+          if (tag) {
+            if (m.dropped) {
+              tag.textContent = 'dropped';
+              tag.classList.add('dropped');
+            } else {
+              tag.remove();
+            }
+          }
+        }
         break;
       case 'error':
         addMsg('error', m.text, 'Error');
@@ -1181,11 +1259,13 @@ chatInput.addEventListener('input', () => {
   autosizeChatInput();
   syncSendBtn();
 });
-// Enter sends, Shift+Enter inserts a newline.
+// Enter sends, Shift+Enter inserts a newline; while the agent works,
+// ⌘/Ctrl+Enter steers the message into the run instead of queueing it.
 chatInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
-    $('chatForm').requestSubmit();
+    if ((e.metaKey || e.ctrlKey) && agentPhase !== 'idle') submitChat(true);
+    else $('chatForm').requestSubmit();
   }
 });
 
@@ -1306,9 +1386,10 @@ chatPane.addEventListener('drop', (e) => {
 });
 
 // Every message runs on the selected device with the conversation's model.
-// One agent per device: a busy device rejects (or the client short-circuits).
-$('chatForm').onsubmit = async (e) => {
-  e.preventDefault();
+// One agent per device: while it works, sends queue behind the run (the
+// agent picks them up when it finishes, before cleanup) — or `steer`
+// pushes the message into the running context at the next step.
+async function submitChat(steer) {
   const text = chatInput.value.trim();
   if (!text && !stagedFiles.length) return;
   let files;
@@ -1323,19 +1404,9 @@ $('chatForm').onsubmit = async (e) => {
     chatInput.value = '';
     autosizeChatInput();
     awaitingAnswer = false;
-    chatInput.placeholder = TASK_PLACEHOLDER;
+    syncPlaceholder();
     send({ type: 'answer', text, files });
     clearStaged();
-    return;
-  }
-  // Rejected sends keep the draft so it isn't lost.
-  if (agentPhase !== 'idle') {
-    addMsg('error',
-      runningConvId && runningConvId !== activeConvId
-        ? `${activeDev().name} is busy on “${convTitle(runningConvId)}” — ` +
-          'stop it there or pick another device'
-        : 'the agent is still working — stop it or wait',
-      'Error');
     return;
   }
   if (!activeConvId) {
@@ -1349,9 +1420,11 @@ $('chatForm').onsubmit = async (e) => {
   chatInput.value = '';
   autosizeChatInput();
   // Rendered when the daemon echoes the stored event back over the socket.
-  send({ type: 'task', conversation_id: activeConvId, text, files });
+  send({ type: 'task', conversation_id: activeConvId, text, files, steer });
   clearStaged();
-};
+}
+$('chatForm').onsubmit = (e) => { e.preventDefault(); submitChat(false); };
+steerBtn.onclick = () => submitChat(true);
 syncSendBtn();
 
 // ── conversation drawer ─────────────────────────────────────────────────

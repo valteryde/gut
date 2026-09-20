@@ -347,6 +347,12 @@ class AgentState:
         # subagent_inbox for injection into their conversation's context.
         self.subagents: dict[str, dict] = {}
         self.subagent_inbox = deque()
+        # User messages sent while a run is active: {conv, text, files,
+        # mode, seq}. "steer" entries inject into the running
+        # conversation's context at the next step; "queue" entries are
+        # picked up when the run ends — same-conversation ones even before
+        # the end-of-run cleanup sweep.
+        self.user_msgs = deque()
         # The running conversation's update_todos checklist (persisted at
         # <cid>.todos.json) and the long-horizon bookkeeping for reminders
         # and compaction.
@@ -2672,6 +2678,47 @@ def drain_subagent_inbox(conv_id: str, messages: list) -> None:
     state.subagent_inbox.extend(kept)
 
 
+async def drain_user_msgs(conv_id: str, messages: list, mode: str) -> bool:
+    """Deliver queued user messages into the run's context as user turns.
+
+    "steer" entries land mid-run at the next step boundary; "queue"
+    entries are delivered when the run would otherwise finish — a
+    follow-up the user typed while the agent was still working, picked up
+    before the end-of-run cleanup tears down what the run left behind.
+    """
+    delivered, kept = [], []
+    while state.user_msgs:
+        e = state.user_msgs.popleft()
+        if e.get("conv") == conv_id and e.get("mode") == mode:
+            delivered.append(e)
+        else:
+            kept.append(e)
+    state.user_msgs.extend(kept)
+    if not delivered:
+        return False
+    for e in delivered:
+        text = e["text"]
+        if mode == "steer":
+            text = ("[the user sent you this message while you were "
+                    f"working]\n{text}")
+        content = [{"type": "text", "text": text}]
+        for f in e.get("files") or []:
+            if f["mime"].startswith("image/"):
+                content.append({"type": "image_url", "image_url": {
+                    "url": f"data:{f['mime']};base64,{f['b64']}"}})
+        if mode == "queue":
+            # A follow-up turn starts from the screen the last task left.
+            shot = screenshot_block(force=True)
+            if shot is not None:
+                content.append(shot)
+        messages.append({"role": "user", "content": content})
+    items = [{"conv": conv_id, "seq": e["seq"]} for e in delivered
+             if e.get("seq") is not None]
+    if items:
+        await broadcast({"type": "dequeue", "items": items})
+    return True
+
+
 # ── Run cleanup ──────────────────────────────────────────────────────────────
 # End-of-run teardown — daemon-driven, never model-invoked. First a
 # deterministic sweep of whatever the run created: browser tabs (CDP target
@@ -3030,10 +3077,19 @@ async def agent_loop(conv_id: str, task_text: str,
             for _ in range(MAX_STEPS):
                 while state.paused and not state.stop:
                     await asyncio.sleep(0.4)
-                if state.stop or done:
+                if state.stop:
+                    break
+                if done:
+                    # A follow-up the user queued while the agent worked
+                    # becomes the next turn here — ahead of the end-of-run
+                    # cleanup, so the desktop is still as the run left it.
+                    if await drain_user_msgs(conv_id, messages, "queue"):
+                        done = False
+                        continue
                     break
 
                 drain_subagent_inbox(conv_id, messages)
+                await drain_user_msgs(conv_id, messages, "steer")
 
                 # Long-horizon: compact history once the last request's
                 # billed input approaches the model's context window. The
@@ -3247,6 +3303,24 @@ async def agent_loop(conv_id: str, task_text: str,
         await broadcast({"type": "status", "state": "idle",
                          "model": state.model, "conversation_id": None})
         await push_cost()
+        # Queued follow-ups outlive the run they waited behind — a stop
+        # ends the current task, not what the user lined up after it.
+        while state.user_msgs:
+            nxt = state.user_msgs.popleft()
+            try:
+                meta = _read_meta(nxt["conv"])
+            except ValueError:
+                meta = None
+            if meta is None:
+                continue  # conversation deleted while the message waited
+            state.conversation_id = nxt["conv"]
+            state.model = str(meta.get("model") or state.model)
+            if nxt.get("seq") is not None:
+                await broadcast({"type": "dequeue", "items": [
+                    {"conv": nxt["conv"], "seq": nxt["seq"]}]})
+            state.task = asyncio.create_task(
+                agent_loop(nxt["conv"], nxt["text"], nxt["files"]))
+            break
 
 
 async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
@@ -3262,20 +3336,6 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
                 {"type": "error",
                  "text": "no such conversation — create one first"}))
             return
-        if state.running:
-            # One agent per desktop environment: this device can only work
-            # one conversation at a time.
-            running = {}
-            if state.conversation_id:
-                try:
-                    running = _read_meta(state.conversation_id) or {}
-                except ValueError:
-                    pass
-            title = running.get("title") or "another conversation"
-            await ws.send_text(json.dumps(
-                {"type": "error",
-                 "text": f"device is busy on “{title}” — stop it first"}))
-            return
         text = str(msg.get("text", ""))
         saved, err = save_attachments(msg.get("files") or [])
         if err:
@@ -3283,16 +3343,30 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
             return
         if not text.strip() and not saved:
             return
-        state.conversation_id = cid
-        state.model = str(meta.get("model") or state.model)
         event = {"type": "user", "text": text}
         if saved:
             event["files"] = event_files(saved)
-        seq = conv_append_event(cid, event)
-        await broadcast({**event, "conversation_id": cid, "seq": seq})
         if saved:
             text = f"{text}\n\n{attach_note(saved)}" if text \
                 else attach_note(saved)
+        if state.running:
+            # One agent per desktop environment: a message sent mid-run
+            # queues instead of starting. "steer" is injected into the
+            # running conversation's context at the next step; anything
+            # else is picked up when the run ends — same-conversation
+            # entries even before the cleanup sweep.
+            steer = bool(msg.get("steer")) and cid == state.conversation_id
+            seq = conv_append_event(cid, event)
+            await broadcast({**event, "conversation_id": cid, "seq": seq,
+                             "queued": "steer" if steer else "queue"})
+            state.user_msgs.append({
+                "conv": cid, "text": text, "files": saved,
+                "mode": "steer" if steer else "queue", "seq": seq})
+            return
+        state.conversation_id = cid
+        state.model = str(meta.get("model") or state.model)
+        seq = conv_append_event(cid, event)
+        await broadcast({**event, "conversation_id": cid, "seq": seq})
         state.task = asyncio.create_task(agent_loop(cid, text, saved))
     elif mtype == "answer":
         if state.pending_answer is not None and not state.pending_answer.done():
@@ -3330,6 +3404,26 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
                 t = e.get("task")
                 if t and e.get("status") == "running":
                     t.cancel()
+        elif action == "deliver":
+            # Promote queued message(s) of the running conversation to
+            # steer — they're injected at the next step boundary.
+            seq = msg.get("seq")
+            for e in state.user_msgs:
+                if (e["conv"] == state.conversation_id
+                        and (seq is None or e.get("seq") == seq)):
+                    e["mode"] = "steer"
+        elif action == "dequeue":
+            seq = msg.get("seq")
+            dropped = [{"conv": e["conv"], "seq": e.get("seq")}
+                       for e in state.user_msgs
+                       if seq is None or e.get("seq") == seq]
+            if dropped:
+                seqs = {d["seq"] for d in dropped}
+                state.user_msgs = deque(
+                    e for e in state.user_msgs
+                    if e.get("seq") not in seqs)
+                await broadcast({"type": "dequeue", "items": dropped,
+                                 "dropped": True})
         await push_status()
     elif mtype == "set_model":
         model = str(msg.get("model") or state.model)
@@ -3554,11 +3648,28 @@ async def chat_ws(ws: WebSocket):
         "device": DEVICE_NAME,
         "running_conversation":
             state.conversation_id if state.running else None,
+        # Queued mid-run messages — lets a rejoining client restore the
+        # "queued" badges on transcript events it fetches afterwards.
+        "queue": [{"conv": e["conv"], "seq": e.get("seq"),
+                   "mode": e["mode"]} for e in state.user_msgs],
     }))
     await push_cost()
     try:
         while True:
-            await handle_client_msg(ws, json.loads(await ws.receive_text()))
+            try:
+                await handle_client_msg(
+                    ws, json.loads(await ws.receive_text()))
+            except (WebSocketDisconnect, json.JSONDecodeError, RuntimeError):
+                raise
+            except Exception as e:
+                # A handler bug must not kill the socket and swallow the
+                # user's message in silence — report it back to them.
+                try:
+                    await ws.send_text(json.dumps(
+                        {"type": "error",
+                         "text": f"internal error: {e}"}))
+                except Exception:
+                    raise WebSocketDisconnect()
     # Abrupt TCP drops (tab reload, network blip) surface as RuntimeError
     # ("WebSocket is not connected") rather than WebSocketDisconnect — the
     # peer is gone either way.

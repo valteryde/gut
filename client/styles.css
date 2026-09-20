@@ -464,6 +464,27 @@ main {
   border-radius: var(--radius-card);
 }
 
+/* queued-for-delivery tag under a user message sent mid-run */
+.qtag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.qtag.dropped { text-decoration: line-through; }
+.qtag button {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--mint);
+  cursor: pointer;
+}
+.qtag button:hover { text-decoration: underline; }
+.qtag button:disabled { color: var(--text-3); cursor: default; text-decoration: none; }
+
 /* agent-side entries drop the name column — colour and the clay band
    already mark the speaker; the span stays in the DOM (visually hidden)
    for screen readers */
@@ -839,6 +860,8 @@ body.verbose .verbose-only { display: grid; }
 .ibtn:hover { background: var(--surface-3); color: var(--text); }
 .ibtn.danger { color: var(--bad); }
 .ibtn.danger:hover { background: var(--bad-bg); }
+.ibtn.steer { color: var(--mint-ink); }
+.ibtn.steer:hover { background: var(--mint-soft); }
 .ibtn svg { width: 17px; height: 17px; }
 
 /* round send button */
