@@ -2038,6 +2038,10 @@ function closeSettings() {
   document.body.classList.remove('settings-open');
   clearInterval(devProbeTimer);
   devProbeTimer = null;
+  // While settings hid the pane (display:none) noVNC's observer scaled the
+  // canvas to 0 — and its expected-size check then skips the restore on
+  // unhide, leaving a dark pane. Re-setting scaleViewport forces a rescale.
+  requestAnimationFrame(() => { if (rfb) rfb.scaleViewport = true; });
 }
 
 // Devices re-probe on a timer while the page is open — an "offline" label
