@@ -126,6 +126,8 @@ app.whenReady().then(() => {
     local.restart((line) => e.sender.send('local:log', line)));
   ipcMain.handle('local:update', (e) =>
     local.update((line) => e.sender.send('local:log', line)));
+  ipcMain.handle('local:remove', (e) =>
+    local.remove((line) => e.sender.send('local:log', line)));
   ipcMain.handle('shell:open', (_e, url) => {
     if (/^https?:\/\//.test(String(url))) shell.openExternal(url);
   });

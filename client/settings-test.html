@@ -121,6 +121,7 @@
               <button type="button" id="localAction" class="preset">…</button>
               <button type="button" id="localRestart" class="preset" hidden>Restart</button>
               <button type="button" id="localStop" class="preset" hidden>Stop</button>
+              <button type="button" id="localRemove" class="preset" hidden>Remove</button>
             </div>
             <pre id="localLog" hidden></pre>
           </section>
@@ -193,6 +194,7 @@ window.gut = (() => {
   return {
     isElectron: true, platform: 'darwin',
     localStatus: async () => ({ runtime: 'ready', stack: 'stopped',
+      exists: true,
       image: 'ghcr.io/valteryde/gut-desktop:latest' }),
     localKeys: async () => ({ ...keys }),
     saveLocalKeys: async (k) => {
@@ -204,6 +206,7 @@ window.gut = (() => {
     stopLocal: async () => ({ ok: true }),
     restartLocal: async () => ({ ok: true }),
     updateLocal: async () => ({ ok: true }),
+    removeLocal: async () => ({ ok: true }),
     openExternal: () => {},
     onLocalLog: () => {},
     updateState: async () => ({ status: 'none' }),

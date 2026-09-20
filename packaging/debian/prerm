@@ -3,11 +3,14 @@ set -e
 
 case "$1" in
   remove|deconfigure)
-    systemctl stop gut-bot.service gut-litellm.service 2>/dev/null || true
-    systemctl disable gut-bot.service gut-litellm.service 2>/dev/null || true
+    systemctl stop gut-bot.service gut-litellm.service \
+                   gut-openserp.service 2>/dev/null || true
+    systemctl disable gut-bot.service gut-litellm.service \
+                      gut-openserp.service 2>/dev/null || true
   ;;
   upgrade)
-    systemctl stop gut-bot.service gut-litellm.service 2>/dev/null || true
+    systemctl stop gut-bot.service gut-litellm.service \
+                   gut-openserp.service 2>/dev/null || true
   ;;
 esac
 

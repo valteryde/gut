@@ -41,7 +41,6 @@ const envFile = (proj = MANAGED) => proj === 'gut'
 const envPath = () => envFile();
 const composePath = () => composeFile();
 const litellmPath = () => path.join(stackDir(), 'litellm.yaml');
-const searxngPath = () => path.join(stackDir(), 'searxng.yml');
 
 const imageTag = () =>
   process.env.GUT_DESKTOP_IMAGE ||
@@ -233,27 +232,6 @@ function writeLitellmConfig(env) {
   return entries.length > 0;
 }
 
-// SearXNG settings for the local stack's metasearch service — written once
-// so the generated secret_key stays stable across restarts/updates. The
-// service is internal-only (no published ports); limiter off and JSON on
-// because the daemon's web_search calls /search?format=json.
-function writeSearxngSettings() {
-  if (fs.existsSync(searxngPath())) return;
-  fs.writeFileSync(searxngPath(), `use_default_settings: true
-
-server:
-  secret_key: "${rand(32)}"
-  limiter: false
-  image_proxy: false
-  method: "GET"
-
-search:
-  formats:
-    - html
-    - json
-`);
-}
-
 function writeCompose() {
   fs.writeFileSync(composePath(), `name: gut-local
 
@@ -297,11 +275,12 @@ services:
       retries: 18
       start_period: 60s
 
-  searxng:
-    image: searxng/searxng:latest
+  openserp:
+    image: karust/openserp:latest
     restart: unless-stopped
-    volumes:
-      - ./searxng.yml:/etc/searxng/settings.yml:ro
+    # -a 0.0.0.0: default binds 127.0.0.1, unreachable from other containers.
+    # --leakless closes the per-query browser instances it spawns.
+    command: ["serve", "-a", "0.0.0.0", "-p", "7070", "--leakless"]
 
   desktop:
     image: ${imageTag()}
@@ -316,7 +295,7 @@ services:
       LITELLM_MASTER_KEY: \${LITELLM_MASTER_KEY}
       DEFAULT_MODEL: \${DEFAULT_MODEL}
       DEVICE_NAME: local
-      SEARXNG_URL: http://searxng:8080
+      OPENSERP_URL: http://openserp:7070
     ports:
       - "127.0.0.1:6080:6080"
       - "127.0.0.1:8000:8000"
@@ -328,7 +307,7 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
-      searxng:
+      openserp:
         condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/version || exit 1"]
@@ -390,6 +369,7 @@ async function status() {
   return {
     runtime: docker ? 'ready' : 'missing',
     stack: c?.running ? 'running' : 'stopped',
+    exists: !!c,   // a stack (running or stopped) exists → offer Remove
     project: proj,
     agent: c?.running ? await probeAgent() : false,
     image: proj === 'gut' ? 'dev build' : imageTag(),
@@ -458,7 +438,6 @@ async function start(keys, log) {
     env.DEFAULT_MODEL = litellmConfigFirstModel(env);
   }
   writeEnv(env);
-  writeSearxngSettings();
   writeCompose();
 
   log(`Pulling and starting the stack (image ${imageTag()}) — first run downloads several GB…`);
@@ -478,6 +457,36 @@ async function stop() {
   const proj = (await desktopContainer())?.project || MANAGED;
   const r = await run('docker', [...composeArgs(proj), 'down']);
   return { ok: r.code === 0 };
+}
+
+// Full teardown: containers + named volumes + the desktop image, then the
+// generated stack dir for the packaged project. Docker itself stays —
+// Start recreates everything from scratch.
+async function remove(log) {
+  const c = await desktopContainer();
+  const proj = c?.project || MANAGED;
+  if (!c && !fs.existsSync(composeFile(proj))) return { ok: true };
+  if (proj === 'gut-local' && !fs.existsSync(composeFile(proj))) {
+    // Orphaned containers with a deleted stack dir: regenerate just enough
+    // compose file for `down` to target the project.
+    fs.mkdirSync(stackDir(), { recursive: true });
+    writeCompose();
+  }
+  log?.(`Removing the local stack (project ${proj})…`);
+  const r = await run('docker',
+    [...composeArgs(proj), 'down', '-v', '--rmi', 'local'], log);
+  if (r.code !== 0) return fail('docker compose down failed', r);
+  // `--rmi local` only drops untagged build images — remove every tag of
+  // the desktop image too (multi-GB; the other services' images are small
+  // and may be shared with other compose projects).
+  const repo = proj === 'gut' ? 'gut-desktop' : GHCR;
+  const ids = (await run('docker', ['images', '-q', repo])).out
+    .trim().split('\n').filter(Boolean);
+  for (const id of new Set(ids)) await run('docker', ['rmi', id]);
+  if (proj === 'gut-local') {
+    fs.rmSync(stackDir(), { recursive: true, force: true });
+  }
+  return { ok: true };
 }
 
 // Bounce the stack: recreate the containers in place and wait on the
@@ -504,7 +513,6 @@ async function update(log) {
   if (!fs.existsSync(composePath())) {
     return { ok: false, error: 'local stack has not been created yet' };
   }
-  writeSearxngSettings();  // older stacks lack the file the compose mount needs
   writeCompose();  // refresh the image tag for the current app version
   log(`Updating the local desktop to ${imageTag()}…`);
   let r = await run('docker', [...composeArgs(), 'pull'], log);
@@ -515,5 +523,5 @@ async function update(log) {
 }
 
 module.exports =
-  { status, installRuntime, start, stop, restart, update, keysSet,
+  { status, installRuntime, start, stop, restart, update, remove, keysSet,
     keyValues, saveKeys };

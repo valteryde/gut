@@ -90,9 +90,8 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 ## Repository Structure
 
 ```text
-├── docker-compose.yml          # dev stack (db + litellm + searxng + desktop, built from source)
+├── docker-compose.yml          # dev stack (db + litellm + openserp + desktop, built from source)
 ├── litellm_config.yaml         # shared LiteLLM model config (compose + gut-bot)
-├── searxng/settings.yml        # metasearch config — JSON on, bot limiter off
 ├── .env.example
 ├── backend/
 │   ├── Dockerfile              # builds the gut-desktop image (context: repo root)
@@ -112,7 +111,8 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 │   ├── apt-deps.txt            # single source of truth: system deps for image AND deb
 │   ├── build-deb.sh            # builds gut-bot_<v>_<arch>.deb (run in debian:trixie)
 │   ├── debian/                 # control, postinst (secrets + postgres + services), prerm/postrm
-│   ├── systemd/                # gut-bot.service, gut-litellm.service
+│   ├── systemd/                # gut-bot.service, gut-litellm.service, gut-openserp.service
+│   ├── openserp-browser        # Chrome launcher for OpenSERP (no-sandbox only, non-snap)
 │   ├── gut-bot                 # CLI: info/status/logs/restart/version
 │   └── chromium-gut.conf       # /etc/chromium.d flags (CDP, no-sandbox, scale)
 └── .github/workflows/
@@ -147,9 +147,10 @@ reports it via `GET /api/version`.
   localhost:9222 (profile at `~/.gut-chrome`), so the agent reads the DOM and
   clicks elements by `#ref` instead of guessing pixels. **Never publish port
   9222** — CDP is unauthenticated full browser control.
-- **Text-first web tools.** `web_search` (SearXNG on the internal compose
-  network — `SEARXNG_URL`, internal-only, never published — with a
-  DuckDuckGo HTML fallback when unset) and `fetch_url` (plain-HTTP page
+- **Text-first web tools.** `web_search` (OpenSERP on the internal compose
+  network — `OPENSERP_URL`, internal-only, never published; bundled into
+  gut-bot as `gut-openserp.service` — with a DuckDuckGo HTML fallback when
+  unset) and `fetch_url` (plain-HTTP page
   text + links) let the agent research without opening Chrome: no
   screenshots, no CAPTCHA walls, one turn instead of five. The `browser_*`
   tools stay for what needs a real browser — JS-heavy pages, logins, forms.

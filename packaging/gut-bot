@@ -25,13 +25,18 @@ case "$cmd" in
     echo "  litellm   : http://127.0.0.1:4000 (localhost only)"
     echo
     echo "config    : $ENV_FILE (provider keys optional — the app can push them)"
-    echo "services  : gut-bot.service, gut-litellm.service"
+    echo "services  : gut-bot.service, gut-litellm.service, gut-openserp.service"
     ;;
-  status)   systemctl status gut-bot.service gut-litellm.service ;;
-  start)    systemctl start gut-litellm.service gut-bot.service ;;
-  stop)     systemctl stop gut-bot.service gut-litellm.service ;;
-  restart)  systemctl restart gut-litellm.service gut-bot.service ;;
-  logs)     journalctl -u gut-bot.service -u gut-litellm.service "${@:2}" ;;
+  status)   systemctl status gut-bot.service gut-litellm.service \
+                            gut-openserp.service ;;
+  start)    systemctl start gut-litellm.service gut-openserp.service \
+                          gut-bot.service ;;
+  stop)     systemctl stop gut-bot.service gut-litellm.service \
+                         gut-openserp.service ;;
+  restart)  systemctl restart gut-litellm.service gut-openserp.service \
+                            gut-bot.service ;;
+  logs)     journalctl -u gut-bot.service -u gut-litellm.service \
+                       -u gut-openserp.service "${@:2}" ;;
   version)  cat /opt/gut/VERSION ;;
   *)
     echo "usage: gut-bot [info|status|start|stop|restart|logs|version]" >&2

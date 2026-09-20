@@ -1388,6 +1388,7 @@ const localStatusEl = $('localStatus');
 const localActionBtn = $('localAction');
 const localRestartBtn = $('localRestart');
 const localStopBtn = $('localStop');
+const localRemoveBtn = $('localRemove');
 const localLogEl = $('localLog');
 let localState = null;
 let localKeysSet = {};
@@ -1829,6 +1830,9 @@ async function refreshLocal() {
   if (!gut) return;
   localBox.hidden = false;
   localState = await gut.localStatus();
+  // Remove applies to any existing stack, running or stopped — never to a
+  // bare Docker install where nothing was created yet.
+  localRemoveBtn.hidden = !localState.exists;
   if (localState.runtime === 'missing') {
     localStatusEl.textContent = localNote ||
       'Docker not found — needed to run a desktop on this machine.';
@@ -1997,6 +2001,29 @@ if (gut) {
       }
     } finally {
       localRestartBtn.disabled = false;
+      refreshLocal();
+    }
+  };
+
+  localRemoveBtn.onclick = async () => {
+    if (!confirm('Remove the local desktop entirely? Its containers, ' +
+        'volumes, the desktop image and the generated config are deleted — ' +
+        'Start local desktop can recreate it later.')) return;
+    localRemoveBtn.disabled = true;
+    localNote = null;
+    localLogEl.hidden = false;
+    localLogEl.textContent = '';
+    localStatusEl.textContent = 'Removing the local desktop…';
+    try {
+      const r = await gut.removeLocal();
+      if (!r?.ok) {
+        localNote = `Remove failed: ${r?.error || 'see log'}`;
+      } else if (cfg.devices.some(d => d.id === 'local')) {
+        // The local row now points at a backend that no longer exists.
+        removeDevice('local');
+      }
+    } finally {
+      localRemoveBtn.disabled = false;
       refreshLocal();
     }
   };

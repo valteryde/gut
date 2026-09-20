@@ -33,9 +33,10 @@ DATABASE_URL=postgresql://litellm:${PGPASS}@127.0.0.1:5432/litellm
 RESOLUTION=1024x768
 UI_SCALE=1.0
 DEVICE_NAME=${HOST}
-# Optional: point the agent's web_search at a SearXNG instance you host
-# (gut-bot ships none — unset = built-in DuckDuckGo fallback).
-# SEARXNG_URL=http://127.0.0.1:8888
+# The agent's web_search backend — gut-openserp.service runs a bundled
+# OpenSERP instance on localhost. Override to use your own; empty =
+# DuckDuckGo HTML fallback (unreliable — engines bot-block it).
+OPENSERP_URL=http://127.0.0.1:7070
 # WALLPAPER_HUE=    # 0-360: pin the desktop wallpaper color (default: derived from DEVICE_NAME)
 # DEFAULT_MODEL=openrouter/claude-sonnet-4.5
 
@@ -51,6 +52,11 @@ EOF
       chown root:gut /etc/gut/gut-bot.env
       chmod 640 /etc/gut/gut-bot.env
     fi
+    # Upgrades: env files written by older versions predate the bundled
+    # OpenSERP — add the default endpoint so web_search works without a
+    # manual edit.
+    grep -q '^OPENSERP_URL=' /etc/gut/gut-bot.env \
+      || echo 'OPENSERP_URL=http://127.0.0.1:7070' >> /etc/gut/gut-bot.env
     . /etc/gut/gut-bot.env
 
     # Python venv — built on the target so it always matches the local
@@ -166,8 +172,10 @@ PYEOF
 
     if [ -d /run/systemd/system ]; then
       systemctl daemon-reload
-      systemctl enable gut-litellm.service gut-bot.service >/dev/null 2>&1 || true
-      systemctl restart gut-litellm.service gut-bot.service || true
+      systemctl enable gut-litellm.service gut-openserp.service \
+                       gut-bot.service >/dev/null 2>&1 || true
+      systemctl restart gut-litellm.service gut-openserp.service \
+                        gut-bot.service || true
     fi
 
     # Browser sanity: Ubuntu's `chromium` deb is a snap stub that can't exec

@@ -1,7 +1,8 @@
 [Unit]
 Description=Gut desktop agent (Xvfb + XFCE4 + VNC + agent daemon)
-After=gut-litellm.service
+After=gut-litellm.service gut-openserp.service
 Requires=gut-litellm.service
+Wants=gut-openserp.service
 
 [Service]
 Type=simple

@@ -100,9 +100,10 @@ LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
 SEND_FILE_MAX_BYTES = int(os.environ.get("SEND_FILE_MAX_BYTES", str(9 * 1024 * 1024)))
 CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 CDP_HTTP = f"http://localhost:{CDP_PORT}"
-# SearXNG endpoint for web_search — the compose stacks run one on the
-# internal network. Empty = fall back to DuckDuckGo's HTML endpoint.
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "").rstrip("/")
+# OpenSERP endpoint for web_search — the compose stacks run one on the
+# internal network, gut-bot runs it as a systemd unit on localhost.
+# Empty = fall back to DuckDuckGo's HTML endpoint.
+OPENSERP_URL = os.environ.get("OPENSERP_URL", "").rstrip("/")
 SHOT_PATH = Path("/tmp/gut_screen.png")
 HOME_DIR = Path(os.environ.get("HOME") or Path.home())
 KEY_FILE = Path(os.environ.get("GUT_KEY_FILE") or HOME_DIR / ".gut_litellm_key")
@@ -1359,8 +1360,8 @@ async def open_url(url: str) -> str:
 
 
 # ── Web search & fetch ─────────────────────────────────────────────────────
-# Text-only alternatives to driving Chrome: the agent searches via SearXNG
-# (SEARXNG_URL — the compose stacks run one on the internal network; unset or
+# Text-only alternatives to driving Chrome: the agent searches via OpenSERP
+# (OPENSERP_URL — the compose stacks run one on the internal network; unset or
 # unreachable = DuckDuckGo's HTML endpoint) and reads pages over plain HTTP.
 # Deliberately absent from SCREEN_TOOLS: these turns carry no screenshot.
 
@@ -1447,7 +1448,7 @@ class _PageText(HTMLParser):
 
 
 class _DDGResults(HTMLParser):
-    """Parser for html.duckduckgo.com result pages (the SEARXNG_URL fallback)."""
+    """Parser for html.duckduckgo.com result pages (the OPENSERP_URL fallback)."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -1501,17 +1502,19 @@ async def web_search(query: str, max_results: int = 8) -> str:
         return "empty query"
     n = max(1, min(int(max_results or 8), 15))
     results, backend = [], ""
-    if SEARXNG_URL:
+    if OPENSERP_URL:
         try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get(f"{SEARXNG_URL}/search",
-                                params={"q": query, "format": "json"})
+            # /mega/search fans out to every engine and merges+dedupes —
+            # per-engine blocks (CAPTCHA, rate limits) don't sink the query.
+            async with httpx.AsyncClient(timeout=35) as c:
+                r = await c.get(f"{OPENSERP_URL}/mega/search",
+                                params={"text": query, "limit": n})
             if r.status_code == 200:
                 results = [{"title": str(it.get("title", "")),
                             "url": str(it.get("url", "")),
-                            "snippet": str(it.get("content") or "")}
+                            "snippet": str(it.get("snippet") or "")}
                            for it in r.json().get("results", [])]
-                backend = "searxng"
+                backend = "openserp"
         except Exception:
             pass  # fall through to the DDG fallback
     if not results:

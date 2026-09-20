@@ -32,7 +32,7 @@ mkdir -p "$STAGE/DEBIAN" "$STAGE/opt/gut" "$STAGE/etc/gut" \
 # per-version wheels), so the deb carries wheels and postinst creates
 # /opt/gut/venv against the target interpreter.
 apt-get update -qq
-apt-get install -y -qq python3-pip >/dev/null
+apt-get install -y -qq python3-pip ca-certificates curl >/dev/null
 PYVERS="${WHEEL_PYVERS:-3.12 3.13 3.14}"
 case "$ARCH" in
   amd64) MARCH=x86_64 ;;
@@ -84,8 +84,22 @@ install -m755 "$ROOT/packaging/gut-browser" "$STAGE/usr/local/bin/google-chrome"
 # browser config; runs from postinst and every start.sh boot.
 install -m755 "$ROOT/packaging/ensure-browser.sh" "$STAGE/opt/gut/ensure-browser.sh"
 
+# ── openserp — the agent's web_search backend ────────────────────────────
+# Static Go binary from a pinned upstream release; serves a multi-engine
+# SERP API on 127.0.0.1:7070 via gut-openserp.service. Asset arch names
+# match the deb's (amd64|arm64).
+OPENSERP_VERSION="${OPENSERP_VERSION:-0.8.12}"
+curl -fsSL "https://github.com/karust/openserp/releases/download/v${OPENSERP_VERSION}/openserp-linux-${ARCH}-${OPENSERP_VERSION}.tgz" \
+    | tar xz -C "$STAGE/opt/gut"   # the tarball contains ./openserp
+chmod 755 "$STAGE/opt/gut/openserp"
+# Browser launcher: resolves a real (non-snap) Chrome/Chromium and adds
+# --no-sandbox only — openserp's go-rod supplies its own CDP port/profile.
+install -m755 "$ROOT/packaging/openserp-browser" \
+              "$STAGE/opt/gut/openserp-browser"
+
 install -m644 "$ROOT/packaging/systemd/gut-bot.service" \
               "$ROOT/packaging/systemd/gut-litellm.service" \
+              "$ROOT/packaging/systemd/gut-openserp.service" \
               "$STAGE/usr/lib/systemd/system/"
 install -m755 "$ROOT/packaging/gut-bot" "$STAGE/usr/bin/gut-bot"
 

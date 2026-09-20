@@ -42,14 +42,15 @@ services:
       retries: 18
       start_period: 60s
 
-  # Metasearch for the agent's web_search tool. Internal only — never publish
-  # a port; the desktop reaches it by service name. SearXNG's bot limiter is
-  # off and JSON output on via searxng/settings.yml.
-  searxng:
-    image: searxng/searxng:latest
+  # SERP search API for the agent's web_search tool. Internal only — never
+  # publish a port; the desktop reaches it by service name. The image bundles
+  # Chrome which openserp drives over CDP, so JS-gated engines still answer.
+  openserp:
+    image: karust/openserp:latest
     restart: unless-stopped
-    volumes:
-      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    # -a 0.0.0.0: default binds 127.0.0.1, unreachable from other containers.
+    # --leakless closes the per-query browser instances it spawns.
+    command: ["serve", "-a", "0.0.0.0", "-p", "7070", "--leakless"]
 
   desktop:
     build:
@@ -70,7 +71,7 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-sonnet-4-5}
       DEVICE_NAME: ${DEVICE_NAME:-local}
-      SEARXNG_URL: http://searxng:8080
+      OPENSERP_URL: http://openserp:7070
     ports:
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
       - "127.0.0.1:${AGENT_PORT:-8000}:8000"
@@ -83,7 +84,7 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
-      searxng:
+      openserp:
         condition: service_started
 
 volumes:

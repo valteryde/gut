@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('gut', {
   stopLocal: () => ipcRenderer.invoke('local:stop'),
   restartLocal: () => ipcRenderer.invoke('local:restart'),
   updateLocal: () => ipcRenderer.invoke('local:update'),
+  removeLocal: () => ipcRenderer.invoke('local:remove'),
   openExternal: (url) => ipcRenderer.invoke('shell:open', url),
   onLocalLog: (cb) => ipcRenderer.on('local:log', (_e, line) => cb(line)),
   updateState: () => ipcRenderer.invoke('update:state'),
