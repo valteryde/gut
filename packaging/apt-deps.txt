@@ -30,6 +30,7 @@ xdg-utils
 curl
 wget
 ca-certificates
+openssl
 gnupg
 sudo
 procps

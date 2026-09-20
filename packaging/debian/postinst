@@ -171,8 +171,8 @@ PYEOF
     cat <<EOF
 
   gut-bot is up.
-    agent api : http://${IP:-<host>}:8000
-    desktop   : http://${IP:-<host>}:6080
+    agent api : https://${IP:-<host>}:8443
+    desktop   : https://${IP:-<host>}:6443
     password  : ${VNC_PASSWORD}
 
   Add this machine in the app, then paste model provider keys in

@@ -39,7 +39,10 @@ function loadDevices() {
 }
 
 function saveDevices() {
-  localStorage.setItem('gut.devices', JSON.stringify(cfg.devices));
+  // _-prefixed fields (_hsPending, _tlsRefused) are session state — a
+  // persisted _hsPending would block TLS re-pairing forever after reload.
+  localStorage.setItem('gut.devices', JSON.stringify(cfg.devices,
+    (k, v) => (k.startsWith('_') ? undefined : v)));
   localStorage.setItem('gut.activeDevice', cfg.activeDevice);
 }
 
@@ -51,24 +54,99 @@ function activeDev() {
 
 const AGENT_PORT = 8000;
 const NOVNC_PORT = 6080;
-const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
-const httpScheme = location.protocol === 'https:' ? 'https' : 'http';
+const AGENT_TLS_PORT = 8443;
+const NOVNC_TLS_PORT = 6443;
 
-const agentBase = () => `${httpScheme}://${activeDev().host}:${AGENT_PORT}`;
+// Transport is per-device: d.secure (set by ensureSecure, which pairs and
+// pins the backend's self-signed cert via the Electron bridge) flips every
+// endpoint to https/wss on the TLS ports. Plain HTTP remains only for
+// pre-TLS backends and non-Electron dev mode.
+const devAgentBase = (d) => (d.secure
+  ? `https://${d.host}:${d.tlsPort || AGENT_TLS_PORT}`
+  : `http://${d.host}:${AGENT_PORT}`);
+const agentBase = () => devAgentBase(activeDev());
 // The device password doubles as the agent API token — one secret per
 // backend, set by gut-bot/Electron at install time.
 const wsUrl = () => {
-  const t = activeDev().vncPassword;
-  return `${wsScheme}://${activeDev().host}:${AGENT_PORT}/ws/chat` +
+  const d = activeDev();
+  const t = d.vncPassword;
+  return `${d.secure ? 'wss' : 'ws'}://${d.host}:` +
+    `${d.secure ? (d.tlsPort || AGENT_TLS_PORT) : AGENT_PORT}/ws/chat` +
     (t ? `?token=${encodeURIComponent(t)}` : '');
 };
-const novncUrl = (d) => `${wsScheme}://${d.host}:${NOVNC_PORT}/websockify`;
+const novncUrl = (d) => `${d.secure ? 'wss' : 'ws'}://${d.host}:` +
+  `${d.secure ? (d.tlsVncPort || NOVNC_TLS_PORT) : NOVNC_PORT}/websockify`;
+
+// ── transport security ──────────────────────────────────────────────────
+// Once a device proves it can do TLS (tlsSeen), its password never crosses
+// plaintext again — a network attacker can strip the /api/hello bootstrap
+// to force a downgrade, so falling back silently would leak it. insecureOk
+// is the user's explicit per-device consent to that fallback.
+function maySendSecret(d) {
+  return d.secure || !d.tlsSeen || !!d.insecureOk;
+}
+
+// Pair + pin the backend's cert. Returns true when TLS is usable; also
+// heals cert rotation automatically (the handshake is password-checked,
+// so a re-pin is safe without user confirmation).
+async function ensureSecure(d) {
+  if (!gut?.tlsHandshake) return false;
+  // Concurrent callers (probe timer, connect paths) share one handshake.
+  if (d._hsPending) return d._hsPending;
+  d._hsPending = (async () => {
+    let r = null;
+    try { r = await gut.tlsHandshake(d.host, d.vncPassword || ''); }
+    catch (_) { /* bridge missing */ }
+    if (r?.ok) {
+      Object.assign(d, { secure: true, tlsSeen: true,
+                         tlsPort: r.port, tlsVncPort: r.vncPort });
+      delete d.insecureOk;
+      delete d.tlsError;
+      saveDevices();
+      return true;
+    }
+    d.secure = false;
+    d.tlsError = (r && (r.error || (r.unsupported && 'backend predates TLS')))
+      || 'no answer';
+    saveDevices();
+    return false;
+  })();
+  try {
+    return await d._hsPending;
+  } finally {
+    delete d._hsPending;
+  }
+}
+
+// Connect-time gate for user-driven switches: pair TLS, and if the device
+// *previously* encrypted but can't now, ask before going plaintext.
+async function gateConnection(d) {
+  if (!gut?.tlsHandshake) return true;   // browser dev: plain by design
+  await ensureSecure(d);
+  if (maySendSecret(d)) return true;
+  if (d._tlsRefused) return false;
+  if (confirm(`“${d.name || d.host}” used an encrypted connection but its ` +
+      `secure endpoint isn't answering now (${d.tlsError || 'unreachable'}). ` +
+      'A network attacker can cause this.\n\n' +
+      'Connect over unencrypted HTTP anyway?')) {
+    d.insecureOk = true;
+    saveDevices();
+    return true;
+  }
+  d._tlsRefused = true;
+  addMsg('error', `Not connecting to ${d.name || d.host}: the encrypted ` +
+    'endpoint is unavailable and unencrypted fallback was declined. ' +
+    'Re-save the device in Settings to try again.', 'Error');
+  return false;
+}
 
 function apiFetch(path, opts = {}) {
+  const d = activeDev();
   const headers = { ...(opts.headers || {}) };
-  const t = activeDev().vncPassword;
-  if (t) headers.Authorization = `Bearer ${t}`;
-  return fetch(`${agentBase()}${path}`, { ...opts, headers });
+  if (d.vncPassword && maySendSecret(d)) {
+    headers.Authorization = `Bearer ${d.vncPassword}`;
+  }
+  return fetch(`${devAgentBase(d)}${path}`, { ...opts, headers });
 }
 
 // ── agent display name ──────────────────────────────────────────────────
@@ -500,12 +578,27 @@ function disconnectDesktop() {
   backdropCtx.clearRect(0, 0, backdrop.width, backdrop.height);
 }
 
+function setScreenStatus(msg, bad = false) {
+  screenStatusEl.textContent = msg;
+  screenStatusEl.classList.toggle('bad', bad);
+}
+
 function connectDesktop(d) {
   disconnectDesktop();
   screenDevId = d.id;
   screenEl.hidden = false;
   screenLogoEl.hidden = true;
-  screenStatusEl.textContent = 'connecting…';
+  if (!maySendSecret(d)) {
+    // Downgrade guard — never stream the VNC password over plaintext.
+    // Re-pair periodically; a healed TLS endpoint reconnects by itself.
+    setScreenStatus('encrypted endpoint unavailable — refusing ' +
+                    'unencrypted fallback (see Settings → Devices)', true);
+    setTimeout(async () => {
+      if (screenDevId === d.id && await ensureSecure(d)) syncScreen();
+    }, 15000);
+    return;
+  }
+  setScreenStatus('connecting…');
   const conn = new RFB(screenEl, novncUrl(d), {
     credentials: { password: d.vncPassword },
   });
@@ -517,7 +610,7 @@ function connectDesktop(d) {
   conn.background = 'transparent';  // let the ambient backdrop show through
   conn.addEventListener('connect', () => {
     if (rfb !== conn) return;  // superseded before it connected
-    screenStatusEl.textContent = '';
+    setScreenStatus('');
   });
   conn.addEventListener('disconnect', (e) => {
     // A stale RFB's disconnect event can arrive after a newer stream was
@@ -525,9 +618,9 @@ function connectDesktop(d) {
     if (rfb !== conn) return;
     rfb = null;
     if (!screenDevId) return;  // we closed it — the logo is up
-    screenStatusEl.textContent = e.detail.clean
-      ? 'disconnected'
-      : 'connection lost — retrying…';
+    setScreenStatus(
+      e.detail.clean ? 'disconnected' : 'connection lost — retrying…',
+      !e.detail.clean);
     setTimeout(syncScreen, 3000);
   });
   conn.addEventListener('credentialsrequired', () => {
@@ -543,7 +636,7 @@ function syncScreen() {
     disconnectDesktop();
     screenEl.hidden = true;
     screenLogoEl.hidden = false;
-    screenStatusEl.textContent = '';
+    setScreenStatus('');
     return;
   }
   if (screenDevId !== d.id || !rfb) connectDesktop(d);
@@ -778,6 +871,15 @@ function handleTranscriptEvent(m) {
 
 // ── agent websocket ─────────────────────────────────────────────────────
 function connectChat() {
+  const d = activeDev();
+  if (!maySendSecret(d)) {
+    if (chatWs) { try { chatWs.close(); } catch (_) {} chatWs = null; }
+    // Same self-heal retry as the desktop stream.
+    setTimeout(async () => {
+      if (activeDev() === d && await ensureSecure(d)) connectChat();
+    }, 15000);
+    return;
+  }
   if (chatWs) { try { chatWs.close(); } catch (_) {} }
   chatWs = new WebSocket(wsUrl());
 
@@ -966,10 +1068,14 @@ function switchDevice(id) {
   drawSpark();
   setAgentState('idle');
   populateDeviceSelect();
-  syncScreen();
-  connectChat();
-  loadModels();
-  loadConversations();
+  // Gate first: pair TLS (and ask before a plaintext downgrade) before any
+  // channel that would carry the device password is opened.
+  gateConnection(dev).finally(() => {
+    syncScreen();
+    connectChat();
+    loadModels();
+    loadConversations();
+  });
   keyNote = null;  // key status describes the old device — drop it
   editingKey = null;
   if (settingsOpen()) refreshKeys();
@@ -1341,7 +1447,8 @@ function updateKeysHeader() {
     case 'offline':
       hint = `${name} isn\u2019t answering` +
         (devInfo[d.id]?.offlineReason
-          ? ` — ${devInfo[d.id].offlineReason}` : ` on :${AGENT_PORT}`) +
+          ? ` — ${devInfo[d.id].offlineReason}`
+          : ` on :${d.secure ? (d.tlsPort || AGENT_TLS_PORT) : AGENT_PORT}`) +
         '. The app can\u2019t see or change its keys until it\u2019s back.';
       break;
     default:
@@ -1853,9 +1960,10 @@ function semverGt(a, b) {
 
 function devFetch(d, path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
-  if (d.vncPassword) headers.Authorization = `Bearer ${d.vncPassword}`;
-  return fetch(`${httpScheme}://${d.host}:${AGENT_PORT}${path}`,
-               { ...opts, headers });
+  if (d.vncPassword && maySendSecret(d)) {
+    headers.Authorization = `Bearer ${d.vncPassword}`;
+  }
+  return fetch(`${devAgentBase(d)}${path}`, { ...opts, headers });
 }
 
 // Dead hosts hang fetch() until the OS TCP timeout (~75s) — cap probes.
@@ -1867,6 +1975,11 @@ async function probeDevice(d) {
   // a probe must not wipe.
   const cur = devInfo[d.id] || (devInfo[d.id] = {});
   cur.pending = true;
+  // Pair TLS when the device isn't already pinned — picks up encryption
+  // after a backend update, and re-pins a rotated cert after an outage.
+  if (gut?.tlsHandshake && (!d.secure || cur.offline)) {
+    await ensureSecure(d);
+  }
   try {
     const r = await devFetch(d, '/api/version', { signal: probeSignal() });
     if (r.ok) {
@@ -1910,9 +2023,12 @@ async function offlineReason(d, err) {
     return `no answer on :${AGENT_PORT} (timed out)`;
   }
   try {
-    await fetch(`${httpScheme}://${d.host}:${NOVNC_PORT}/`,
-                { signal: probeSignal() });
-    return `host is up but the agent isn't answering on :${AGENT_PORT}`;
+    const vncBase = d.secure
+      ? `https://${d.host}:${d.tlsVncPort || NOVNC_TLS_PORT}`
+      : `http://${d.host}:${NOVNC_PORT}`;
+    await fetch(`${vncBase}/`, { signal: probeSignal() });
+    return `host is up but the agent isn't answering on ` +
+           `:${d.secure ? (d.tlsPort || AGENT_TLS_PORT) : AGENT_PORT}`;
   } catch (_) {
     return `${d.host} isn't responding — powered off, wrong network, ` +
            'or firewalled?';
@@ -2111,6 +2227,18 @@ function renderDeviceList() {
       : info?.pending ? '· checking…' : '';
     ver.title = info?.offline ? (info.offlineReason || '') : '';
     ver.classList.toggle('bad', !!info?.offline);
+    // Transport state: 'unencrypted' marks pre-TLS backends; it turns bad
+    // when the device encrypted before — silence now means downgrade risk.
+    if (!info?.offline && gut?.tlsHandshake && !d.secure) {
+      ver.textContent += ' · unencrypted';
+      if (d.tlsSeen || d.tlsError) {
+        ver.classList.add('bad');
+        ver.title = d.tlsSeen
+          ? `previously encrypted — now refusing plaintext ` +
+            `fallback (${d.tlsError || 'secure endpoint down'})`
+          : `unencrypted connection (${d.tlsError})`;
+      }
+    }
     // Provider-key count: the API when the daemon answers, the local
     // stack's .env for the Electron local device.
     let keyCount = info?.keys;
@@ -2193,6 +2321,8 @@ async function restartLocalBackend() {
 
 function removeDevice(id) {
   const wasActive = id === activeDev().id;
+  const removed = cfg.devices.find(d => d.id === id);
+  if (removed && gut?.tlsForget) gut.tlsForget(removed.host);
   cfg.devices = cfg.devices.filter(d => d.id !== id);
   if (!cfg.devices.length) {
     cfg.devices.push({ id: 'local', name: 'Local',
@@ -2254,15 +2384,20 @@ $('devForm').addEventListener('submit', (e) => {
   if (!d) return;
   const wasActive = d.id === activeDev().id;
   Object.assign(d, fields);
+  // Host/password changed — prior TLS state no longer applies; re-pair.
+  delete d.insecureOk;
+  delete d._tlsRefused;
   saveDevices();
   populateDeviceSelect();
   if (wasActive) {
     if (screenDevId === d.id) disconnectDesktop();  // pick up new host/password
-    syncScreen();
-    connectChat();
-    loadModels();
-    loadConversations();
-    refreshKeys();  // host/password may have changed — re-check key state
+    gateConnection(d).finally(() => {
+      syncScreen();
+      connectChat();
+      loadModels();
+      loadConversations();
+      refreshKeys();  // host/password may have changed — re-check key state
+    });
   }
   renderDeviceList();
 });
@@ -2286,10 +2421,13 @@ new ResizeObserver(() => {
 activeConvId = localStorage.getItem(convKey(activeDev().id)) || null;
 activeConvDevId = activeConvId ? activeDev().id : null;
 populateDeviceSelect();
-syncScreen();
-connectChat();
-loadConversations();
-refreshKeys();
+// Pair/pin TLS before any channel that carries the device password opens.
+gateConnection(activeDev()).finally(() => {
+  syncScreen();
+  connectChat();
+  loadConversations();
+  refreshKeys();
+});
 setInterval(loadModels, 30000);
 setTimeout(loadModels, 1500);
 

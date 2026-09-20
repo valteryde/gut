@@ -960,6 +960,30 @@ body.takeover #desktopPane { border-color: var(--clay); }
   padding: 5px 10px;
   pointer-events: none;
 }
+.screen-status.bad {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--bad);
+  background: var(--bad-bg);
+  border-color: var(--bad-line);
+}
+.screen-status.bad::before {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--bad);
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .screen-status.bad::before { animation: none; }
+}
 .screen-status:empty { display: none; }
 
 /* takeover notice — a clay band at the foot of the conversation, where

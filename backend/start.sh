@@ -84,8 +84,34 @@ else
 fi
 x11vnc "${VNC_ARGS[@]}" &
 
-echo "[gut] starting websockify/noVNC on :6080"
+# Self-signed TLS cert shared by the agent daemon (:8443) and the desktop
+# stream (:6443). Persisted in the data dir so the fingerprint the app pins
+# stays stable across restarts. The app pins it after a password-checked
+# handshake, so no CA or user-provided cert is needed.
+TLS_DIR="${GUT_DATA_DIR:-$HOME/.gut}/tls"
+TLS_CERT="$TLS_DIR/cert.pem"
+TLS_KEY="$TLS_DIR/key.pem"
+if [ ! -s "$TLS_CERT" ] || [ ! -s "$TLS_KEY" ]; then
+  mkdir -p "$TLS_DIR"
+  CN="gut-$(printf '%s' "${DEVICE_NAME:-$(hostname 2>/dev/null || echo device)}" | tr -cd 'a-zA-Z0-9._-')"
+  if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+       -nodes -days 3650 -subj "/CN=${CN}" \
+       -keyout "$TLS_KEY" -out "$TLS_CERT" 2>/dev/null; then
+    chmod 600 "$TLS_KEY"
+    echo "[gut] generated self-signed TLS cert in ${TLS_DIR}"
+  else
+    rm -f "$TLS_CERT" "$TLS_KEY"
+    echo "[gut] WARNING: TLS cert generation failed — plain HTTP only" >&2
+  fi
+fi
+export GUT_TLS_CERT="$TLS_CERT" GUT_TLS_KEY="$TLS_KEY"
+
+echo "[gut] starting websockify/noVNC on :6080 (+ TLS on :6443)"
 websockify --web /usr/share/novnc 6080 localhost:5900 &
+if [ -s "$TLS_CERT" ] && [ -s "$TLS_KEY" ]; then
+  websockify --web /usr/share/novnc --cert "$TLS_CERT" --key "$TLS_KEY" \
+    "${GUT_NOVNC_TLS_PORT:-6443}" localhost:5900 &
+fi
 
 echo "[gut] waiting for LiteLLM at ${LITELLM_URL}"
 for _ in $(seq 1 120); do
@@ -95,6 +121,6 @@ for _ in $(seq 1 120); do
     sleep 1
 done
 
-echo "[gut] starting agent daemon on :8000"
+echo "[gut] starting agent daemon on :${GUT_HTTP_PORT:-8000} (+ TLS on :${GUT_TLS_PORT:-8443})"
 cd /opt/gut
-exec uvicorn agent_daemon:app --host 0.0.0.0 --port 8000
+exec uvicorn agent_daemon:app --host 0.0.0.0 --port "${GUT_HTTP_PORT:-8000}"

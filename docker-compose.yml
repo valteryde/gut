@@ -64,6 +64,9 @@ services:
     ports:
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
       - "127.0.0.1:${AGENT_PORT:-8000}:8000"
+      # Pinned self-signed TLS endpoints — the app prefers these.
+      - "127.0.0.1:${NOVNC_TLS_PORT:-6443}:6443"
+      - "127.0.0.1:${AGENT_TLS_PORT:-8443}:8443"
     volumes:
       - chrome-profile:/home/agent/.gut-chrome
       - desktop-home:/home/agent

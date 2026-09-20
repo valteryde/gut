@@ -156,10 +156,12 @@
                 <label>Password <small>(protects the desktop stream and agent API on that device)</small>
                   <input id="vncPassInput" type="password" autocomplete="off">
                 </label>
-                <p class="hint">Each device is one Gut backend (agent :8000 &middot;
-                  desktop :6080) running at most one agent at a time. Rows show the
-                  backend's version and offer an update when a newer release exists.
-                  Click a row to edit it, or &ldquo;+ New device&rdquo; to add one.</p>
+                <p class="hint">Each device is one Gut backend (agent :8000/:8443 &middot;
+                  desktop :6080/:6443) running at most one agent at a time. The app
+                  prefers the TLS ports and pins the backend's self-signed cert;
+                  rows mark a connection &ldquo;unencrypted&rdquo; when only the plain
+                  ports answer. Rows show the backend's version and offer an update
+                  when a newer release exists.</p>
                 <menu>
                   <button id="saveSettings" class="btn primary">Save</button>
                 </menu>

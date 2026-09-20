@@ -291,6 +291,8 @@ services:
     ports:
       - "127.0.0.1:6080:6080"
       - "127.0.0.1:8000:8000"
+      - "127.0.0.1:6443:6443"
+      - "127.0.0.1:8443:8443"
     volumes:
       - gut-chrome:/home/agent/.gut-chrome
       - gut-home:/home/agent

@@ -19,7 +19,7 @@
     "appId": "dev.gut.app",
     "directories": { "output": "dist" },
     "artifactName": "${productName}-${version}-${arch}.${ext}",
-    "files": ["main.js", "preload.js", "localstack.js", "updater.js"],
+    "files": ["main.js", "preload.js", "localstack.js", "updater.js", "tls.js"],
     "extraResources": [
       { "from": "../client", "to": "client" }
     ],
@@ -29,7 +29,7 @@
       "target": ["dmg", "zip"],
       "extendInfo": {
         "NSLocalNetworkUsageDescription": "gut connects to Gut backends on your local network — the desktop stream and agent API run on machines you point it at.",
-        "NSBonjourServices": ["_http._tcp", "_ws._tcp"]
+        "NSBonjourServices": ["_http._tcp", "_ws._tcp", "_https._tcp", "_wss._tcp"]
       }
     },
     "win": {

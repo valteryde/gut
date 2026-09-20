@@ -22,4 +22,8 @@ contextBridge.exposeInMainWorld('gut', {
   installUpdate: () => ipcRenderer.invoke('update:install'),
   onUpdateState: (cb) =>
     ipcRenderer.on('update:state', (_e, s) => cb(s)),
+  // Pinned-TLS pairing against a backend's self-signed cert (see main.js).
+  tlsHandshake: (host, password) =>
+    ipcRenderer.invoke('tls:handshake', host, password),
+  tlsForget: (host) => ipcRenderer.invoke('tls:forget', host),
 });

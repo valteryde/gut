@@ -2,11 +2,25 @@
 // Loads the static client UI and exposes a small IPC surface (window.gut)
 // that manages a local Docker-based backend stack.
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const fs = require('fs');
 const path = require('path');
+const { certFp, tlsHandshake } = require('./tls');
 const local = require('./localstack');
 const updater = require('./updater');
 
 let win = null;
+
+// ── pinned TLS ──────────────────────────────────────────────────────────
+// Backends serve a self-signed cert (see tls.js for the pairing protocol).
+// Pins live in userData and the certificate-error hook below enforces them
+// for every https/wss connection the renderer opens.
+const PIN_FILE = path.join(app.getPath('userData'), 'tls-pins.json');
+let tlsPins = {};
+try { tlsPins = JSON.parse(fs.readFileSync(PIN_FILE, 'utf8')) || {}; }
+catch (_) { /* first run or unreadable — start empty */ }
+const savePins = () => {
+  try { fs.writeFileSync(PIN_FILE, JSON.stringify(tlsPins)); } catch (_) {}
+};
 
 // ── updates ─────────────────────────────────────────────────────────────
 let updateState = { status: 'idle', version: null, progress: null, error: null };
@@ -86,6 +100,19 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  ipcMain.handle('tls:handshake', async (_e, host, password) => {
+    const r = await tlsHandshake(String(host || ''),
+                                 String(password || ''), tlsPins);
+    if (r.ok) savePins();
+    return r;
+  });
+  ipcMain.handle('tls:forget', (_e, host) => {
+    const prefix = `${String(host || '')}:`;
+    for (const k of Object.keys(tlsPins)) {
+      if (k.startsWith(prefix)) delete tlsPins[k];
+    }
+    savePins();
+  });
   ipcMain.handle('local:status', () => local.status());
   ipcMain.handle('local:keys', () => local.keysSet());
   ipcMain.handle('local:key-values', () => local.keyValues());
@@ -106,6 +133,22 @@ app.whenReady().then(() => {
   ipcMain.handle('update:check', () => checkForUpdate());
   ipcMain.handle('update:download', () => downloadUpdate());
   ipcMain.handle('update:install', () => updater.applyAndRestart());
+
+  // Self-signed backend certs always fail normal verification — accept
+  // exactly the fingerprints pinned by tlsHandshake, reject everything else.
+  app.on('certificate-error', (event, _wc, url, _error, certificate,
+                               callback) => {
+    event.preventDefault();
+    let ok = false;
+    try {
+      const u = new URL(url);
+      const fp = certFp(certificate);
+      ok = !!fp &&
+        tlsPins[`${u.hostname}:${u.port || '443'}`] === fp;
+    } catch (_) { /* reject below */ }
+    if (!ok) console.warn('[gut] rejected unpinned TLS cert for', url);
+    callback(ok);
+  });
 
   createWindow();
   // Background update check at launch, then every 6h.

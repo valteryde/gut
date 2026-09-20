@@ -55,8 +55,8 @@ The installer prints the address and a generated password:
 
 ```
   gut-bot is up.
-    agent api : http://203.0.113.10:8000
-    desktop   : http://203.0.113.10:6080
+    agent api : https://203.0.113.10:8443
+    desktop   : https://203.0.113.10:6443
     password  : xK9…
 ```
 
@@ -123,8 +123,10 @@ reports it via `GET /api/version`.
 
 | Port | Service |
 |---|---|
-| 8000 | Agent daemon (REST + WebSocket `/ws/chat`) — requires the device password |
-| 6080 | noVNC / websockify desktop stream — requires the device password |
+| 8443 | Agent daemon over TLS — same API as :8000, self-signed cert pinned by the app |
+| 6443 | noVNC / websockify desktop stream over TLS — requires the device password |
+| 8000 | Agent daemon, plain HTTP — kept for older clients and the `/api/hello` pairing handshake |
+| 6080 | noVNC desktop stream, plain — kept for older clients |
 | 4000 | LiteLLM proxy (admin UI at `/ui`) — localhost-only in gut-bot |
 
 ---
@@ -198,19 +200,32 @@ The desktop stream is **full remote control** — anyone who reaches port 6080
 owns the machine, and port 8000 drives the agent itself. That's why every
 install generates one password (`VNC_PASSWORD`/`GUT_API_TOKEN`, same value)
 that protects both; the app sends it as a Bearer token / `?token=`.
-`GET /api/version` stays open for health checks and exposes only the version
-and device name. For remote backends, additionally firewall ports to your IP
-or front them with a TLS reverse proxy. Keep `LITELLM_MASTER_KEY` secret — it
-administers the proxy.
+`GET /api/version` and `GET /api/hello` stay open for health checks and TLS
+pairing and expose only the version, device name and cert fingerprint. Keep
+`LITELLM_MASTER_KEY` secret — it administers the proxy.
+
+**Transport encryption.** Every backend generates a persistent self-signed
+cert at boot and serves the agent API + desktop stream over TLS on `:8443`
+/`:6443` (the plain `:8000`/`:6080` ports stay for older clients). There is
+no CA and nothing to provision: on first connect the app fetches the
+unauthenticated `/api/hello` — the cert fingerprint plus
+`HMAC(device password, fingerprint + nonce)` — opens a provisional TLS
+connection, and pins the presented cert only when the fingerprint matches
+and the MAC verifies. A MITM can't forge the MAC without the password, and
+a relay can only forward the real cert, so pairing has no trust gap. Pins
+live in the app's userData dir; a regenerated cert re-pairs automatically
+(still password-checked). Once a device has encrypted, the app refuses to
+send its password over plaintext without your explicit OK — a stripped
+hello can't silently downgrade you.
 
 Provider keys entered in the app are uploaded to the device they belong to
 and stored there (the daemon's data dir plus LiteLLM's internal DB) — the
 agent needs them to call model providers, and anyone with the device
 password can read that store. The app also keeps a copy locally so keys
 can be pushed to other devices (the "Saved on this computer" store in
-Settings → Provider keys). They travel over plain HTTP like everything
-else on :8000, so push keys only on networks you trust or put a TLS proxy
-in front.
+Settings → Provider keys). On current backends the upload travels over the
+pinned TLS channel; pre-TLS backends still send it over plain HTTP, so push
+keys only on networks you trust until the device is updated.
 
 ## Human-in-the-loop
 

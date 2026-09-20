@@ -12,6 +12,7 @@ import asyncio
 import base64
 import hashlib
 from collections import deque
+import hmac
 import io
 import json
 import mimetypes
@@ -19,6 +20,7 @@ import os
 import re
 import shlex
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -109,6 +111,21 @@ INSTALL_KIND = _install_kind()
 # volume (or ~/.gut outside docker) so they survive container rebuilds.
 GUT_DATA_DIR = Path(os.environ.get("GUT_DATA_DIR") or Path.home() / ".gut")
 CONV_DIR = GUT_DATA_DIR / "conversations"
+# TLS: start.sh generates a self-signed cert into the data dir; a thin
+# TLS->TCP proxy in this process terminates GUT_TLS_PORT and forwards to the
+# plain uvicorn socket, so a second app instance (and a second lifespan) is
+# never needed. Clients don't need a CA — they pin the cert fingerprint
+# after the password-authenticated /api/hello handshake. GUT_NOVNC_TLS_PORT
+# is only advertised to clients; the TLS websockify is spawned by start.sh.
+TLS_CERT = Path(os.environ.get("GUT_TLS_CERT") or GUT_DATA_DIR / "tls" / "cert.pem")
+TLS_KEY = Path(os.environ.get("GUT_TLS_KEY") or GUT_DATA_DIR / "tls" / "key.pem")
+TLS_PORT = int(os.environ.get("GUT_TLS_PORT", "8443"))
+NOVNC_TLS_PORT = int(os.environ.get("GUT_NOVNC_TLS_PORT", "6443"))
+# Where the plain uvicorn socket lives — the TLS proxy forwards to it.
+# start.sh passes the same var to uvicorn's --port so overrides stay in
+# sync (AGENT_PORT in .env only moves the host-side compose mapping).
+HTTP_PORT = int(os.environ.get("GUT_HTTP_PORT", "8000"))
+TLS_FP = None  # sha256 of the cert the proxy actually presents
 # Files the user attaches in the composer land on the desktop itself, where
 # the agent's file/shell tools can read them (paths are relative to home).
 UPLOAD_DIR = Path(os.environ.get("GUT_UPLOAD_DIR") or HOME_DIR / "uploads")
@@ -2014,6 +2031,72 @@ rm -rf "$TMP"
 """
 
 
+# ── TLS termination ─────────────────────────────────────────────────────────
+
+def _ensure_tls_cert() -> None:
+    """Self-signed cert for the pinned-TLS listener. start.sh already does
+    this for docker/gut-bot (websockify needs the files too); this fallback
+    covers bare `uvicorn agent_daemon:app` dev runs."""
+    if TLS_CERT.exists() and TLS_KEY.exists():
+        return
+    cn = re.sub(r"[^A-Za-z0-9._-]", "", DEVICE_NAME) or "device"
+    try:
+        TLS_CERT.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "ec",
+             "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+             "-days", "3650", "-subj", f"/CN=gut-{cn}",
+             "-keyout", str(TLS_KEY), "-out", str(TLS_CERT)],
+            check=True, capture_output=True)
+        TLS_KEY.chmod(0o600)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"[gut] TLS cert generation failed ({e}) — TLS disabled")
+
+
+async def _pipe(reader: asyncio.StreamReader,
+                writer: asyncio.StreamWriter) -> None:
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, OSError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def _tls_bridge(client_r: asyncio.StreamReader,
+                      client_w: asyncio.StreamWriter) -> None:
+    try:
+        local_r, local_w = await asyncio.open_connection(
+            "127.0.0.1", HTTP_PORT)
+    except OSError:
+        client_w.close()
+        return
+    await asyncio.gather(_pipe(client_r, local_w), _pipe(local_r, client_w))
+
+
+async def _start_tls_proxy():
+    """TLS-terminating forwarder onto the plain uvicorn socket."""
+    global TLS_FP
+    _ensure_tls_cert()
+    try:
+        der = ssl.PEM_cert_to_DER_cert(TLS_CERT.read_text())
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+    except (OSError, ValueError, ssl.SSLError) as e:
+        print(f"[gut] TLS unavailable ({e}) — plain HTTP only")
+        return None
+    TLS_FP = hashlib.sha256(der).hexdigest()
+    srv = await asyncio.start_server(_tls_bridge, "0.0.0.0", TLS_PORT,
+                                     ssl=ctx)
+    print(f"[gut] TLS listener on :{TLS_PORT} (self-signed, pinned by the app)")
+    return srv
+
+
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -2022,6 +2105,7 @@ async def lifespan(_app: FastAPI):
         CONV_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         print(f"[gut] conversation dir {CONV_DIR} unavailable: {e}")
+    tls_srv = await _start_tls_proxy()
     state.litellm_key = await provision_key()
     sync_task = asyncio.create_task(model_sync_loop())
     print(f"[gut] agent ready, model={state.model}")
@@ -2029,6 +2113,8 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         sync_task.cancel()
+        if tls_srv:
+            tls_srv.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -2042,10 +2128,11 @@ def _token_ok(token: str) -> bool:
 
 @app.middleware("http")
 async def require_token(request: Request, call_next):
-    # /api/version stays open — the Electron app probes it to detect a Gut
-    # backend before it has credentials. OPTIONS is a CORS preflight.
+    # /api/version and /api/hello stay open — the Electron app probes them
+    # to detect a Gut backend and to pair TLS before it has credentials.
+    # OPTIONS is a CORS preflight.
     if (not GUT_API_TOKEN or request.method == "OPTIONS"
-            or request.url.path == "/api/version"):
+            or request.url.path in ("/api/version", "/api/hello")):
         return await call_next(request)
     auth = request.headers.get("authorization", "")
     if (auth == f"Bearer {GUT_API_TOKEN}"
@@ -2089,6 +2176,29 @@ async def api_version():
     backend and check compatibility before presenting credentials."""
     return {"version": GUT_VERSION, "device": DEVICE_NAME,
             "auth": bool(GUT_API_TOKEN), "install": INSTALL_KIND}
+
+
+@app.get("/api/hello")
+async def api_hello(n: str = ""):
+    """Unauthenticated TLS pairing handshake, like /api/version.
+
+    The app reads the pinned listener's cert fingerprint here (over plain
+    HTTP is fine — it leaks nothing), opens a provisional TLS connection to
+    see the cert actually presented, and pins it when the fingerprint
+    matches and `mac` verifies: HMAC(device password, fp + client nonce).
+    A MITM can't forge the MAC without the password, and a pure relay only
+    ever forwards the real cert — so first connect has no trust gap. `n`
+    makes every answer single-use so replays can't pin stale certs.
+    """
+    if not TLS_FP:
+        raise HTTPException(404, "this backend has no TLS listener")
+    mac = None
+    if GUT_API_TOKEN:
+        mac = hmac.new(GUT_API_TOKEN.encode(),
+                       f"gut-tls-pin:{TLS_FP}:{n}".encode(),
+                       hashlib.sha256).hexdigest()
+    return {"cert_sha256": TLS_FP, "mac": mac,
+            "port": TLS_PORT, "vnc_port": NOVNC_TLS_PORT}
 
 
 def _update_status() -> dict:
