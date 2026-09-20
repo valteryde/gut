@@ -167,6 +167,14 @@ PYEOF
       systemctl restart gut-litellm.service gut-bot.service || true
     fi
 
+    # Browser sanity: Ubuntu's `chromium` deb is a snap stub that can't exec
+    # on many VPSes — exo-open then fails with "Input/output error" and the
+    # agent's browser_* tools die with it. Provisions real Chrome on amd64
+    # (deferred past the apt lock) and pins the session's default browser to
+    # the /usr/local/bin/google-chrome wrapper. Never fatal.
+    /opt/gut/ensure-browser.sh \
+      || echo "gut-bot: browser provisioning failed — continuing" >&2
+
     IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     cat <<EOF
 

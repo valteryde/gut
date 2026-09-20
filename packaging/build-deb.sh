@@ -75,7 +75,13 @@ install -m644 "$ROOT/litellm_config.yaml" "$STAGE/etc/gut/litellm.yaml"
 install -m644 "$ROOT/packaging/chromium-gut.conf" "$STAGE/etc/chromium.d/gut"
 printf 'gut ALL=(ALL) NOPASSWD:ALL\n' > "$STAGE/etc/sudoers.d/gut"
 chmod 440 "$STAGE/etc/sudoers.d/gut"
-ln -sf /usr/bin/chromium "$STAGE/usr/local/bin/google-chrome"
+# Browser launcher: not a plain symlink — it skips snap stubs (Ubuntu's
+# `chromium` deb execs the snap, which can't run on many VPSes) and forces
+# the CDP/no-sandbox flags whatever binary it picks.
+install -m755 "$ROOT/packaging/gut-browser" "$STAGE/usr/local/bin/google-chrome"
+# Provisions a real browser (Chrome on amd64) and the session's default-
+# browser config; runs from postinst and every start.sh boot.
+install -m755 "$ROOT/packaging/ensure-browser.sh" "$STAGE/opt/gut/ensure-browser.sh"
 
 install -m644 "$ROOT/packaging/systemd/gut-bot.service" \
               "$ROOT/packaging/systemd/gut-litellm.service" \
@@ -86,7 +92,7 @@ install -m755 "$ROOT/packaging/gut-bot" "$STAGE/usr/bin/gut-bot"
 DEPS=$(grep -v '^\s*#' "$ROOT/packaging/apt-deps.txt" | grep -v '^\s*$' \
        | paste -sd, -)
 sed -e "s/@VERSION@/$VERSION/" -e "s/@ARCH@/$ARCH/" \
-    -e "s/@DEPS@/$DEPS,chromium,postgresql/" \
+    -e "s/@DEPS@/$DEPS,chromium | google-chrome-stable,postgresql/" \
     "$ROOT/packaging/debian/control" > "$STAGE/DEBIAN/control"
 for s in postinst prerm postrm; do
     install -m755 "$ROOT/packaging/debian/$s" "$STAGE/DEBIAN/$s"

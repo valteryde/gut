@@ -113,6 +113,16 @@ if [ -s "$TLS_CERT" ] && [ -s "$TLS_KEY" ]; then
     "${GUT_NOVNC_TLS_PORT:-6443}" localhost:5900 &
 fi
 
+# Browser self-heal (gut-bot deb installs only): if the packaged browser is
+# a non-runnable snap stub — Ubuntu's `chromium` is — ensure-browser.sh
+# installs real Chrome on amd64 and wires it as the session's default
+# browser. Runs as root via the gut sudoers rule; a fast no-op once a real
+# browser exists. The Docker image doesn't ship the script (its browser is
+# real already).
+if [ -x /opt/gut/ensure-browser.sh ]; then
+  sudo -n /opt/gut/ensure-browser.sh >/dev/null 2>&1 &
+fi
+
 echo "[gut] waiting for LiteLLM at ${LITELLM_URL}"
 for _ in $(seq 1 120); do
     # /health/liveliness exists on newer litellm; 1.9.x only has /health.

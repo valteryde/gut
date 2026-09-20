@@ -182,8 +182,11 @@ reports it via `GET /api/version`.
   selected device, push one via a card's "Use saved key", or forget one.
   Remote daemons never return key values, so only the app holds a copy.
 - **Architecture**: the Docker image ships Google Chrome on amd64 and Debian's
-  `chromium` on arm64; gut-bot always uses `chromium` (Google doesn't publish
-  an apt repo the deb can depend on). `google-chrome` is aliased either way.
+  `chromium` on arm64; gut-bot depends on `chromium | google-chrome-stable`
+  and self-provisions real Google Chrome on amd64 hosts where `chromium` is
+  only a snap stub (Ubuntu — snaps can't exec on many VPSes). Either way
+  `google-chrome` resolves to a wrapper that forces the CDP/no-sandbox flags
+  and is wired as the session's default browser.
 - **Browser sandbox**: the browser always launches with `--no-sandbox` —
   restricted kernels (containers, some VPSes) block the user namespaces its
   sandbox needs; the dedicated desktop is the isolation boundary.
