@@ -160,8 +160,10 @@ jobs:
           # find-identity -p codesigning won't return it to electron-builder.
           security find-certificate -c "gut self-signed" -p "$KC" \
             > /tmp/gut-sign-cert.pem
-          security add-trusted-cert -r trustRoot \
-            -k "$KC" /tmp/gut-sign-cert.pem
+          # -d = admin/system domain. The user-domain form (no -d) can
+          # block on an auth prompt that never shows on a headless runner.
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain /tmp/gut-sign-cert.pem
           security find-identity -v -p codesigning
           echo "CSC_NAME=gut self-signed" >> "$GITHUB_ENV"
           echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
