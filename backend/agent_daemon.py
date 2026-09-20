@@ -942,6 +942,26 @@ def block_external_schemes() -> None:
         pass
 
 
+_last_browser_heal = 0.0
+
+
+def _kick_browser_provision() -> None:
+    """Deb installs: hand the missing/broken browser to ensure-browser.sh so
+    a failed launch self-heals instead of waiting for a service restart.
+    The script is idempotent and self-throttling, so kicks are cheap."""
+    global _last_browser_heal
+    if not Path("/opt/gut/ensure-browser.sh").exists():
+        return
+    now = time.monotonic()
+    if now - _last_browser_heal < 120:
+        return
+    _last_browser_heal = now
+    try:
+        subprocess.Popen(["sudo", "-n", "/opt/gut/ensure-browser.sh"])
+    except OSError:
+        pass
+
+
 async def ensure_browser(url: str | None = None) -> str:
     """Guarantee Chrome is running with CDP; returns a status line."""
     if await cdp_up():
@@ -961,7 +981,10 @@ async def ensure_browser(url: str | None = None) -> str:
         if await cdp_up():
             return "chrome started"
         await asyncio.sleep(0.5)
-    raise CDPError(f"chrome did not expose CDP on :{CDP_PORT}")
+    _kick_browser_provision()
+    raise CDPError(
+        f"chrome did not expose CDP on :{CDP_PORT} — provisioning a "
+        "working browser in the background; retry in a minute")
 
 
 async def cdp_send(ws, method: str, params: dict | None = None) -> dict:

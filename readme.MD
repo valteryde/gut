@@ -183,10 +183,16 @@ reports it via `GET /api/version`.
   Remote daemons never return key values, so only the app holds a copy.
 - **Architecture**: the Docker image ships Google Chrome on amd64 and Debian's
   `chromium` on arm64; gut-bot depends on `chromium | google-chrome-stable`
-  and self-provisions real Google Chrome on amd64 hosts where `chromium` is
-  only a snap stub (Ubuntu — snaps can't exec on many VPSes). Either way
+  and self-provisions a working browser where `chromium` is only a snap stub
+  (Ubuntu — snaps can't exec on many VPSes): real Chrome on amd64, Google's
+  Chrome-for-Testing zip on either arch (lock-free, works mid-transaction),
+  and Mozilla-repo Firefox as a GUI fallback (no CDP in Firefox ≥141, so it
+  serves the desktop but not the agent's `browser_*` tools). Candidates are
+  exec-verified — a browser that can't run `--version` doesn't count, and a
+  broken leftover payload gets dep-repaired on the next run. Either way
   `google-chrome` resolves to a wrapper that forces the CDP/no-sandbox flags
-  and is wired as the session's default browser.
+  and is wired as the session's default browser, and the daemon re-triggers
+  provisioning itself when a browser launch fails.
 - **Browser sandbox**: the browser always launches with `--no-sandbox` —
   restricted kernels (containers, some VPSes) block the user namespaces its
   sandbox needs; the dedicated desktop is the isolation boundary.

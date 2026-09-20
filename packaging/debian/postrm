@@ -3,9 +3,13 @@ set -e
 
 case "$1" in
   purge)
-    rm -rf /var/lib/gut /etc/gut /etc/systemd/system/gut-litellm.service.d
+    rm -rf /var/lib/gut /etc/gut /etc/systemd/system/gut-litellm.service.d \
+           /opt/gut/browsers
     # written by ensure-browser.sh at install time, not package payload
-    rm -f /usr/share/xfce4/helpers/gut-browser.desktop
+    rm -f /usr/share/xfce4/helpers/gut-browser.desktop \
+          /etc/apt/sources.list.d/mozilla.list \
+          /etc/apt/preferences.d/mozilla \
+          /etc/apt/keyrings/packages.mozilla.org.asc
     systemctl daemon-reload 2>/dev/null || true
     deluser --quiet gut 2>/dev/null || true
     # LiteLLM's postgres data is left in place — drop manually if unwanted:

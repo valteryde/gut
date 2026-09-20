@@ -4,18 +4,23 @@
 # (`nohup google-chrome`), XFCE exo-open/xdg-open via the gut-browser
 # helper, and .desktop icons.
 #
-# Picks the first *real* browser and forces the flags the agent needs:
+# Picks the first *working* browser and forces the flags the agent needs:
 # --no-sandbox (gut-bot hosts often lack unprivileged user namespaces), CDP
 # on localhost:9222 for the browser_* tools, a dedicated profile dir
 # (Chrome 136+ ignores --remote-debugging-port on the default profile), and
 # a UI scale bump so page text survives screenshot downscaling.
 #
-# Snap stubs are skipped: Ubuntu's `chromium` deb is a transitional package
-# that execs the snap, and snap-confined apps die with EIO on VPSes without
-# squashfs/loop support — ensure-browser.sh installs real Chrome there.
+# Snap stubs are skipped: Ubuntu's `chromium`/`firefox` debs are
+# transitional packages that exec the snap, and snap-confined apps die with
+# EIO on VPSes without squashfs/loop support. ensure-browser.sh provisions
+# real Chrome / Chrome-for-Testing / Mozilla-repo firefox instead.
+#
+# Firefox is a last resort: it's a working desktop browser but has no CDP
+# (removed in 141), so the agent's browser_* tools only work on the
+# Chromium-family candidates above it.
 
-FLAGS="--no-sandbox --disable-setuid-sandbox \
---remote-debugging-address=127.0.0.1 --remote-allow-origins=* \
+CHROME_FLAGS="--no-sandbox --disable-setuid-sandbox \
+--remote-debugging-address=127.0.0.1 --remote-allow-origins='*' \
 --remote-debugging-port=${CDP_PORT:-9222} \
 --user-data-dir=${HOME:-/var/lib/gut}/.gut-chrome \
 --force-device-scale-factor=${UI_SCALE:-1.25}"
@@ -28,19 +33,48 @@ is_snap() {
   head -c 4096 "$1" 2>/dev/null | grep -q 'snap run'
 }
 
+# A browser that can't even print its version (missing libs, truncated
+# payload) is worse than absent — it would exec-fail or hang mid-launch.
+runnable() {
+  timeout 15 "$1" --version >/dev/null 2>&1
+}
+
+# CDP-capable candidates, best first: real Chrome, Chrome for Testing
+# (provisioned by ensure-browser.sh into /opt/gut/browsers), real chromium.
 for b in /usr/bin/google-chrome-stable /usr/bin/google-chrome \
-         /opt/google/chrome/google-chrome; do
-  [ -x "$b" ] && exec "$b" $FLAGS "$@"
+         /opt/google/chrome/google-chrome \
+         /opt/gut/browsers/cft/chrome; do
+  case "$b" in
+    /usr/bin/google-chrome) [ -e "$b" ] && is_snap "$b" && continue ;;
+  esac
+  [ -x "$b" ] && runnable "$b" && exec "$b" $CHROME_FLAGS "$@"
 done
 
 for c in /usr/bin/chromium /usr/bin/chromium-browser; do
-  [ -e "$c" ] && ! is_snap "$c" && exec "$c" $FLAGS "$@"
+  [ -e "$c" ] && ! is_snap "$c" && runnable "$c" \
+    && exec "$c" $CHROME_FLAGS "$@"
+done
+
+# GUI fallback: a real (non-snap) firefox. No CDP, but the user gets a
+# browser that opens; MOZ_*_SANDBOX keeps it alive without user namespaces.
+for f in /usr/bin/firefox /usr/bin/firefox-esr; do
+  if [ -x "$f" ] && ! is_snap "$f" && runnable "$f"; then
+    P="${HOME:-/var/lib/gut}/.gut-firefox"
+    mkdir -p "$P"
+    touch "$P/user.js"
+    sed -i '/layout\.css\.devPixelsPerPx/d' "$P/user.js"
+    printf 'user_pref("layout.css.devPixelsPerPx", "%s");\n' \
+      "${UI_SCALE:-1.25}" >> "$P/user.js"
+    MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 \
+    MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 \
+      exec "$f" -profile "$P" "$@"
+  fi
 done
 
 # last resort: whatever chromium is reachable (may still be the snap stub —
 # a broken snap fails the same way it would have anyway)
 c="$(command -v chromium || command -v chromium-browser || true)"
-[ -n "$c" ] && exec "$c" $FLAGS "$@"
+[ -n "$c" ] && exec "$c" $CHROME_FLAGS "$@"
 
 echo "gut-browser: no usable browser found" >&2
 exit 1
