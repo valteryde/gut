@@ -19,13 +19,17 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
+import signal
 import socket
 import ssl
 import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlparse
 from uuid import uuid4
 
 import httpx
@@ -58,6 +62,26 @@ MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "150"))
 IDLE_REPLY_LIMIT = int(os.environ.get("AGENT_IDLE_REPLY_LIMIT", "3"))
 ASK_USER_TIMEOUT = int(os.environ.get("ASK_USER_TIMEOUT", "600"))
 COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "60"))
+# Background helper agents (spawn_agent): headless — web/text tools and a
+# display-less shell, own step cap and optional cheaper model.
+# SUBAGENT_MODEL empty = same model as the main agent.
+SUBAGENT_MAX_STEPS = int(os.environ.get("SUBAGENT_MAX_STEPS", "40"))
+SUBAGENT_MAX_CONCURRENT = int(os.environ.get("SUBAGENT_MAX_CONCURRENT", "4"))
+SUBAGENT_MODEL = os.environ.get("SUBAGENT_MODEL", "")
+# Long-horizon support. When a request's prompt_tokens exceed
+# AGENT_COMPACT_RATIO of the model's context window (max_input_tokens from
+# LiteLLM's /model/info; AGENT_CONTEXT_LIMIT is the fallback when it reports
+# none — deliberately conservative: over-compacting wastes one call,
+# under-compacting kills the run), history is summarized into a handoff
+# note and the loop continues on summary + todos + the last
+# AGENT_COMPACT_KEEP messages.
+COMPACT_RATIO = float(os.environ.get("AGENT_COMPACT_RATIO", "0.75"))
+COMPACT_CONTEXT_LIMIT = int(os.environ.get("AGENT_CONTEXT_LIMIT", "128000"))
+COMPACT_KEEP = int(os.environ.get("AGENT_COMPACT_KEEP", "6"))
+# Steps without an update_todos call before the checklist is nudged back
+# into view on long tasks.
+TODO_REMIND_STEPS = int(os.environ.get("TODO_REMIND_STEPS", "20"))
+TODO_MAX_ITEMS = int(os.environ.get("TODO_MAX_ITEMS", "30"))
 SCREENSHOT_MAX_EDGE = int(os.environ.get("SCREENSHOT_MAX_EDGE", "1568"))
 SCREENSHOT_MAX_PIXELS = int(os.environ.get("SCREENSHOT_MAX_PIXELS", "1000000"))
 SCREENSHOT_HISTORY = int(os.environ.get("SCREENSHOT_HISTORY", "3"))
@@ -76,6 +100,9 @@ LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
 SEND_FILE_MAX_BYTES = int(os.environ.get("SEND_FILE_MAX_BYTES", str(9 * 1024 * 1024)))
 CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 CDP_HTTP = f"http://localhost:{CDP_PORT}"
+# SearXNG endpoint for web_search — the compose stacks run one on the
+# internal network. Empty = fall back to DuckDuckGo's HTML endpoint.
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "").rstrip("/")
 SHOT_PATH = Path("/tmp/gut_screen.png")
 HOME_DIR = Path(os.environ.get("HOME") or Path.home())
 KEY_FILE = Path(os.environ.get("GUT_KEY_FILE") or HOME_DIR / ".gut_litellm_key")
@@ -172,16 +199,22 @@ SYSTEM_PROMPT = """You are Gut, an autonomous operator of a Linux desktop (XFCE4
 You perceive the screen through screenshots and act with mouse/keyboard tools.
 
 Environment:
-- Google Chrome is installed with DevTools on localhost:{cdp}. For anything on
-  a web page prefer the browser_* tools (DOM refs, not pixels): open_url or
-  browser_navigate to get somewhere, browser_text to read the page's text,
-  browser_dom to list interactive elements as #refs, then browser_click /
-  browser_type by ref; browser_eval runs arbitrary JS. Fall back to pixel
-  tools for anything outside the page.
+- To find or read web content, start with the text tools — fast and cheap,
+  no browser or screenshots needed: web_search finds pages, fetch_url reads
+  a page's text and links (run_command + curl works for APIs and downloads).
+- Google Chrome is installed with DevTools on localhost:{cdp}. Use the
+  browser_* tools only when the text tools can't do the job — pages needing
+  JS, logins/sessions, forms, or visual checks (DOM refs, not pixels):
+  open_url or browser_navigate to get somewhere, browser_text to read the
+  page's text, browser_dom to list interactive elements as #refs, then
+  browser_click / browser_type by ref; browser_eval runs arbitrary JS.
+  Fall back to pixel tools for anything outside the page.
 - LibreOffice Writer, Calc and Impress are installed
   (`libreoffice --writer/--calc/--impress`).
 - run_command gives you a bash shell (cwd {home}, DISPLAY already set).
   Launch GUI apps in the background so the command returns, e.g. `google-chrome &`.
+- {home}/scratch is wiped when the task ends — use it for temp and
+  intermediate files. Keep anything needed later elsewhere in {home}.
 - {coords}
 - Older screenshots are dropped from context — only recent frames are kept.
   The text log of your actions stays; call screenshot for a fresh look.
@@ -195,7 +228,9 @@ Talking to the user — act like a teammate, not a live feed:
   task, a blocker, a finding worth flagging. Silence is fine while work is
   straightforward; do not narrate steps.
 - send_file: deliver an artifact (report, spreadsheet, export, download) as a
-  chat attachment. Paths are relative to {home}.
+  chat attachment. Paths are relative to {home}. The user can't browse this
+  filesystem — before task_complete, send_file every file they'll want,
+  including attached files you edited; a path in the summary is not delivery.
 - send_image: show the user an image — a file, or a fresh screenshot when no
   path is given.
 - Files the user attaches to a message are saved under {home}/uploads/ — the
@@ -208,6 +243,18 @@ Talking to the user — act like a teammate, not a live feed:
 - task_complete: ends the task and sends `summary` as your wrap-up message.
   Make it a good one: what was done, where results live, what to check.
 
+Planning — match the effort to the task:
+- Small tasks: just do them — no plan, no checklist.
+- Big multi-phase tasks: call share_plan once with a concise plan (it posts
+  to the user as a card — no approval needed, keep working), then
+  update_todos with the step list. Pass the full list every call, keep
+  exactly one item in_progress, mark steps done as you go. If the scope
+  changes, share_plan again and rewrite the list.
+- On very long runs your older context gets compacted into a handoff
+  summary — the checklist always survives it. Anything else worth keeping
+  (paths, URLs, decisions, findings) belongs in the todo text or in files
+  under {home}.
+
 Guidelines:
 - A fresh screenshot is attached automatically after each turn's actions; only
   call screenshot when nothing changed or you need an extra look.
@@ -215,6 +262,8 @@ Guidelines:
   once (e.g. click field → type → press enter). Split only when the next step
   depends on what the screen shows after the previous one.
 - Prefer keyboard shortcuts, direct typing and run_command over pixel hunting.
+- For anything online, web_search/fetch_url first; browser_* only when they
+  fail or the page genuinely needs a browser (JS, auth, interaction).
 - If an action changes nothing after two tries, stop and brainstorm at least
   5 different approaches (keyboard navigation, menus, run_command, the
   browser_* tools, a different app entirely) and try the most promising
@@ -228,6 +277,38 @@ Guidelines:
   pickers), press Escape to dismiss it rather than pixel-clicking buttons.
 - If a login, 2FA, CAPTCHA or genuinely ambiguous decision blocks you, call
   ask_user — the human can click into the live screen to help, then resume you.
+- When your task ends the system closes the apps, windows and browser tabs
+  you opened and stops leftover processes. Logins and cookies persist across
+  tasks — never log out or wipe browser data as "cleanup".
+
+Delegating — spawn_agent runs a helper agent in the background:
+- Give it self-contained headless subtasks: web research, reading or writing
+  files, crunching data with run_command. It has no screen, no browser and
+  no way to reach the user — anything needing eyes, clicks or logins is yours.
+- Its final report arrives as a message mid-run; collect_agent(name) blocks
+  until it (or any helper) reports. Share artifacts through files under {home}.
+- Good use: "research these 5 companies" → spawn several and keep working.
+  At most {subcap} helpers run at once.
+"""
+
+SUBAGENT_PROMPT = """You are '{name}', a background helper spawned by Gut on a Linux desktop.
+The main agent works in parallel and only ever sees your final report.
+
+Tools:
+- web_search + fetch_url: find and read web content (text only).
+- run_command: bash, cwd {home}. There is no display — GUI apps and anything
+  needing a screen fail; stay headless (curl, scripts, files, packages).
+- send_file: deliver a file to the user (paths relative to {home}).
+- task_complete: finish; `summary` becomes your report to the main agent.
+
+Rules:
+- Your whole output is the final report — pack in findings, file paths,
+  blockers. For substantial output, write files under {home} and return the
+  paths instead of pasting everything.
+- You cannot see the screen, drive the browser, or ask the user anything —
+  put blockers in the report instead.
+- A reply with no tool calls also ends your run, with the reply as the
+  report — but prefer task_complete so the intent is clear.
 """
 
 COORD_PROMPT_PIXEL = ("Tool coordinates refer to pixels in the screenshot "
@@ -260,6 +341,27 @@ class AgentState:
         self.tokens_in = 0
         self.tokens_out = 0
         self.models_synced = False  # provider keys pushed into LiteLLM
+        # Background helpers: name -> {task, desc, conv, status, result,
+        # model, usd, steps, delivered}. Finished entries queue on
+        # subagent_inbox for injection into their conversation's context.
+        self.subagents: dict[str, dict] = {}
+        self.subagent_inbox = deque()
+        # The running conversation's update_todos checklist (persisted at
+        # <cid>.todos.json) and the long-horizon bookkeeping for reminders
+        # and compaction.
+        self.todos: list[dict] = []
+        self.steps_since_todo = 0
+        self.steps_since_compact = 99
+        self.ctx_limit: dict[str, int] = {}  # model -> max_input_tokens
+        # Delivery bookkeeping for the unsent-output nudge at task_complete:
+        # run_start marks the current task's beginning; delivered maps an
+        # attachment's resolved path -> mtime when the user sent it (cumulative
+        # across runs); sent_files maps path -> mtime at send_file time, so a
+        # post-send edit counts as unsent again.
+        self.run_start = 0.0
+        self.delivered: dict[str, float] = {}
+        self.sent_files: dict[str, float] = {}
+        self.output_nudge_done = False
 
     @property
     def running(self) -> bool:
@@ -349,7 +451,7 @@ def conv_get(cid: str) -> dict | None:
                 events.append(json.loads(line))
     except (OSError, json.JSONDecodeError):
         pass
-    return {"meta": meta, "events": events}
+    return {"meta": meta, "events": events, "todos": conv_load_todos(cid)}
 
 
 def conv_delete(cid: str) -> bool:
@@ -357,6 +459,10 @@ def conv_delete(cid: str) -> bool:
         return False
     for p in _conv_paths(cid):
         p.unlink(missing_ok=True)
+    try:
+        _todo_path(cid).unlink(missing_ok=True)
+    except ValueError:
+        pass
     return True
 
 
@@ -430,6 +536,33 @@ def conv_save_context(cid: str, messages: list) -> None:
         tmp.replace(ctx_path)
     except OSError as e:
         print(f"[gut] context save failed for {cid}: {e}")
+
+
+def _todo_path(cid: str) -> Path:
+    if not _CID_RE.fullmatch(cid or ""):
+        raise ValueError(f"bad conversation id: {cid!r}")
+    return CONV_DIR / f"{cid}.todos.json"
+
+
+def conv_load_todos(cid: str) -> list[dict]:
+    try:
+        items = json.loads(_todo_path(cid).read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    return [i for i in items
+            if isinstance(i, dict) and str(i.get("content") or "").strip()]
+
+
+def conv_save_todos(cid: str, items: list[dict]) -> None:
+    try:
+        p = _todo_path(cid)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items))
+        tmp.replace(p)
+    except (OSError, ValueError) as e:
+        print(f"[gut] todos save failed for {cid}: {e}")
 
 
 def sanitize_context(messages: list) -> None:
@@ -726,7 +859,8 @@ async def model_sync_loop() -> None:
 # ephemeral channel noise and are not recorded.
 TRANSCRIPT_TYPES = frozenset({
     "user", "agent_msg", "done", "file", "image",
-    "thought", "action", "action_result", "question", "error"})
+    "thought", "action", "action_result", "question", "error",
+    "subagent", "cleanup", "plan", "compact"})
 
 
 def record_event(msg: dict) -> None:
@@ -872,17 +1006,23 @@ def type_text(text: str) -> str:
     return f"typed {len(text)} chars"
 
 
-def run_command(command: str) -> str:
+def run_command(command: str, headless: bool = False) -> str:
     # Redirect via a real file, not pipes: a backgrounded child (`foo &`)
     # inherits stdout/stderr, and communicate() would block on pipe EOF until
     # that child exits — a false "still running" timeout for every GUI launch.
+    env = None
+    if headless:
+        # Subagent shell: no display, so GUI launches fail fast instead of
+        # silently hijacking the screen the main agent is using.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY")}
     fd, out_path = tempfile.mkstemp(prefix="gut-cmd-", suffix=".out")
     try:
         with os.fdopen(fd, "w") as f:
             p = subprocess.run(
                 ["bash", "-lc", command],
                 stdout=f, stderr=subprocess.STDOUT,
-                timeout=COMMAND_TIMEOUT, cwd=str(HOME_DIR),
+                timeout=COMMAND_TIMEOUT, cwd=str(HOME_DIR), env=env,
             )
         out = Path(out_path).read_text(errors="replace").strip()
         return (out or f"(exit {p.returncode}, no output)")[:4000]
@@ -1218,6 +1358,223 @@ async def open_url(url: str) -> str:
     return f"{status}; opened {url}"
 
 
+# ── Web search & fetch ─────────────────────────────────────────────────────
+# Text-only alternatives to driving Chrome: the agent searches via SearXNG
+# (SEARXNG_URL — the compose stacks run one on the internal network; unset or
+# unreachable = DuckDuckGo's HTML endpoint) and reads pages over plain HTTP.
+# Deliberately absent from SCREEN_TOOLS: these turns carry no screenshot.
+
+WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# Content of _SKIP_TAGS is dropped entirely (boilerplate); _BLOCK_TAGS only
+# force line breaks so text doesn't run together.
+_SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "head",
+              "nav", "header", "footer", "aside", "form"}
+_BLOCK_TAGS = {
+    "p", "div", "br", "hr", "li", "ul", "ol", "tr", "td", "th", "table",
+    "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "main",
+    "blockquote", "pre", "fieldset", "figure", "figcaption",
+}
+
+
+class _PageText(HTMLParser):
+    """Minimal HTML -> text+links extractor (stdlib, no deps)."""
+
+    def __init__(self, base: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.skip = 0
+        self.parts: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self._a_href: str | None = None
+        self._a_text: list[str] = []
+        self.title = ""
+        self._in_title = False
+
+    def _break(self) -> None:
+        if self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag == "title":
+            self._in_title = True
+        if tag in _SKIP_TAGS:
+            self.skip += 1
+            return
+        if self.skip:
+            return
+        if tag in _BLOCK_TAGS:
+            self._break()
+        if tag == "a":
+            href = dict(attrs).get("href")
+            self._a_href = urljoin(self.base, href) if href else None
+            self._a_text = []
+
+    def handle_endtag(self, tag) -> None:
+        if tag == "title":
+            self._in_title = False
+        if tag in _SKIP_TAGS:
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip:
+            return
+        if tag in _BLOCK_TAGS:
+            self._break()
+        if tag == "a":
+            txt = " ".join("".join(self._a_text).split())
+            if self._a_href and txt and len(txt) <= 140:
+                self.links.append((txt, self._a_href))
+            self._a_href = None
+            self._a_text = []
+
+    def handle_data(self, data) -> None:
+        if self._in_title:
+            self.title += data
+            return
+        if self.skip:
+            return
+        self.parts.append(data)
+        if self._a_href is not None:
+            self._a_text.append(data)
+
+    def result(self) -> tuple[str, str, list]:
+        lines = [" ".join(l.split()) for l in "".join(self.parts).split("\n")]
+        text = "\n".join(l for l in lines if l)
+        links = [(t, u) for t, u in self.links
+                 if urlparse(u).scheme in ("http", "https")]
+        return text, " ".join(self.title.split()), links
+
+
+class _DDGResults(HTMLParser):
+    """Parser for html.duckduckgo.com result pages (the SEARXNG_URL fallback)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict] = []
+        self._cls = ""
+        self._href: str | None = None
+        self._buf: list[str] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        cls = dict(attrs).get("class", "").split()
+        if "result__a" in cls:
+            self._cls, self._href, self._buf = "a", dict(attrs).get("href"), []
+        elif "result__snippet" in cls:
+            self._cls, self._buf = "snippet", []
+
+    def handle_data(self, data) -> None:
+        if self._cls:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag) -> None:
+        # Both result__a and result__snippet are anchors — inner tags like
+        # <b> must not finalize the element early (they'd truncate text).
+        if tag != "a" or not self._cls:
+            return
+        text = " ".join("".join(self._buf).split())
+        if self._cls == "a":
+            url = self._href or ""
+            if "uddg=" in url:  # unwrap the /l/?uddg= redirect
+                url = parse_qs(urlparse(url).query).get("uddg", [url])[0]
+            if urlparse(url).scheme in ("http", "https"):
+                self.results.append({"title": text, "url": url, "snippet": ""})
+        elif self._cls == "snippet" and self.results:
+            self.results[-1]["snippet"] = text
+        self._cls = ""
+
+
+async def _ddg_search(query: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"User-Agent": WEB_UA}) as c:
+        r = await c.post("https://html.duckduckgo.com/html/",
+                         data={"q": query})
+        r.raise_for_status()
+    p = _DDGResults()
+    p.feed(r.text)
+    return p.results
+
+
+async def web_search(query: str, max_results: int = 8) -> str:
+    query = query.strip()
+    if not query:
+        return "empty query"
+    n = max(1, min(int(max_results or 8), 15))
+    results, backend = [], ""
+    if SEARXNG_URL:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(f"{SEARXNG_URL}/search",
+                                params={"q": query, "format": "json"})
+            if r.status_code == 200:
+                results = [{"title": str(it.get("title", "")),
+                            "url": str(it.get("url", "")),
+                            "snippet": str(it.get("content") or "")}
+                           for it in r.json().get("results", [])]
+                backend = "searxng"
+        except Exception:
+            pass  # fall through to the DDG fallback
+    if not results:
+        try:
+            results, backend = await _ddg_search(query), "duckduckgo"
+        except Exception as e:
+            return (f"search failed ({e}) — use the browser tools instead")
+    if not results:
+        return "no results — try rephrasing, or use the browser tools"
+    lines = [f"{i}. {r['title']}\n   {r['url']}"
+             + (f"\n   {r['snippet']}" if r["snippet"] else "")
+             for i, r in enumerate(results[:n], 1)]
+    return f"results for '{query}' via {backend}:\n" + "\n".join(lines)
+
+
+async def fetch_url(url: str, max_chars: int = 6000) -> str:
+    url = url.strip()
+    if not re.match(r"https?://", url):
+        return "url must start with http:// or https://"
+    cap = max(500, min(int(max_chars or 6000), 16000))
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                     headers={"User-Agent": WEB_UA}) as c:
+            async with c.stream("GET", url) as r:
+                ctype = (r.headers.get("content-type", "")
+                         .split(";")[0].strip().lower())
+                enc = r.encoding or "utf-8"
+                final_url = str(r.url)
+                raw = b""
+                async for chunk in r.aiter_bytes(65536):
+                    raw += chunk
+                    if len(raw) > 2_000_000:
+                        break
+    except Exception as e:
+        return (f"fetch failed: {e} — if the page needs JS or a login, "
+                "use the browser tools")
+    if ctype in ("", "text/html", "application/xhtml+xml"):
+        p = _PageText(final_url)
+        p.feed(raw.decode(enc, errors="replace"))
+        text, title, links = p.result()
+        out = [f"# {title or final_url}", final_url, "", text[:cap]]
+        if len(text) > cap:
+            out.append(f"\n[truncated — {len(text)} chars total; refetch with "
+                       "a higher max_chars or grab a section with curl]")
+        seen: set[str] = set()
+        link_lines = []
+        for txt, href in links:
+            if href in seen or len(link_lines) >= 25:
+                continue
+            seen.add(href)
+            link_lines.append(f"  {txt} — {href}")
+        if link_lines:
+            out.append("\nlinks:")
+            out.extend(link_lines)
+        return "\n".join(out)
+    if ctype.startswith("text/") or ctype in ("application/json",
+                                             "application/xml"):
+        return f"{final_url}\n\n" + raw[:cap].decode(enc, errors="replace")
+    return (f"{final_url} is {ctype or 'unknown type'} ({len(raw)} bytes) — "
+            "not readable as text; download it with run_command/curl or "
+            "open it in the browser")
+
+
 # Screen-mutating tools trigger one fresh screenshot per turn, attached to the
 # last tool result (skipped when the frame is unchanged). See agent_loop.
 SCREEN_TOOLS = {
@@ -1294,6 +1651,29 @@ TOOLS = [
                        "Append '&' when launching GUI apps so it returns immediately.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web — returns numbered results with title, "
+                       "URL and snippet. Fast and text-only (no browser, no "
+                       "screenshots): always prefer this for finding pages or "
+                       "answers online.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+            "max_results": {"type": "integer",
+                            "description": "results to return, default 8"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_url",
+        "description": "Fetch a URL over HTTP and return the page's text plus "
+                       "its links — no browser needed. Much cheaper than "
+                       "browser_* for reading articles, docs, posts. Pages "
+                       "that need JS or a login come back thin; use the "
+                       "browser then.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "max_chars": {"type": "integer",
+                          "description": "text cap, default 6000 (max 16000)"}},
+            "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "browser_navigate",
         "description": "Navigate the current Chrome tab to a URL (starts Chrome "
@@ -1382,13 +1762,70 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "question": {"type": "string"}}, "required": ["question"]}}},
     {"type": "function", "function": {
+        "name": "spawn_agent",
+        "description": "Spawn a background helper agent on a self-contained "
+                       "headless subtask — web research, file and data work. "
+                       "It gets web_search, fetch_url, run_command and "
+                       "send_file (no screen, no browser, no user contact) "
+                       "and reports back as a message when done. You keep "
+                       "working meanwhile; collect_agent waits for a report.",
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string",
+                     "description": "complete instructions — the helper sees "
+                                    "only this, not your conversation"},
+            "name": {"type": "string",
+                     "description": "short label, e.g. 'visa-research'"},
+            "model": {"type": "string",
+                      "description": "override model (default: yours)"}},
+            "required": ["task"]}}},
+    {"type": "function", "function": {
+        "name": "collect_agent",
+        "description": "Wait for a spawned helper to finish and return its "
+                       "report. With no name, waits for the next one done.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "share_plan",
+        "description": "Post your plan to the user as a card in chat. On big "
+                       "multi-phase tasks share the plan once before "
+                       "starting, then track the steps with update_todos. "
+                       "Small tasks need neither.",
+        "parameters": {"type": "object", "properties": {
+            "plan": {"type": "string",
+                     "description": "concise plan, markdown ok"}},
+            "required": ["plan"]}}},
+    {"type": "function", "function": {
+        "name": "update_todos",
+        "description": "Replace your working checklist — the user watches it "
+                       "as a live card. Pass the full list every call and "
+                       "keep exactly one item in_progress. It survives "
+                       "context compaction; keep it current on long tasks.",
+        "parameters": {"type": "object", "properties": {
+            "items": {"type": "array", "items": {"type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "status": {"type": "string",
+                               "enum": ["pending", "in_progress", "done"]}},
+                "required": ["content", "status"]}}},
+            "required": ["items"]}}},
+    {"type": "function", "function": {
         "name": "task_complete",
         "description": "End the task. `summary` is sent to the user as your "
                        "wrap-up message — cover what was done, where results "
-                       "live, and anything they should check.",
+                       "live, and anything they should check. send_file any "
+                       "files the user needs first.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
+
+
+# Background helpers (spawn_agent) get a headless subset — nothing that
+# touches the screen, the browser, or the user. They also can't spawn, so
+# delegation never nests deeper than one level.
+SUBAGENT_TOOL_NAMES = {"web_search", "fetch_url", "run_command",
+                       "send_file", "task_complete"}
+SUBAGENT_TOOLS = [t for t in TOOLS
+                  if t["function"]["name"] in SUBAGENT_TOOL_NAMES]
 
 
 def _resolve_path(path_str: str) -> Path | str:
@@ -1447,6 +1884,7 @@ def save_attachments(files) -> tuple[list[dict], str | None]:
             p.write_bytes(raw)
         except OSError as e:
             return [], f"could not save “{name}”: {e}"
+        state.delivered[str(p.resolve())] = p.stat().st_mtime
         saved.append({
             "name": p.name, "size": len(raw), "path": str(p),
             "mime": str(f.get("mime") or
@@ -1482,6 +1920,7 @@ async def send_file(path_str: str, note: str = "") -> str:
         "type": "file", "name": p.name, "size": size,
         "mime": mimetypes.guess_type(p.name)[0] or "application/octet-stream",
         "note": note, "data": base64.b64encode(p.read_bytes()).decode()})
+    state.sent_files[str(p)] = p.stat().st_mtime
     return f"sent {p.name} ({size} bytes) to the user"
 
 
@@ -1518,8 +1957,92 @@ async def ask_user(question: str) -> str:
         await push_status()
 
 
-async def execute_tool(name: str, args: dict) -> tuple[list | str, bool]:
-    """Return (tool_result_content, task_done)."""
+def unsent_outputs() -> list[Path]:
+    """Files changed since the run started that were never sent back — the
+    backstop for "agent saved a file but only told the user the path".
+    Uploads are scanned recursively; home, Desktop and Downloads only
+    shallowly so caches and app dirs don't count. Hidden names are skipped.
+    """
+    if not state.run_start:
+        return []
+    seen, out = set(), []
+    for root, deep in ((UPLOAD_DIR, True), (HOME_DIR, False),
+                     (HOME_DIR / "Desktop", False),
+                     (HOME_DIR / "Downloads", False)):
+        if not root.is_dir():
+            continue
+        try:
+            paths = list(root.rglob("*")) if deep else list(root.iterdir())
+        except OSError:
+            continue
+        for p in paths:
+            if any(part.startswith(".")
+                   for part in p.relative_to(root).parts):
+                continue
+            try:
+                rp = p.resolve()
+                if not rp.is_file():
+                    continue
+                mtime = rp.stat().st_mtime
+            except OSError:
+                continue
+            key = str(rp)
+            baseline = max(state.run_start, state.delivered.get(key, 0))
+            if (key in seen or mtime <= baseline
+                    or state.sent_files.get(key, 0) >= mtime):
+                continue
+            seen.add(key)
+            out.append(rp)
+    return sorted(out)
+
+
+_TODO_MARKS = {"done": "☑", "in_progress": "◐", "pending": "☐"}
+
+
+def render_todos(items: list[dict]) -> str:
+    return "\n".join(f"{_TODO_MARKS.get(i['status'], '☐')} {i['content']}"
+                     for i in items)
+
+
+async def update_todos(raw_items) -> str:
+    """Replace the running conversation's checklist — persisted next to the
+    context and pushed to clients as a live card (not a transcript event:
+    the card only ever shows latest state, and replayed updates would spam
+    history)."""
+    items = []
+    for it in (raw_items if isinstance(raw_items, list) else []):
+        if not isinstance(it, dict):
+            continue
+        content = str(it.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(it.get("status") or "pending").lower()
+        if status == "completed":
+            status = "done"
+        if status not in _TODO_MARKS:
+            status = "pending"
+        items.append({"content": content[:200], "status": status})
+    state.todos = items[:TODO_MAX_ITEMS]
+    state.steps_since_todo = 0
+    if state.conversation_id:
+        conv_save_todos(state.conversation_id, state.todos)
+    await broadcast({"type": "todos",
+                     "conversation_id": state.conversation_id,
+                     "items": state.todos})
+    return ("checklist updated:\n"
+            + (render_todos(state.todos) or "(empty — all steps done?)"))
+
+
+async def execute_tool(name: str, args: dict,
+                       agent: str | None = None) -> tuple[list | str, bool]:
+    """Return (tool_result_content, task_done). `agent` set = the caller is a
+    restricted agent — a background helper (headless SUBAGENT_TOOL_NAMES) or
+    the cleanup janitor (desktop-only JANITOR_TOOL_NAMES)."""
+    if agent is not None:
+        allowed = (JANITOR_TOOL_NAMES if agent == JANITOR_NAME
+                   else SUBAGENT_TOOL_NAMES)
+        if name not in allowed:
+            return f"{name} isn't available to the {agent} agent", False
     try:
         if name == "screenshot":
             return [{"type": "text", "text": "captured screenshot"},
@@ -1568,7 +2091,17 @@ async def execute_tool(name: str, args: dict) -> tuple[list | str, bool]:
             if warn:
                 result = _note(result, warn)
         elif name == "run_command":
-            result = run_command(str(args.get("command", "")))
+            # to_thread keeps a long command from freezing the event loop —
+            # matters now that helper agents share it with the main loop.
+            result = await asyncio.to_thread(
+                run_command, str(args.get("command", "")),
+                agent is not None)
+        elif name == "web_search":
+            result = await web_search(str(args.get("query", "")),
+                                      int(args.get("max_results") or 8))
+        elif name == "fetch_url":
+            result = await fetch_url(str(args.get("url", "")),
+                                     int(args.get("max_chars") or 6000))
         elif name == "browser_navigate":
             result = await browser_navigate(str(args.get("url", "")))
         elif name == "browser_dom":
@@ -1600,9 +2133,33 @@ async def execute_tool(name: str, args: dict) -> tuple[list | str, bool]:
         elif name == "send_image":
             result = await send_image(args.get("path"),
                                       str(args.get("caption", "")))
+        elif name == "spawn_agent":
+            result = spawn_agent(str(args.get("task", "")),
+                                 str(args.get("name", "")),
+                                 str(args.get("model", "")))
+        elif name == "collect_agent":
+            result = await collect_agent(str(args.get("name", "")))
         elif name == "ask_user":
             return await ask_user(str(args.get("question", ""))), False
+        elif name == "share_plan":
+            plan = str(args.get("plan", "")).strip()
+            if not plan:
+                return "empty plan — nothing shared", False
+            await broadcast({"type": "plan", "text": plan})
+            result = ("plan shared with the user — now execute it; keep "
+                      "progress current via update_todos")
+        elif name == "update_todos":
+            result = await update_todos(args.get("items"))
         elif name == "task_complete":
+            unsent = unsent_outputs() if agent is None else []
+            if unsent and not state.output_nudge_done:
+                state.output_nudge_done = True
+                listing = "\n".join(f"- {p}" for p in unsent[:10])
+                return (f"files changed during this task but were never "
+                        f"sent to the user:\n{listing}\nThe user can't "
+                        f"browse this filesystem — send_file any they need, "
+                        f"then call task_complete again; or call it again "
+                        f"now if none of these are deliverables"), False
             return str(args.get("summary", "done")), True
         else:
             return f"unknown tool: {name}", False
@@ -1647,10 +2204,10 @@ def prune_images(messages: list, keep: int = SCREENSHOT_HISTORY) -> None:
                               "text": "[earlier image omitted]"})
 
 
-def cache_friendly() -> bool:
+def cache_friendly(model: str | None = None) -> bool:
     """Only Anthropic-family models understand cache_control — for everyone
     else LiteLLM may forward it and the provider may reject the request."""
-    m = state.model.lower()
+    m = (model or state.model).lower()
     return "claude" in m or "anthropic" in m
 
 
@@ -1712,13 +2269,19 @@ STUCK_ASK_USER = ("I've brainstormed and tried several different approaches "
                   "and I'm still stuck. Any guidance?")
 
 
-async def llm_request(http: httpx.AsyncClient, messages: list) -> httpx.Response:
+async def llm_request(http: httpx.AsyncClient, messages: list,
+                      model: str | None = None,
+                      tools: list | None = None) -> httpx.Response:
     """One chat-completion call with retry on transient failures.
 
     A single 429/5xx mid-task used to kill the run and waste all prior spend.
     Retries with backoff; non-retryable 4xx propagates immediately.
     """
-    payload = {"model": state.model, "messages": messages, "tools": TOOLS}
+    payload = {"model": model or state.model, "messages": messages,
+               "tools": tools if tools is not None else TOOLS}
+    if not payload["tools"]:
+        del payload["tools"]  # no tools wanted (compaction) — an empty
+                              # array is rejected by some providers
     delay, last_exc = 2.0, None
     for attempt in range(LLM_MAX_RETRIES):
         try:
@@ -1746,10 +2309,658 @@ async def llm_request(http: httpx.AsyncClient, messages: list) -> httpx.Response
     raise RuntimeError("llm_request exhausted retries without a response")
 
 
+# ── Context compaction ─────────────────────────────────────────────────────
+# Long runs would otherwise grow the context array until the provider
+# rejects the request. When the last response's prompt_tokens approach the
+# model's window, one extra call summarizes the history into a handoff note
+# and the loop continues on [system, handoff + checklist, recent tail].
+
+COMPACT_PROMPT = """Summarize this conversation so far as a handoff note to yourself — the older messages are about to be dropped from context.
+
+Cover, compactly:
+1. Goal — the user's task, in one or two sentences.
+2. Progress — what's done, what worked, what's left.
+3. Key facts — file paths, URLs, names, values, decisions: anything the remaining steps still need.
+4. Screen state — what's open / running right now.
+5. Next — the immediate next action.
+
+Be terse but complete: this note plus the last few messages are all you keep."""
+
+# Summarizer input cap — the compact call itself must fit the window even
+# when history is already past it, so the middle of a huge history is cut.
+COMPACT_INPUT_MAX_CHARS = int(
+    os.environ.get("AGENT_COMPACT_INPUT_CHARS", "400000"))
+
+
+async def model_context_limit(http: httpx.AsyncClient) -> int:
+    """max_input_tokens for the active model, cached per model name; falls
+    back to AGENT_CONTEXT_LIMIT when LiteLLM reports nothing."""
+    cached = state.ctx_limit.get(state.model)
+    if cached:
+        return cached
+    try:
+        r = await http.get(
+            f"{LITELLM_URL}/model/info",
+            headers={"Authorization": f"Bearer {state.litellm_key}"})
+        data = r.json()
+        items = data.get("data", []) if isinstance(data, dict) else data
+        for m in items:
+            if m.get("model_name") == state.model:
+                info = m.get("model_info") or {}
+                lim = info.get("max_input_tokens") or info.get("max_tokens")
+                if lim:
+                    state.ctx_limit[state.model] = int(lim)
+                    return int(lim)
+    except Exception:
+        pass
+    return COMPACT_CONTEXT_LIMIT
+
+
+def _text_only(messages: list) -> list[dict]:
+    """Copy of messages with image blocks replaced by markers — the
+    summarizer call is text-only."""
+    out = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = [{"type": "text",
+                        "text": "[screenshot]"
+                        if b.get("type") == "image_url"
+                        else str(b.get("text", ""))}
+                       for b in content]
+        out.append({**msg, "content": content})
+    return out
+
+
+def _msg_size(msg: dict) -> int:
+    return len(json.dumps(msg, default=str))
+
+
+async def compact_context(http: httpx.AsyncClient, conv_id: str,
+                          messages: list) -> bool:
+    """Summarize older history into a handoff note and rebuild `messages`
+    in place as [system, handoff + checklist, recent tail].
+
+    Returns False with `messages` untouched when summarization fails — the
+    run just continues on the full history.
+    """
+    view = _text_only(messages[1:])
+    total = sum(_msg_size(m) for m in view)
+    if total > COMPACT_INPUT_MAX_CHARS and len(view) > 4:
+        tail, acc = [], 0
+        for m in reversed(view[1:]):
+            acc += _msg_size(m)
+            if acc > COMPACT_INPUT_MAX_CHARS:
+                break
+            tail.insert(0, m)
+        view = [view[0],
+                {"role": "user",
+                 "content": "[... middle of the history omitted ...]"},
+                *tail]
+    try:
+        r = await llm_request(
+            http, view + [{"role": "user", "content": COMPACT_PROMPT}],
+            tools=[])
+    except Exception as e:
+        await broadcast({"type": "error",
+                         "text": f"context compaction failed: {e}"})
+        return False
+    usd, tin, tout = track_cost(r)
+    if usd or tin or tout:
+        conv_add_usage(conv_id, usd, tin, tout)
+    await push_cost()
+    summary = r.json()["choices"][0]["message"].get("content") or ""
+    if not isinstance(summary, str):
+        summary = " ".join(str(b.get("text", "")) for b in summary
+                           if isinstance(b, dict))
+    summary = summary.strip()
+    if not summary:
+        return False
+    # Keep the freshest few messages — never messages[0] (the system
+    # prompt), drop leading tool orphans, then let sanitize_context repair
+    # a tool-call pair cut at the boundary.
+    tail = messages[max(1, len(messages) - COMPACT_KEEP):]
+    while tail and tail[0].get("role") == "tool":
+        tail = tail[1:]
+    dropped = len(messages) - 1 - len(tail)
+    handoff = ("[The earlier conversation was compacted into this handoff "
+               "summary; the messages after it are the recent tail.]\n\n"
+               + summary)
+    if state.todos:
+        handoff += "\n\nCurrent checklist:\n" + render_todos(state.todos)
+    messages[1:] = [{"role": "user", "content": handoff}, *tail]
+    sanitize_context(messages)
+    state.steps_since_compact = 0
+    await asyncio.to_thread(conv_save_context, conv_id, messages)
+    await broadcast({"type": "compact",
+                     "text": f"context compacted — {dropped} older messages "
+                             "summarized into a handoff note"})
+    return True
+
+
+# Provider error bodies for a blown context window vary — match the usual
+# phrasings so an overflow 400 triggers compaction instead of killing the
+# run (the ratio trigger normally fires first; this catches unknown-window
+# models and single huge tool results).
+_OVERFLOW_RE = re.compile(
+    r"context|too many tokens|maximum.{0,20}length|token.{0,12}limit|"
+    r"prompt is too long|reduce the length", re.I)
+
+
+def is_context_overflow(e: httpx.HTTPError) -> bool:
+    resp = getattr(e, "response", None)
+    if resp is None or resp.status_code not in (400, 413):
+        return False
+    return bool(_OVERFLOW_RE.search(resp.text or ""))
+
+
+# ── Subagents ─────────────────────────────────────────────────────────────
+# spawn_agent runs a helper loop in the background — headless tools only, so
+# parallel helpers can't fight over the screen, the browser or the user.
+# Reports reach the parent two ways: auto-injected as a user message at the
+# top of the next agent_loop step (subagent_inbox), or pulled on demand via
+# collect_agent. `delivered` dedupes the two paths; `conv` scopes injection
+# to the conversation that spawned the helper.
+
+def _subagent_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:24]
+
+
+def agents_status() -> str:
+    if not state.subagents:
+        return "no helpers yet"
+    return "helpers: " + ", ".join(
+        f"{n} ({e['status']})" for n, e in state.subagents.items())
+
+
+def subagent_report(name: str, e: dict) -> str:
+    return (f"[subagent '{name}' {e['status']} — {e.get('steps', 0)} steps, "
+            f"${e.get('usd', 0):.4f}]\n{e.get('result') or '(no report)'}")
+
+
+def spawn_agent(task: str, name: str = "", model: str = "") -> str:
+    task = task.strip()
+    if not task:
+        return "empty task — nothing spawned"
+    # GC: drop finished entries whose report already reached the parent.
+    for n in [n for n, e in state.subagents.items()
+              if e["status"] != "running" and e.get("delivered")]:
+        del state.subagents[n]
+    running = [n for n, e in state.subagents.items()
+               if e["status"] == "running"]
+    if len(running) >= SUBAGENT_MAX_CONCURRENT:
+        return (f"at the helper cap ({SUBAGENT_MAX_CONCURRENT}) — running: "
+                + ", ".join(running)
+                + ". collect_agent or keep working until one reports.")
+    name = _subagent_name(name)
+    if name and state.subagents.get(name, {}).get("status") == "running":
+        return f"'{name}' is already running — pick another name"
+    if not name:
+        n = 1
+        while f"agent-{n}" in state.subagents:
+            n += 1
+        name = f"agent-{n}"
+    model = model.strip() or SUBAGENT_MODEL or state.model
+    entry = {"name": name, "desc": task[:200], "conv": state.conversation_id,
+             "status": "running", "result": None, "model": model,
+             "usd": 0.0, "steps": 0, "delivered": False}
+    entry["task"] = asyncio.create_task(
+        subagent_loop(name, task, model, entry))
+    state.subagents[name] = entry
+    return (f"spawned '{name}' (model {model}) — it works in the background; "
+            "its report arrives as a message. collect_agent(name) blocks "
+            "for it. Share artifacts through files under ~.")
+
+
+async def collect_agent(name: str = "") -> str:
+    """Wait for a helper's report. No name = the next one to finish."""
+    name = _subagent_name(name)
+    if name:
+        e = state.subagents.get(name)
+        if e is None:
+            return f"no helper '{name}' — {agents_status()}"
+        while e["status"] == "running" and not state.stop:
+            await asyncio.sleep(0.3)
+        e["delivered"] = True
+        return subagent_report(name, e)
+    while not state.stop:
+        done = [(n, e) for n, e in state.subagents.items()
+                if e["status"] != "running" and not e.get("delivered")]
+        if done:
+            n, e = done[0]
+            e["delivered"] = True
+            return subagent_report(n, e)
+        if not any(e["status"] == "running"
+                   for e in state.subagents.values()):
+            return f"nothing to collect — {agents_status()}"
+        await asyncio.sleep(0.4)
+    return "(stopped)"
+
+
+async def subagent_loop(name: str, task_text: str, model: str,
+                        entry: dict) -> None:
+    """Headless helper loop: text tools only, own step cap and model. The
+    final report queues for injection into the parent conversation."""
+    conv_id = entry["conv"]
+    usd0 = state.session_usd
+    messages = [
+        {"role": "system", "content": SUBAGENT_PROMPT.format(
+            home=HOME_DIR, name=name)},
+        {"role": "user", "content": task_text}]
+    status, result = "done", "(ended without a report)"
+    await broadcast({"type": "subagent", "name": name, "state": "running",
+                     "model": model, "task": task_text[:300]})
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(300, connect=30)) as http:
+            for step in range(SUBAGENT_MAX_STEPS):
+                if state.stop:
+                    status, result = "stopped", "(stopped by user)"
+                    break
+                entry["steps"] = step + 1
+                if cache_friendly(model):
+                    apply_cache_control(messages)
+                try:
+                    r = await llm_request(http, messages, model=model,
+                                          tools=SUBAGENT_TOOLS)
+                except httpx.HTTPError as e:
+                    body = getattr(e.response, "text", "") \
+                        if hasattr(e, "response") else ""
+                    status, result = "error", \
+                        f"model request failed: {e} {body[:300]}"
+                    break
+                usd, tin, tout = track_cost(r)
+                if conv_id and (usd or tin or tout):
+                    conv_add_usage(conv_id, usd, tin, tout)
+                await push_cost()
+
+                msg = r.json()["choices"][0]["message"]
+                messages.append(assistant_to_dict(msg))
+                reply = msg.get("content") or ""
+                if not isinstance(reply, str):
+                    reply = " ".join(str(b.get("text", "")) for b in reply
+                                     if isinstance(b, dict))
+                reply = reply.strip()
+                if reply:
+                    await broadcast({"type": "thought", "text": reply,
+                                     "agent": name})
+                tool_calls = msg.get("tool_calls") or []
+                if not tool_calls:
+                    # A plain reply IS the report — no idle nudges here.
+                    result = reply or result
+                    break
+                finished = False
+                for tc in tool_calls:
+                    if state.stop:
+                        break
+                    fn = tc.get("function") or {}
+                    tname = fn.get("name", "")
+                    try:
+                        targs = json.loads(fn.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        targs = {}
+                    await broadcast({"type": "action", "tool": tname,
+                                     "args": targs, "agent": name})
+                    res, fin = await execute_tool(tname, targs, agent=name)
+                    messages.append({"role": "tool",
+                                     "tool_call_id": tc.get("id"),
+                                     "content": res})
+                    prev = res if isinstance(res, str) else next(
+                        (b.get("text", "") for b in res
+                         if b.get("type") == "text"), "")
+                    await broadcast({"type": "action_result", "tool": tname,
+                                     "result": prev.strip()[:500],
+                                     "agent": name})
+                    if fin:  # task_complete — the summary is the report
+                        result = res if isinstance(res, str) else prev
+                        finished = True
+                        break
+                if finished:
+                    break
+            else:
+                result = f"{result} (hit the {SUBAGENT_MAX_STEPS}-step cap)"
+    except asyncio.CancelledError:
+        status, result = "stopped", "(stopped)"
+    except Exception as e:
+        status, result = "error", f"helper error: {e}"
+    entry["usd"] = round(state.session_usd - usd0, 6)
+    entry.update(status=status, result=result)
+    # Even a stopped helper's report is queued — if the run was stopped the
+    # drained-on-resume message tells the parent the helper died with it.
+    state.subagent_inbox.append(entry)
+    await broadcast({"type": "subagent", "name": name, "state": status,
+                     "result": str(result)[:600], "usd": entry["usd"]})
+
+
+def drain_subagent_inbox(conv_id: str, messages: list) -> None:
+    """Deliver finished helper reports into the run's context as user
+    messages — scoped to the conversation that spawned them, so a helper of
+    another conversation stays queued until that conv next runs."""
+    kept = []
+    while state.subagent_inbox:
+        e = state.subagent_inbox.popleft()
+        if e.get("delivered"):
+            continue
+        if e.get("conv") != conv_id:
+            kept.append(e)
+            continue
+        e["delivered"] = True
+        messages.append({"role": "user",
+                         "content": subagent_report(e["name"], e)})
+    state.subagent_inbox.extend(kept)
+
+
+# ── Run cleanup ──────────────────────────────────────────────────────────────
+# End-of-run teardown — daemon-driven, never model-invoked. First a
+# deterministic sweep of whatever the run created: browser tabs (CDP target
+# diff), windows (wmctrl id diff) and processes (pid+starttime diff), plus a
+# wipe of ~/scratch. Then a bounded janitor LLM pass with a fresh context
+# cleans up residue the sweep can't enumerate (modal dialogs, wedged apps).
+# Cookies and logins persist — tabs are closed, the profile is never touched.
+# The baseline is persisted at run start so a daemon restart mid-run still
+# lets the next boot sweep that run's leftovers.
+
+def _snapshot_procs() -> dict[str, str]:
+    """pid -> starttime for every process. Starttime (jiffies since boot)
+    disambiguates PID reuse: same pid + different starttime = new process."""
+    out = {}
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return out  # no procfs (bare-metal dev) — nothing to diff
+    for p in entries:
+        if not p.name.isdigit():
+            continue
+        try:
+            out[p.name] = \
+                (p / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            continue
+    return out
+
+
+def _snapshot_windows() -> list[str]:
+    try:
+        p = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln.split(None, 1)[0] for ln in p.stdout.splitlines()
+            if ln.strip()]
+
+
+def _snapshot_tabs() -> list[str]:
+    try:
+        r = httpx.get(f"{CDP_HTTP}/json", timeout=5)
+        return [t["id"] for t in r.json() if t.get("type") == "page"]
+    except Exception:
+        return []
+
+
+def _boot_key() -> str:
+    """Starttime of pid 1 — changes when the container/host reboots, so a
+    persisted baseline can tell "the daemon restarted" (same boot: sweep the
+    dead run's leftovers) from "the whole desktop restarted" (every process
+    is new — the baseline is meaningless and sweeping it would kill Xvfb,
+    websockify, the panels…)."""
+    try:
+        return Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
+def capture_baseline() -> dict:
+    try:
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return {"started": time.time(), "boot": _boot_key(),
+            "pids": _snapshot_procs(),
+            "windows": _snapshot_windows(),
+            "tabs": _snapshot_tabs()}
+
+
+def _persist_baseline(b: dict | None) -> None:
+    try:
+        if b is None:
+            RUN_STATE_FILE.unlink(missing_ok=True)
+        else:
+            RUN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            RUN_STATE_FILE.write_text(json.dumps(b))
+    except OSError:
+        pass
+
+
+def sweep_desktop(baseline: dict) -> dict:
+    """Close tabs/windows and kill processes created since baseline — never
+    anything that predates the run. Returns counts."""
+    stats = {"tabs": 0, "windows": 0, "procs": 0, "scratch": 0}
+
+    # Closing a tab never logs anyone out — cookies live in the profile.
+    old_tabs = set(baseline.get("tabs") or [])
+    try:
+        cur = {t["id"] for t in
+               httpx.get(f"{CDP_HTTP}/json", timeout=5).json()
+               if t.get("type") == "page"}
+        for tid in cur - old_tabs:
+            try:
+                httpx.get(f"{CDP_HTTP}/json/close/{tid}", timeout=5)
+                stats["tabs"] += 1
+            except httpx.HTTPError:
+                pass
+    except Exception:
+        pass
+
+    # Graceful close so apps shut down clean (no soffice recovery prompt).
+    for wid in set(_snapshot_windows()) - set(baseline.get("windows") or []):
+        subprocess.run(["wmctrl", "-i", "-c", wid],
+                       check=False, capture_output=True)
+        stats["windows"] += 1
+    if stats["windows"]:
+        time.sleep(1.5)  # let apps quit before the process sweep
+
+    # Whatever's still alive that wasn't at baseline — backgrounded shells,
+    # GUI apps, timed-out commands. TERM, then KILL the stubborn.
+    old_pids = baseline.get("pids") or {}
+    me = str(os.getpid())
+
+    def new_procs() -> list[int]:
+        return [int(p) for p, s in _snapshot_procs().items()
+                if old_pids.get(p) != s and p != me]
+
+    for pid in new_procs():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stats["procs"] += 1
+        except OSError:
+            pass
+    if stats["procs"]:
+        time.sleep(1.0)
+        for pid in new_procs():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    if SCRATCH_DIR.is_dir():
+        for child in SCRATCH_DIR.iterdir():
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                stats["scratch"] += 1
+            except OSError:
+                pass
+    return stats
+
+
+# The janitor gets desktop tools only — no run_command (too broad for an
+# unsupervised pass), no browser_* (tabs were just closed), no ask_user
+# (cleanup must never block) and no send_* (the wrap-up already went out).
+JANITOR_NAME = "janitor"
+JANITOR_TOOL_NAMES = {
+    "screenshot", "wait", "list_windows", "focus_window", "left_click",
+    "right_click", "double_click", "mouse_move", "scroll", "type_text",
+    "key", "task_complete",
+}
+JANITOR_TOOLS = [t for t in TOOLS
+                 if t["function"]["name"] in JANITOR_TOOL_NAMES]
+
+JANITOR_PROMPT = """You are the cleanup pass on a Gut Linux desktop ({res}). \
+The task that was running just ended; an automatic sweep already closed the \
+apps, windows and browser tabs it tracked. Look at the screen and the window \
+list — if something the task left behind is still open (dialogs, save or \
+discard prompts, stray windows), close it. Escape or alt-F4 for dialogs.
+
+Rules:
+- Discard unsaved work when asked — deliverables were already sent to the user.
+- Never delete files, clear browser data, or log out of anything.
+- Leave the panels, wallpaper and desktop icons alone.
+- When nothing is left to close — or nothing needed closing — call \
+task_complete with a one-line summary of what you closed.
+"""
+
+
+async def janitor_pass(conv_id: str) -> str:
+    """Bounded post-sweep tidy with a fresh context — its chatter never
+    touches the conversation's model context."""
+    try:
+        res = "%dx%d" % tuple(pyautogui.size())
+    except Exception:
+        res = RESOLUTION
+    wins = await asyncio.to_thread(list_windows)
+    content = [{"type": "text", "text":
+                f"Open windows:\n{wins}\n\nClose whatever is left, then call "
+                "task_complete."}]
+    try:
+        shot = screenshot_block(force=True)
+    except Exception:
+        shot = None
+    if shot:
+        content.append(shot)
+    messages = [
+        {"role": "system", "content": JANITOR_PROMPT.format(res=res)},
+        {"role": "user", "content": content}]
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(300, connect=30)) as http:
+            for _ in range(JANITOR_MAX_STEPS):
+                if state.stop:
+                    return "(stopped)"
+                prune_images(messages)
+                if cache_friendly():
+                    apply_cache_control(messages)
+                try:
+                    r = await llm_request(http, messages,
+                                          tools=JANITOR_TOOLS)
+                except httpx.HTTPError as e:
+                    return f"model request failed: {e}"
+                usd, tin, tout = track_cost(r)
+                if conv_id and (usd or tin or tout):
+                    conv_add_usage(conv_id, usd, tin, tout)
+                await push_cost()
+
+                msg = r.json()["choices"][0]["message"]
+                messages.append(assistant_to_dict(msg))
+                tool_calls = msg.get("tool_calls") or []
+                if not tool_calls:
+                    reply = msg.get("content") or ""
+                    if not isinstance(reply, str):
+                        reply = " ".join(
+                            str(b.get("text", "")) for b in reply
+                            if isinstance(b, dict))
+                    return reply.strip()[:300] or "done"
+                acted = False
+                for tc in tool_calls:
+                    if state.stop:
+                        return "(stopped)"
+                    fn = tc.get("function") or {}
+                    tname = fn.get("name", "")
+                    try:
+                        targs = json.loads(fn.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        targs = {}
+                    await broadcast({"type": "action", "tool": tname,
+                                     "args": targs, "agent": JANITOR_NAME})
+                    res2, fin = await execute_tool(tname, targs,
+                                                   agent=JANITOR_NAME)
+                    acted = acted or tname in SCREEN_TOOLS
+                    messages.append({"role": "tool",
+                                     "tool_call_id": tc.get("id"),
+                                     "content": res2})
+                    prev = res2 if isinstance(res2, str) else next(
+                        (b.get("text", "") for b in res2
+                         if b.get("type") == "text"), "")
+                    await broadcast({"type": "action_result", "tool": tname,
+                                     "result": prev.strip()[:500],
+                                     "agent": JANITOR_NAME})
+                    if fin:
+                        return str(res2 if isinstance(res2, str)
+                                   else prev)[:300]
+                if acted:
+                    shot = screenshot_block()
+                    if shot is not None:
+                        t = messages[-1]
+                        c = t["content"]
+                        if isinstance(c, str):
+                            t["content"] = [{"type": "text", "text": c}, shot]
+                        elif not any(b.get("type") == "image_url"
+                                     for b in c):
+                            c.append(shot)
+    except Exception as e:
+        return f"janitor error: {e}"
+    return f"hit the {JANITOR_MAX_STEPS}-step cap"
+
+
+async def cleanup_after_run(conv_id: str, baseline: dict | None,
+                            janitor: bool = True) -> None:
+    """Sweep what the run created, then let the janitor handle residue, then
+    sweep once more for anything the janitor itself opened."""
+    try:
+        if not GUT_CLEANUP:
+            return
+        stats = (await asyncio.to_thread(sweep_desktop, baseline)
+                 if baseline else
+                 {"tabs": 0, "windows": 0, "procs": 0, "scratch": 0})
+        parts = [f"{stats[k]} {label}" for k, label in (
+            ("tabs", "tabs"), ("windows", "windows"),
+            ("procs", "processes"), ("scratch", "scratch items"))
+            if stats[k]]
+        report = ""
+        if janitor:
+            await broadcast({"type": "status", "state": "cleanup",
+                             "model": state.model,
+                             "conversation_id": conv_id})
+            report = await janitor_pass(conv_id)
+            if baseline:
+                await asyncio.to_thread(sweep_desktop, baseline)
+        text = "tidy-up"
+        if parts:
+            text += ": closed " + ", ".join(parts)
+        if report:
+            text += f" — janitor: {report}"
+        if parts or report:
+            await broadcast({"type": "cleanup", "text": text})
+    except Exception as e:
+        print(f"[gut] cleanup failed: {e}")
+    finally:
+        _persist_baseline(None)
+
+
 async def agent_loop(conv_id: str, task_text: str,
                      attachments: list[dict] | None = None) -> None:
     state.stop = False
     state.paused = False
+    state.run_start = time.time()
+    state.sent_files = {}
+    state.output_nudge_done = False
+    # Snapshot the desktop before the run touches it — the end-of-run sweep
+    # only removes what appears after this point, so user-opened windows and
+    # tabs survive. Persisted so a crash mid-run still cleans up at boot.
+    baseline = await asyncio.to_thread(capture_baseline)
+    if GUT_CLEANUP:
+        await asyncio.to_thread(_persist_baseline, baseline)
     await broadcast({"type": "status", "state": "running",
                      "model": state.model, "conversation_id": conv_id})
     # A revisited conversation resumes its own stored context; a fresh one
@@ -1763,7 +2974,8 @@ async def agent_loop(conv_id: str, task_text: str,
     coords = COORD_PROMPT_NORM if coords_normalized() else COORD_PROMPT_PIXEL
     messages = conv_load_context(conv_id) or [
         {"role": "system", "content": SYSTEM_PROMPT.format(
-            res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR)}]
+            res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
+            subcap=SUBAGENT_MAX_CONCURRENT)}]
     sanitize_context(messages)
     content = [{"type": "text", "text": task_text}]
     # Attached images go inline so the model sees them directly; other files
@@ -1777,6 +2989,11 @@ async def agent_loop(conv_id: str, task_text: str,
     done = False
     recent_sigs, unchanged_streak, stuck_rescues = deque(maxlen=10), 0, 0
     idle_replies = 0
+    state.todos = conv_load_todos(conv_id)
+    state.steps_since_todo = 0
+    state.steps_since_compact = 99
+    last_tin = 0        # prompt_tokens of the last request — compaction signal
+    overflow_retries = 0
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as http:
             for _ in range(MAX_STEPS):
@@ -1785,6 +3002,32 @@ async def agent_loop(conv_id: str, task_text: str,
                 if state.stop or done:
                     break
 
+                drain_subagent_inbox(conv_id, messages)
+
+                # Long-horizon: compact history once the last request's
+                # billed input approaches the model's context window. The
+                # >=3-step gap bounds compaction-call spend if the context
+                # stays over the ratio (e.g. one huge tool result).
+                state.steps_since_compact += 1
+                if last_tin and state.steps_since_compact >= 3:
+                    limit = await model_context_limit(http)
+                    if last_tin > limit * COMPACT_RATIO:
+                        await compact_context(http, conv_id, messages)
+
+                # Stale-checklist nudge on long tasks: applied onto the last
+                # tool result so it lands in the same request.
+                if state.todos:
+                    state.steps_since_todo += 1
+                    if (state.steps_since_todo >= TODO_REMIND_STEPS
+                            and messages
+                            and messages[-1].get("role") == "tool"):
+                        state.steps_since_todo = 0
+                        messages[-1]["content"] = _note(
+                            messages[-1]["content"],
+                            f"your checklist hasn't changed in "
+                            f"{TODO_REMIND_STEPS} steps — mark progress via "
+                            "update_todos")
+
                 prune_images(messages)
                 if cache_friendly():
                     apply_cache_control(messages)
@@ -1792,11 +3035,21 @@ async def agent_loop(conv_id: str, task_text: str,
                     r = await llm_request(http, messages)
                 except httpx.HTTPError as e:
                     body = getattr(e.response, "text", "") if hasattr(e, "response") else ""
+                    # Context-window overflow: compact and retry rather than
+                    # killing the run. The ratio check above normally fires
+                    # first; this catches unknown-window models and single
+                    # tool results big enough to overshoot between checks.
+                    if (overflow_retries < 2 and is_context_overflow(e)
+                            and await compact_context(http, conv_id,
+                                                      messages)):
+                        overflow_retries += 1
+                        continue
                     await broadcast({"type": "error",
                                      "text": f"LiteLLM request failed: {e} {body[:300]}"})
                     break
 
                 usd, tin, tout = track_cost(r)
+                last_tin = tin
                 if usd or tin or tout:
                     conv_add_usage(conv_id, usd, tin, tout)
                 await push_cost()
@@ -1946,6 +3199,9 @@ async def agent_loop(conv_id: str, task_text: str,
                                  "text": f"hit step cap ({MAX_STEPS}); stopping"})
     finally:
         await asyncio.to_thread(conv_save_context, conv_id, messages)
+        # The sweep runs on every exit path; the janitor only on natural
+        # endings — an explicit stop hands the desktop back as-is.
+        await cleanup_after_run(conv_id, baseline, janitor=not state.stop)
         await broadcast({"type": "status", "state": "idle",
                          "model": state.model, "conversation_id": None})
         await push_cost()
@@ -2026,6 +3282,12 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
             state.paused = False
             if state.pending_answer is not None and not state.pending_answer.done():
                 state.pending_answer.set_result("(task stopped by user)")
+            # Helpers honor state.stop at their next step; cancel hurries
+            # ones blocked in an LLM request or a long run_command.
+            for e in state.subagents.values():
+                t = e.get("task")
+                if t and e.get("status") == "running":
+                    t.cancel()
         await push_status()
     elif mtype == "set_model":
         model = str(msg.get("model") or state.model)
@@ -2162,6 +3424,23 @@ async def lifespan(_app: FastAPI):
         CONV_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         print(f"[gut] conversation dir {CONV_DIR} unavailable: {e}")
+    # A leftover run-state file means the previous run died before its
+    # end-of-run cleanup — sweep what it left before taking new work.
+    try:
+        stale = json.loads(RUN_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        stale = None
+    if stale:
+        if stale.get("boot") and stale["boot"] != _boot_key():
+            # Whole environment restarted since — nothing to sweep.
+            print("[gut] stale run-state from before a restart — discarded")
+        elif GUT_CLEANUP:
+            try:
+                stats = await asyncio.to_thread(sweep_desktop, stale)
+                print(f"[gut] swept leftovers of interrupted run: {stats}")
+            except Exception as e:
+                print(f"[gut] startup sweep failed: {e}")
+        _persist_baseline(None)
     tls_srv = await _start_tls_proxy()
     # Port multiplexers (see tcpmux): uvicorn and plain websockify sit on
     # loopback internals; the public ports carry plain AND TLS so encrypted
