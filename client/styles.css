@@ -1180,6 +1180,7 @@ body.settings-open #desktopPane { display: none; }
 .dev-del { flex: none; width: 32px; padding: 0; color: var(--text-3); }
 .dev-del:hover { color: var(--bad); }
 .dev-ver { color: var(--text-3); }
+.dev-ver.bad { color: var(--bad); }
 .dev-update {
   flex: none;
   padding: 0 10px;

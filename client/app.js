@@ -442,6 +442,9 @@ function chatDev() {
 function disconnectDesktop() {
   screenDevId = null;
   if (rfb) { try { rfb.disconnect(); } catch (_) {} rfb = null; }
+  // Sweep orphaned noVNC divs — a replaced RFB whose disconnect event fired
+  // late can leave a still-streaming canvas behind.
+  screenEl.querySelectorAll(':scope > div').forEach(el => el.remove());
   backdropCtx.clearRect(0, 0, backdrop.width, backdrop.height);
 }
 
@@ -451,18 +454,23 @@ function connectDesktop(d) {
   screenEl.hidden = false;
   screenLogoEl.hidden = true;
   screenStatusEl.textContent = 'connecting…';
-  rfb = new RFB(screenEl, novncUrl(d), {
+  const conn = new RFB(screenEl, novncUrl(d), {
     credentials: { password: d.vncPassword },
   });
+  rfb = conn;
   // Fit the desktop to the pane both ways — the whole desktop is always
   // visible; the ambient backdrop fills whatever gutter remains.
-  rfb.scaleViewport = true;
-  rfb.clipViewport = true;
-  rfb.background = 'transparent';  // let the ambient backdrop show through
-  rfb.addEventListener('connect', () => {
+  conn.scaleViewport = true;
+  conn.clipViewport = true;
+  conn.background = 'transparent';  // let the ambient backdrop show through
+  conn.addEventListener('connect', () => {
+    if (rfb !== conn) return;  // superseded before it connected
     screenStatusEl.textContent = '';
   });
-  rfb.addEventListener('disconnect', (e) => {
+  conn.addEventListener('disconnect', (e) => {
+    // A stale RFB's disconnect event can arrive after a newer stream was
+    // already assigned to rfb — only the pane's owner may react.
+    if (rfb !== conn) return;
     rfb = null;
     if (!screenDevId) return;  // we closed it — the logo is up
     screenStatusEl.textContent = e.detail.clean
@@ -470,8 +478,8 @@ function connectDesktop(d) {
       : 'connection lost — retrying…';
     setTimeout(syncScreen, 3000);
   });
-  rfb.addEventListener('credentialsrequired', () => {
-    rfb.sendCredentials({ password: d.vncPassword });
+  conn.addEventListener('credentialsrequired', () => {
+    conn.sendCredentials({ password: d.vncPassword });
   });
 }
 
@@ -1118,8 +1126,10 @@ function updateKeysHeader() {
         'below) or set keys in its env on the server itself.';
       break;
     case 'offline':
-      hint = `${name} isn\u2019t answering on :8000 — the app can\u2019t ` +
-        'see or change its keys until it\u2019s back.';
+      hint = `${name} isn\u2019t answering` +
+        (devInfo[d.id]?.offlineReason
+          ? ` — ${devInfo[d.id].offlineReason}` : ` on :${AGENT_PORT}`) +
+        '. The app can\u2019t see or change its keys until it\u2019s back.';
       break;
     default:
       hint = `Checking which keys ${name} has…`;
@@ -1151,7 +1161,7 @@ async function refreshKeys() {
   keyMode = 'checking';
   renderProviderKeys();
   try {
-    const r = await devFetch(d, '/api/keys');
+    const r = await devFetch(d, '/api/keys', { signal: probeSignal() });
     if (d.id !== keyDev().id) return;  // target switched mid-fetch
     if (r.ok) {
       remoteKeys = await r.json();
@@ -1536,17 +1546,22 @@ function devFetch(d, path, opts = {}) {
                { ...opts, headers });
 }
 
+// Dead hosts hang fetch() until the OS TCP timeout (~75s) — cap probes.
+const probeSignal = () =>
+  AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined;
+
 async function probeDevice(d) {
   // Mutate in place — a row may carry UI state (updating, updateError) that
   // a probe must not wipe.
   const cur = devInfo[d.id] || (devInfo[d.id] = {});
   cur.pending = true;
   try {
-    const r = await devFetch(d, '/api/version');
+    const r = await devFetch(d, '/api/version', { signal: probeSignal() });
     if (r.ok) {
       const j = await r.json();
       Object.assign(cur, { version: j.version, install: j.install,
                            device: j.device, offline: false });
+      delete cur.offlineReason;
       delete cur.legacy;
       // How many provider keys the device can serve — the row's key badge.
       try {
@@ -1563,12 +1578,33 @@ async function probeDevice(d) {
       // Any HTTP answer means the backend is alive — daemons older than
       // this route just report "online", no version.
       Object.assign(cur, { offline: false, legacy: true });
+      delete cur.offlineReason;
       delete cur.version;
     }
-  } catch (_) {
+  } catch (e) {
     cur.offline = true;
+    cur.offlineReason = await offlineReason(d, e);
   }
   cur.pending = false;
+}
+
+// fetch() collapses refused/DNS/reset into one opaque TypeError — poke the
+// noVNC port too so the row can say whether the host or the agent is down.
+async function offlineReason(d, err) {
+  if (err?.name === 'SyntaxError') {
+    return `answered on :${AGENT_PORT} but isn't a gut agent`;
+  }
+  if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+    return `no answer on :${AGENT_PORT} (timed out)`;
+  }
+  try {
+    await fetch(`${httpScheme}://${d.host}:${NOVNC_PORT}/`,
+                { signal: probeSignal() });
+    return `host is up but the agent isn't answering on :${AGENT_PORT}`;
+  } catch (_) {
+    return `${d.host} isn't responding — powered off, wrong network, ` +
+           'or firewalled?';
+  }
 }
 
 async function checkLatestRelease() {
@@ -1688,6 +1724,20 @@ function openSettings() {
 function closeSettings() {
   settingsPage.hidden = true;
   document.body.classList.remove('settings-open');
+  clearInterval(devProbeTimer);
+  devProbeTimer = null;
+}
+
+// Devices re-probe on a timer while the page is open — an "offline" label
+// is a live status, not a snapshot from whenever the page was last opened.
+let devProbeTimer = null;
+
+function startDeviceProbe() {
+  clearInterval(devProbeTimer);
+  devProbeTimer = setInterval(() => {
+    Promise.all(cfg.devices.map(probeDevice))
+      .then(() => { if (settingsOpen()) renderDeviceList(); });
+  }, 5000);
 }
 
 // editingDevId === null means the form is in "new device" mode.
@@ -1738,9 +1788,13 @@ function renderDeviceList() {
     }
     const ver = document.createElement('span');
     ver.className = 'dev-ver';
-    ver.textContent = info?.offline ? '· offline'
+    ver.textContent = info?.offline
+      ? `· offline${info.offlineReason ? ` — ${info.offlineReason}` : ''}`
       : info?.version ? `· v${info.version}`
-      : info?.legacy ? '· online' : '';
+      : info?.legacy ? '· online'
+      : info?.pending ? '· checking…' : '';
+    ver.title = info?.offline ? (info.offlineReason || '') : '';
+    ver.classList.toggle('bad', !!info?.offline);
     // Provider-key count: the API when the daemon answers, the local
     // stack's .env for the Electron local device.
     let keyCount = info?.keys;
@@ -1842,6 +1896,7 @@ $('settingsBtn').onclick = () => {
   fillDeviceForm(activeDev());  // refreshes the keys cards for it too
   refreshLocal();
   refreshDeviceInfo();
+  startDeviceProbe();
   openSettings();
 };
 
