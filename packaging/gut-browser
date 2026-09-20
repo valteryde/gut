@@ -26,6 +26,17 @@ CHROME_FLAGS="--no-sandbox --disable-setuid-sandbox \
 --user-data-dir=${HOME:-/var/lib/gut}/.gut-chrome \
 --force-device-scale-factor=${UI_SCALE:-1.25}"
 
+# Chrome/Chromium 151+ shows a modal 'Additional Terms of Service' on first
+# run (eula_required defaults on for Linux) and skips it when an 'EULA
+# Accepted' sentinel exists in the user-data dir. Write it for the gut
+# profile and the default profile dirs so launches that bypass these flags
+# still come up clean.
+for d in "${HOME:-/var/lib/gut}/.gut-chrome" \
+         "${HOME:-/var/lib/gut}/.config/google-chrome" \
+         "${HOME:-/var/lib/gut}/.config/chromium"; do
+  mkdir -p "$d" 2>/dev/null && touch "$d/EULA Accepted" 2>/dev/null
+done
+
 is_snap() {
   case "$(readlink -f "$1" 2>/dev/null)" in
     /snap/*|/var/lib/snapd/*) return 0 ;;

@@ -37,9 +37,19 @@ RUN mkdir -p /tmp/.X11-unix /tmp/.ICE-unix && \
     chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix
 
 # Unprivileged user that owns the desktop session.
+# The 'EULA Accepted' sentinels suppress Chrome's Linux terms-of-service
+# modal — Chrome 151+ shows it on first run (eula_required now defaults on)
+# and skips it when the sentinel exists in the user-data dir. Written for
+# the gut profile and the default profile dirs so launches that bypass the
+# wrapper flags still come up clean.
 RUN useradd -m -s /bin/bash -u 1000 agent && \
     mkdir -p /home/agent/Desktop /home/agent/Documents \
-             /home/agent/.gut-chrome && \
+             /home/agent/.gut-chrome \
+             /home/agent/.config/google-chrome \
+             /home/agent/.config/chromium && \
+    touch "/home/agent/.gut-chrome/EULA Accepted" \
+          "/home/agent/.config/google-chrome/EULA Accepted" \
+          "/home/agent/.config/chromium/EULA Accepted" && \
     echo 'agent ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
     chown -R agent:agent /home/agent
 

@@ -1109,6 +1109,24 @@ def block_external_schemes() -> None:
         pass
 
 
+def accept_chrome_eula() -> None:
+    """Write the 'EULA Accepted' sentinel into every Chrome user-data dir.
+
+    Chrome/Chromium 151+ shows a modal 'Additional Terms of Service' on
+    first run (eula_required defaults on for Linux) and skips it when the
+    sentinel exists — covering launches that miss --no-first-run, e.g. a
+    bare chromium via /etc/chromium.d or the real binary re-exec'd without
+    the wrapper's --user-data-dir.
+    """
+    for d in (".gut-chrome", ".config/google-chrome", ".config/chromium"):
+        try:
+            p = Path.home() / d
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "EULA Accepted").touch(exist_ok=True)
+        except OSError:
+            pass
+
+
 _last_browser_heal = 0.0
 
 
@@ -1141,6 +1159,7 @@ async def ensure_browser(url: str | None = None) -> str:
         subprocess.run(["pkill", "-f", "chrome|chromium"], check=False)
         await asyncio.sleep(1.5)
     block_external_schemes()  # Chrome must be stopped while we edit prefs
+    accept_chrome_eula()
     target = f" {shlex.quote(url)}" if url else ""
     subprocess.Popen(["bash", "-lc",
                       f"nohup google-chrome{target} >/dev/null 2>&1 &"])
