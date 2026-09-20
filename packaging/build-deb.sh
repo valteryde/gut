@@ -26,23 +26,49 @@ mkdir -p "$STAGE/DEBIAN" "$STAGE/opt/gut" "$STAGE/etc/gut" \
          "$STAGE/usr/bin" "$STAGE/usr/local/bin" \
          "$STAGE/usr/lib/systemd/system" "$OUTDIR"
 
-# ── Python venv, built at its final install path ──────────────────────────
-# Console scripts (litellm, uvicorn) embed the interpreter path, so the venv
-# must be created at /opt/gut/venv and then copied into the staging tree.
-VENV=/opt/gut/venv
+# ── wheel bundle — postinst builds the venv on the target ────────────────
+# A venv built here only works when the target's python3 matches this
+# container's exactly (bin/python symlinks /usr/bin/python3 and deps ship
+# per-version wheels), so the deb carries wheels and postinst creates
+# /opt/gut/venv against the target interpreter.
 apt-get update -qq
-apt-get install -y -qq python3-venv python3-pip >/dev/null
-rm -rf "$VENV"
-python3 -m venv "$VENV"
-"$VENV/bin/pip" install --quiet --no-cache-dir \
-    -r "$ROOT/backend/requirements.txt" 'litellm[proxy]'
-cp -a "$VENV" "$STAGE/opt/gut/venv"
-find "$STAGE/opt/gut/venv" -name __pycache__ -type d -prune -exec rm -rf {} +
+apt-get install -y -qq python3-pip >/dev/null
+PYVERS="${WHEEL_PYVERS:-3.12 3.13 3.14}"
+case "$ARCH" in
+  amd64) MARCH=x86_64 ;;
+  arm64) MARCH=aarch64 ;;
+esac
+WHEELS="$STAGE/opt/gut/wheels"
+mkdir -p "$WHEELS"
+# pyautogui's whole dependency family ships sdist-only on PyPI — all pure
+# python, so wheel the full closure here and exclude pyautogui from the
+# binary-only download.
+DLREQS="$(mktemp)"
+trap 'rm -rf "$(dirname "$STAGE")" "$DLREQS"' EXIT
+grep -v '^pyautogui' "$ROOT/backend/requirements.txt" > "$DLREQS"
+PYAUTO_VER="$(grep '^pyautogui' "$ROOT/backend/requirements.txt" | cut -d= -f3)"
+python3 -m pip wheel --quiet -w "$WHEELS" "pyautogui==${PYAUTO_VER}"
+for pv in $PYVERS; do
+    python3 -m pip download --quiet --dest "$WHEELS" \
+        --only-binary=:all: \
+        --platform "manylinux_2_17_$MARCH" --platform "manylinux_2_28_$MARCH" \
+        --platform "manylinux_2_34_$MARCH" --platform "manylinux_2_39_$MARCH" \
+        --python-version "$pv" --implementation cp \
+        --abi "cp${pv//./}" --abi abi3 --abi none \
+        -r "$DLREQS" \
+        -r "$ROOT/packaging/litellm-requirements.txt"
+done
+rm -f "$DLREQS"
 
 # ── payload ───────────────────────────────────────────────────────────────
 install -m755 "$ROOT/backend/start.sh" "$STAGE/opt/gut/start.sh"
 install -m644 "$ROOT/backend/agent_daemon.py" "$STAGE/opt/gut/agent_daemon.py"
+install -m644 "$ROOT/backend/requirements.txt" "$STAGE/opt/gut/requirements.txt"
+install -m644 "$ROOT/packaging/litellm-requirements.txt" \
+            "$STAGE/opt/gut/litellm-requirements.txt"
 install -m644 "$ROOT/backend/wallpaper.png" "$STAGE/opt/gut/wallpaper.png"
+install -m644 "$ROOT/backend/device_wallpaper.py" \
+            "$STAGE/opt/gut/device_wallpaper.py"
 echo "$VERSION" > "$STAGE/opt/gut/VERSION"
 
 install -m644 "$ROOT/litellm_config.yaml" "$STAGE/etc/gut/litellm.yaml"

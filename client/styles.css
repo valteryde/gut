@@ -809,6 +809,23 @@ body.takeover #desktopPane { border-color: var(--clay); }
   filter: blur(48px) saturate(1.35) brightness(0.75);
 }
 
+/* no open conversation — the pane shows the brand instead of a stream */
+#screenLogo {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: .9;
+  pointer-events: none;
+}
+#screenLogo .brand { gap: 28px; font-size: 64px; letter-spacing: -0.02em; }
+#screenLogo .mark { width: 74px; height: 44px; }
+#screenLogo .mark::before,
+#screenLogo .mark::after { width: 44px; height: 44px; }
+#screenLogo .mark::after { box-shadow: 0 0 0 6px var(--surface-3); }
+
 .screen-status {
   position: absolute;
   bottom: 12px;
@@ -928,6 +945,14 @@ body.settings-open #desktopPane { display: none; }
   color: var(--text-3);
   font-size: 12.5px;
   margin: 10px 0 0;
+}
+.keys-target {
+  font-weight: 400;
+  text-transform: none;
+  color: var(--text-3);
+}
+.key-status {
+  color: var(--text-2);
 }
 
 /* ── provider keys ─────────────────────────────────────────── */

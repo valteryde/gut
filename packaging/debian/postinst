@@ -33,10 +33,12 @@ DATABASE_URL=postgresql://litellm:${PGPASS}@127.0.0.1:5432/litellm
 RESOLUTION=1024x768
 UI_SCALE=1.0
 DEVICE_NAME=${HOST}
+# WALLPAPER_HUE=    # 0-360: pin the desktop wallpaper color (default: derived from DEVICE_NAME)
 # DEFAULT_MODEL=openrouter/claude-sonnet-4.5
 
-# Provider keys (BYOK) — fill whichever you use, then:
-#   systemctl restart gut-litellm
+# Provider keys (BYOK) — optional. They can also be pushed from the app's
+# Settings → Provider keys (stored under /var/lib/gut/.gut and applied
+# without a restart). Keys set here need: systemctl restart gut-bot
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 GEMINI_API_KEY=
@@ -47,6 +49,26 @@ EOF
       chmod 640 /etc/gut/gut-bot.env
     fi
     . /etc/gut/gut-bot.env
+
+    # Python venv — built on the target so it always matches the local
+    # interpreter. Rebuilt whenever missing or created for a different
+    # python release (e.g. after a distro upgrade). Wheels are bundled in
+    # the deb, so no PyPI access is needed.
+    PYVER="$(python3 -c 'import sys;print("{}.{}".format(*sys.version_info[:2]))')"
+    # Older debs shipped /opt/gut/venv — on upgrade dpkg removes those files
+    # by path, which can leave a site-packages dir with no interpreter.
+    if [ ! -d "/opt/gut/venv/lib/python${PYVER}" ] \
+       || [ ! -x /opt/gut/venv/bin/pip ]; then
+      rm -rf /opt/gut/venv
+      python3 -m venv /opt/gut/venv
+    fi
+    if ! /opt/gut/venv/bin/pip install --quiet --upgrade --no-index \
+           --find-links /opt/gut/wheels \
+           -r /opt/gut/requirements.txt -r /opt/gut/litellm-requirements.txt; then
+      echo "gut-bot: bundled wheels do not cover python ${PYVER} — run" \
+           "'/opt/gut/venv/bin/pip install -r /opt/gut/requirements.txt" \
+           "-r /opt/gut/litellm-requirements.txt' with network access" >&2
+    fi
 
     # Postgres role/db for LiteLLM spend tracking (idempotent). Skipped with
     # a warning when postgres can't be reached (e.g. installing in a chroot).
@@ -65,9 +87,78 @@ EOF
       su -s /bin/sh postgres -c \
         "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='litellm'\" | grep -q 1" \
         || su -s /bin/sh postgres -c "createdb -O litellm litellm"
+
+      # Prisma: fetch engines + generate the client + push the schema.
+      # litellm writes generated code into its package dirs at runtime
+      # (prisma client, baseline migrations) — gut must own them.
+      # `py fetch`/`db push` download engines from prisma's CDN.
+      SP="$(ls -d /opt/gut/venv/lib/python*/site-packages 2>/dev/null | head -1)"
+      if [ -n "$SP" ] && [ -x /opt/gut/venv/bin/prisma ]; then
+        chown -R gut:gut "$SP/prisma" "$SP/litellm_proxy_extras" \
+          2>/dev/null || true
+        # The generated prisma/types.py defines ~37k TypedDicts, which
+        # take ~8 min to construct under python3.14 (typing_extensions
+        # regression). All runtime uses are lazy annotations that only
+        # need dict-constructible names, so TypedDict is shimmed to a
+        # dict subclass. Patching the generator template too, so the
+        # shim survives `prisma generate` re-runs; the shallow
+        # recursive_type_depth keeps the generated file small.
+        /opt/gut/venv/bin/python - "$SP" <<'PYEOF' || \
+          echo "gut-bot: prisma types shim failed" >&2
+import sys
+sp = sys.argv[1]
+shim = '''from typing_extensions import Literal
+
+# gut: typeddict shim — see packaging/debian/postinst
+class TypedDict(dict):
+    def __init_subclass__(cls, **kwargs): pass
+    def __new__(cls, *args, **kwargs):
+        if cls is TypedDict and args and isinstance(args[0], str):
+            return type(args[0], (TypedDict,), {"__module__": __name__})
+        return dict.__new__(cls)
+'''
+old = "from typing_extensions import TypedDict, Literal"
+for path in (sp + "/prisma/generator/templates/_header.py.jinja",
+             sp + "/prisma/types.py"):
+    try:
+        src = open(path).read()
+    except OSError:
+        continue
+    if "gut: typeddict shim" not in src and old in src:
+        open(path, "w").write(src.replace(old, shim))
+schema = sp + "/litellm/proxy/schema.prisma"
+try:
+    s = open(schema).read()
+except OSError:
+    s = ""
+if s and "recursive_type_depth" not in s:
+    open(schema, "w").write(s.replace(
+        'provider = "prisma-client-py"',
+        'provider = "prisma-client-py"\n  recursive_type_depth = 2', 1))
+PYEOF
+        su -s /bin/sh gut -c \
+          "env HOME=/var/lib/gut PATH=/opt/gut/venv/bin:/usr/bin:/bin \
+           /opt/gut/venv/bin/prisma py fetch" || true
+        su -s /bin/sh gut -c \
+          "env HOME=/var/lib/gut PATH=/opt/gut/venv/bin:/usr/bin:/bin \
+           DATABASE_URL='${DATABASE_URL}' \
+           /opt/gut/venv/bin/prisma db push --schema='${SP}/litellm/proxy/schema.prisma'" \
+          || echo "gut-bot: prisma db push failed — run it manually once" \
+                  "postgres is reachable" >&2
+        # prisma-client-py looks for a query engine named after the local
+        # openssl (e.g. debian-openssl-3.5.x) but prisma only ships 3.0.x
+        # builds — pin the fetched engine so lookup never misfires.
+        ENG="$(find /var/lib/gut/.cache/prisma-python/binaries \
+               -name 'query-engine-*' -type f 2>/dev/null | head -1)"
+        if [ -n "$ENG" ]; then
+          mkdir -p /etc/systemd/system/gut-litellm.service.d
+          printf '[Service]\nEnvironment=PRISMA_QUERY_ENGINE_BINARY=%s\n' "$ENG" \
+            > /etc/systemd/system/gut-litellm.service.d/engine.conf
+        fi
+      fi
     else
-      echo "gut-bot: postgres not reachable — db setup skipped; rerun" \
-           "'dpkg-reconfigure gut-bot' once it is up" >&2
+      echo "gut-bot: postgres not reachable — db and prisma setup skipped;" \
+           "rerun 'dpkg-reconfigure gut-bot' once it is up" >&2
     fi
 
     if [ -d /run/systemd/system ]; then
@@ -84,8 +175,10 @@ EOF
     desktop   : http://${IP:-<host>}:6080
     password  : ${VNC_PASSWORD}
 
-  Add at least one model provider key in /etc/gut/gut-bot.env, then
-  'systemctl restart gut-litellm'. Re-print this panel with: gut-bot info
+  Add this machine in the app, then paste model provider keys in
+  Settings → Provider keys — they upload to and are stored on this
+  host. (Or set them in /etc/gut/gut-bot.env + systemctl restart gut-bot.)
+  Re-print this panel with: gut-bot info
 
 EOF
   ;;

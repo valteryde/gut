@@ -11,16 +11,29 @@ const cfg = {
   verbose: localStorage.getItem('gut.verbose') === '1',
 };
 
+// The installer prints full URLs (http://host:8000) and users paste them —
+// keep only the hostname. Ports are fixed by AGENT_PORT/NOVNC_PORT below.
+function normalizeHost(h) {
+  return String(h || '').trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+    .split('/')[0]
+    .replace(/:\d+$/, '');
+}
+
 function loadDevices() {
   try {
     const devs = JSON.parse(localStorage.getItem('gut.devices') || 'null');
-    if (Array.isArray(devs) && devs.length) return devs;
+    if (Array.isArray(devs) && devs.length) {
+      for (const d of devs) d.host = normalizeHost(d.host);
+      return devs;
+    }
   } catch (_) { /* fall through to migration */ }
   // Migrate the legacy single-host settings into a first device.
   return [{
     id: 'local',
     name: 'Local',
-    host: localStorage.getItem('gut.host') || location.hostname || '127.0.0.1',
+    host: normalizeHost(localStorage.getItem('gut.host'))
+      || location.hostname || '127.0.0.1',
     vncPassword: localStorage.getItem('gut.vncPassword') || '',
   }];
 }
@@ -49,7 +62,7 @@ const wsUrl = () => {
   return `${wsScheme}://${activeDev().host}:${AGENT_PORT}/ws/chat` +
     (t ? `?token=${encodeURIComponent(t)}` : '');
 };
-const novncUrl = () => `${wsScheme}://${activeDev().host}:${NOVNC_PORT}/websockify`;
+const novncUrl = (d) => `${wsScheme}://${d.host}:${NOVNC_PORT}/websockify`;
 
 function apiFetch(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
@@ -123,6 +136,7 @@ const takeoverBanner = $('takeoverBanner');
 const convTitleEl = $('convTitle');
 const chatInput = $('chatInput');
 const screenStatusEl = $('screenStatus');
+const screenLogoEl = $('screenLogo');
 const deviceSelect = $('deviceSelect');
 const modelSelect = $('modelSelect');
 const modelInfoEl = $('modelInfo');
@@ -152,6 +166,7 @@ let lastEntryKey = null;
 // ── conversation state ──────────────────────────────────────────────────
 let conversations = [];          // metas for the active device
 let activeConvId = null;         // conversation being viewed
+let activeConvDevId = null;      // device that conversation lives on
 let convModel = null;            // model bound to the viewed conversation
 let runningConvId = null;        // conversation the device is working on
 let lastSeq = 0;                 // highest seq rendered in the transcript
@@ -413,11 +428,31 @@ function setCost(c) {
 }
 
 // ── desktop stream (noVNC RFB) ──────────────────────────────────────────
-function connectDesktop() {
-  if (rfb) { try { rfb.disconnect(); } catch (_) {} }
+// The screen mirrors the device the open conversation runs on — not the
+// composer picker. With no open conversation there is nothing to watch:
+// the stream stays down and the pane shows the gut mark instead.
+let screenDevId = null;   // device the stream is bound to
+
+// The device the open chat lives on — what the screen should show.
+function chatDev() {
+  if (!activeConvId) return null;
+  return cfg.devices.find(d => d.id === activeConvDevId) || activeDev();
+}
+
+function disconnectDesktop() {
+  screenDevId = null;
+  if (rfb) { try { rfb.disconnect(); } catch (_) {} rfb = null; }
+  backdropCtx.clearRect(0, 0, backdrop.width, backdrop.height);
+}
+
+function connectDesktop(d) {
+  disconnectDesktop();
+  screenDevId = d.id;
+  screenEl.hidden = false;
+  screenLogoEl.hidden = true;
   screenStatusEl.textContent = 'connecting…';
-  rfb = new RFB($('screen'), novncUrl(), {
-    credentials: { password: activeDev().vncPassword },
+  rfb = new RFB(screenEl, novncUrl(d), {
+    credentials: { password: d.vncPassword },
   });
   // Fit the desktop to the pane both ways — the whole desktop is always
   // visible; the ambient backdrop fills whatever gutter remains.
@@ -428,14 +463,30 @@ function connectDesktop() {
     screenStatusEl.textContent = '';
   });
   rfb.addEventListener('disconnect', (e) => {
+    rfb = null;
+    if (!screenDevId) return;  // we closed it — the logo is up
     screenStatusEl.textContent = e.detail.clean
       ? 'disconnected'
       : 'connection lost — retrying…';
-    setTimeout(connectDesktop, 3000);
+    setTimeout(syncScreen, 3000);
   });
   rfb.addEventListener('credentialsrequired', () => {
-    rfb.sendCredentials({ password: activeDev().vncPassword });
+    rfb.sendCredentials({ password: d.vncPassword });
   });
+}
+
+// Point the stream at the open chat's device — or drop to the logo when
+// no conversation is open.
+function syncScreen() {
+  const d = chatDev();
+  if (!d) {
+    disconnectDesktop();
+    screenEl.hidden = true;
+    screenLogoEl.hidden = false;
+    screenStatusEl.textContent = '';
+    return;
+  }
+  if (screenDevId !== d.id || !rfb) connectDesktop(d);
 }
 
 // ── ambient backdrop ────────────────────────────────────────────────────
@@ -556,9 +607,11 @@ function clearTranscript(title) {
 
 async function openConversation(id) {
   activeConvId = id;
+  activeConvDevId = activeDev().id;
   localStorage.setItem(convKey(activeDev().id), id);
   convFetchId = id;
   pendingLive = [];
+  syncScreen();
   try {
     const r = await apiFetch(`/api/conversations/${id}`);
     if (!r.ok) throw new Error(String(r.status));
@@ -606,7 +659,9 @@ async function createConversation() {
     if (!r.ok) return null;
     const meta = await r.json();
     activeConvId = meta.id;
+    activeConvDevId = activeDev().id;
     localStorage.setItem(convKey(activeDev().id), meta.id);
+    syncScreen();
     clearTranscript(meta.title);
     convModel = meta.model || null;
     loadConversations();
@@ -626,8 +681,10 @@ async function deleteConversation(id) {
     }
     if (id === activeConvId) {
       activeConvId = null;
+      activeConvDevId = null;
       localStorage.removeItem(convKey(activeDev().id));
       clearTranscript();
+      syncScreen();
     }
     loadConversations();
   } catch (_) { /* device unreachable */ }
@@ -782,14 +839,28 @@ async function loadModels() {
         .filter(Boolean).join(' · ');
       modelSelect.appendChild(o);
     }
+    // A device with no provider keys serves no models — point at Settings.
+    if (!models.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = 'no models — add keys in Settings';
+      o.disabled = true;
+      modelSelect.appendChild(o);
+      modelSelect.value = '';
+    }
     // The select mirrors the viewed conversation's model; without an open
     // conversation it carries the preferred default for new ones.
     if (convModel) syncModel(convModel);
     else if (cfg.model && models.some(m => m.id === cfg.model))
       modelSelect.value = cfg.model;
-    if (!activeConvId) send({ type: 'set_model', model: modelSelect.value });
+    if (!activeConvId && modelSelect.value)
+      send({ type: 'set_model', model: modelSelect.value });
     setAgentName(modelSelect.value);
     updateModelInfo();
+    if (!models.length) {
+      modelInfoEl.textContent = 'this device has no models yet — ' +
+        'add a provider key in Settings';
+    }
   } catch (_) { /* agent not up yet */ }
 }
 
@@ -825,6 +896,7 @@ function switchDevice(id) {
   pendingLive = [];
   conversations = [];
   activeConvId = localStorage.getItem(convKey(dev.id)) || null;
+  activeConvDevId = activeConvId ? dev.id : null;
   clearTranscript();
   takenOver = false;
   takeoverBanner.hidden = true;
@@ -833,10 +905,13 @@ function switchDevice(id) {
   drawSpark();
   setAgentState('idle');
   populateDeviceSelect();
-  connectDesktop();
+  syncScreen();
   connectChat();
   loadModels();
   loadConversations();
+  keyNote = null;  // key status describes the old device — drop it
+  editingKey = null;
+  if (settingsOpen()) refreshKeys();
 }
 
 deviceSelect.onchange = () => switchDevice(deviceSelect.value);
@@ -984,9 +1059,19 @@ const PROVIDERS = [
 ];
 
 const keysBox = $('keysBox');
+const keysTargetEl = $('keysTarget');
+const keysHintEl = $('keysHint');
+const keyStatusEl = $('keyStatus');
 const providerGrid = $('providerGrid');
 const providerCards = {};
 let editingKey = null;
+// Where the cards are pointing and what the device reported. 'local' mode:
+// Electron writes the local stack's .env via IPC. 'remote': the daemon's
+// /api/keys endpoint — keys are uploaded to and stored on that machine.
+// The other modes explain why the cards are read-only right now.
+let keyMode = 'checking';  // local | remote | offline | auth | old | checking
+let remoteKeys = {};       // env key -> {set, source}
+let keyNote = null;        // sticky status line, like localNote
 
 function provBtn(text, cls = '') {
   const b = document.createElement('button');
@@ -996,23 +1081,175 @@ function provBtn(text, cls = '') {
   return b;
 }
 
-async function saveProviderKey(key, value) {
+function keyStateFor(k) {
+  if (keyMode === 'local') return { set: !!localKeysSet[k], source: 'local' };
+  if (keyMode === 'remote') {
+    const s = remoteKeys[k] || {};
+    return { set: !!s.set, source: s.source || null };
+  }
+  return { set: false, source: null };
+}
+
+function updateKeysHeader() {
+  const d = keyDev();
+  const name = d.name || d.host;
+  keysTargetEl.textContent = `— ${name}`;
+  let hint;
+  switch (keyMode) {
+    case 'local':
+      hint = 'Keys are stored on this computer only, in the local ' +
+        'stack\u2019s .env — they never leave the machine. At least one is ' +
+        'required to start the local desktop; changes apply on its next ' +
+        'start.';
+      break;
+    case 'remote':
+      hint = `Keys are stored on ${name} (${d.host}) — they upload over ` +
+        'plain HTTP and are saved on that machine, so the agent there ' +
+        'can call model providers. Anyone with the device password can ' +
+        'change them.';
+      break;
+    case 'auth':
+      hint = `${name} requires its device password before the app can ` +
+        'see or change its keys — set it on the device below.';
+      break;
+    case 'old':
+      hint = `${name} runs an older backend that can\u2019t take keys ` +
+        'from the app. Update it (the ↑ button on its row in Devices ' +
+        'below) or set keys in its env on the server itself.';
+      break;
+    case 'offline':
+      hint = `${name} isn\u2019t answering on :8000 — the app can\u2019t ` +
+        'see or change its keys until it\u2019s back.';
+      break;
+    default:
+      hint = `Checking which keys ${name} has…`;
+  }
+  keysHintEl.textContent = hint;
+  keyStatusEl.hidden = !keyNote;
+  keyStatusEl.textContent = keyNote || '';
+}
+
+// Which device the provider cards manage — follows the row clicked in the
+// device list below (editingDevId), falling back to the active device, so
+// the keys you see always belong to the device you're looking at.
+function keyDev() {
+  return cfg.devices.find(d => d.id === editingDevId) || activeDev();
+}
+
+// Refresh the cards for the key-target device — called on settings open,
+// device switch and row select. For the Electron local device this is the
+// .env key map; for everything else it asks the daemon which providers it
+// can serve.
+async function refreshKeys() {
+  const d = keyDev();
+  if (gut && d.id === 'local') {
+    keyMode = 'local';
+    try { localKeysSet = await gut.localKeys(); } catch (_) {}
+    renderProviderKeys();
+    return;
+  }
+  keyMode = 'checking';
+  renderProviderKeys();
   try {
-    localKeysSet = await gut.saveLocalKeys({ [key]: value });
-  } catch (e) {
-    localNote = `Could not save the key: ${e?.message || 'error'}`;
-    refreshLocal();
+    const r = await devFetch(d, '/api/keys');
+    if (d.id !== keyDev().id) return;  // target switched mid-fetch
+    if (r.ok) {
+      remoteKeys = await r.json();
+      keyMode = 'remote';
+    } else if (r.status === 401 || r.status === 403) {
+      keyMode = 'auth';
+    } else if (r.status === 404 || r.status === 405) {
+      keyMode = 'old';  // daemon predates /api/keys
+    } else {
+      keyMode = 'offline';
+    }
+  } catch (_) {
+    if (d.id !== keyDev().id) return;
+    keyMode = 'offline';
+  }
+  renderProviderKeys();
+}
+
+async function saveProviderKey(key, value) {
+  const d = keyDev();
+  if (keyMode === 'local') {
+    try {
+      localKeysSet = await gut.saveLocalKeys({ [key]: value });
+      keyNote = null;
+    } catch (e) {
+      keyNote = `Could not save the key: ${e?.message || 'error'}`;
+    }
+    editingKey = null;
+    renderProviderKeys();
+    return;
+  }
+  const p = PROVIDERS.find(x => x.key === key);
+  const name = d.name || d.host;
+  // Keys leave this machine — say so plainly before they go.
+  if (value && !confirm(
+      `Upload your ${p.name} key to ${name} (${d.host})?\n\n` +
+      'It is sent over plain HTTP and stored on that machine — its ' +
+      'agent needs it to call the provider.')) {
+    editingKey = null;
+    renderProviderKeys();
+    return;
+  }
+  keyNote = value ? `Uploading the ${p.name} key to ${name}…`
+                  : `Removing the ${p.name} key from ${name}…`;
+  renderProviderKeys();
+  try {
+    const r = await devFetch(d, '/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { [key]: value } }),
+    });
+    if (r.status === 404 || r.status === 405) {
+      keyMode = 'old';
+      keyNote = null;
+    } else if (!r.ok) {
+      keyNote = `Save failed (HTTP ${r.status}) — nothing was changed.`;
+    } else {
+      const j = await r.json();
+      remoteKeys = j.keys || remoteKeys;
+      keyNote = j.applied === false
+        ? `Saved on ${name}, but the model router rejected it — the ` +
+          `device keeps retrying (${j.error || 'unknown error'}).`
+        : value ? `${p.name} key is now on ${name} — its models show ` +
+                  'up in the picker within a few seconds.'
+                : `${p.name} key removed from ${name}.`;
+      // LiteLLM applies DB models on a short poll — refresh the picker
+      // now and once more after the change has landed.
+      loadModels();
+      setTimeout(loadModels, 8000);
+      const info = devInfo[d.id];
+      if (info) {
+        info.keys =
+          Object.values(remoteKeys).filter(k => k && k.set).length;
+        if (settingsOpen()) renderDeviceList();
+      }
+    }
+  } catch (_) {
+    keyNote = `Could not reach ${name} — nothing was changed.`;
   }
   editingKey = null;
   renderProviderKeys();
 }
 
 function renderProviderKeys() {
+  updateKeysHeader();
+  const manageable = keyMode === 'local' || keyMode === 'remote';
+  // When keys can't be managed right now the five identical dead cards are
+  // just noise — collapse to the single status line in the header.
+  providerGrid.hidden = !manageable;
+  if (!manageable) return;
   for (const p of PROVIDERS) {
     const c = providerCards[p.key];
-    const set = !!localKeysSet[p.key];
+    const { set, source } = keyStateFor(p.key);
     const editing = editingKey === p.key;
-    c.state.textContent = set ? 'Key saved' : 'No key';
+    // The pill says where the key physically lives, not just "saved".
+    c.state.textContent = source === 'env' ? 'Server env'
+      : set ? (keyMode === 'local' ? 'In .env' : 'On device')
+      : 'No key';
     c.state.classList.toggle('set', set);
     // A refresh mid-edit must not wipe the paste field.
     if (editing && c.actions.querySelector('.prov-key-input')) continue;
@@ -1045,16 +1282,25 @@ function renderProviderKeys() {
       c.actions.append(input, save, cancel);
       input.focus();
     } else if (set) {
-      const replace = provBtn('Replace');
+      const replace = provBtn(source === 'env' ? 'Override' : 'Replace');
+      if (source === 'env') {
+        replace.title = 'This key is set on the server itself — pushing ' +
+          'your own overrides it';
+      }
       replace.onclick = () => { editingKey = p.key; renderProviderKeys(); };
-      const remove = provBtn('Remove', 'danger');
-      remove.onclick = () => {
-        if (confirm(`Remove the ${p.name} key? Its models stop working ` +
-                   'the next time the local desktop starts.')) {
-          saveProviderKey(p.key, '');
-        }
-      };
-      c.actions.append(replace, remove);
+      c.actions.append(replace);
+      if (source !== 'env') {
+        const remove = provBtn('Remove', 'danger');
+        remove.onclick = () => {
+          const where = keyMode === 'local'
+            ? 'Its models stop working the next time the local desktop starts.'
+            : `Its models stop working on ${keyDev().name || 'the device'}.`;
+          if (confirm(`Remove the ${p.name} key? ${where}`)) {
+            saveProviderKey(p.key, '');
+          }
+        };
+        c.actions.append(remove);
+      }
     } else {
       const add = provBtn(`Add ${p.name} key`);
       add.classList.add('grow');
@@ -1091,10 +1337,7 @@ function notify(title, text) {
 async function refreshLocal() {
   if (!gut) return;
   localBox.hidden = false;
-  keysBox.hidden = false;
   localState = await gut.localStatus();
-  localKeysSet = await gut.localKeys();
-  renderProviderKeys();
   if (localState.runtime === 'missing') {
     localStatusEl.textContent = localNote ||
       'Docker not found — needed to run a desktop on this machine.';
@@ -1220,9 +1463,12 @@ if (gut) {
         // Any key still sitting in an open paste field goes along too —
         // start() writes it into .env before bringing the stack up.
         const keys = {};
-        for (const input of providerGrid.querySelectorAll('.prov-key-input')) {
-          const v = input.value.trim();
-          if (v) keys[input.dataset.envKey] = v;
+        if (keyMode === 'local') {
+          for (const input of
+               providerGrid.querySelectorAll('.prov-key-input')) {
+            const v = input.value.trim();
+            if (v) keys[input.dataset.envKey] = v;
+          }
         }
         localStatusEl.textContent = 'Starting local desktop…';
         const r = await gut.startLocal(keys);
@@ -1302,6 +1548,17 @@ async function probeDevice(d) {
       Object.assign(cur, { version: j.version, install: j.install,
                            device: j.device, offline: false });
       delete cur.legacy;
+      // How many provider keys the device can serve — the row's key badge.
+      try {
+        const kr = await devFetch(d, '/api/keys');
+        if (kr.ok) {
+          const kj = await kr.json();
+          cur.keys =
+            Object.values(kj).filter(k => k && k.set).length;
+        } else if (kr.status !== 401) {
+          cur.keys = null;  // daemon predates /api/keys — nothing to show
+        }
+      } catch (_) { /* keep the last known count */ }
     } else {
       // Any HTTP answer means the backend is alive — daemons older than
       // this route just report "online", no version.
@@ -1442,6 +1699,8 @@ function fillDeviceForm(d) {
   hostInput.value = d.host;
   vncPassInput.value = d.vncPassword;
   renderDeviceList();
+  keyNote = '';
+  refreshKeys();  // cards follow the device being looked at
 }
 
 function newDeviceForm() {
@@ -1450,6 +1709,8 @@ function newDeviceForm() {
   hostInput.value = '';
   vncPassInput.value = '';
   renderDeviceList();
+  keyNote = '';
+  refreshKeys();
   devNameInput.focus();
 }
 
@@ -1480,6 +1741,16 @@ function renderDeviceList() {
     ver.textContent = info?.offline ? '· offline'
       : info?.version ? `· v${info.version}`
       : info?.legacy ? '· online' : '';
+    // Provider-key count: the API when the daemon answers, the local
+    // stack's .env for the Electron local device.
+    let keyCount = info?.keys;
+    if (keyCount == null && gut && d.id === 'local') {
+      keyCount = Object.values(localKeysSet).filter(Boolean).length;
+    }
+    if (!info?.offline && keyCount != null) {
+      ver.textContent += keyCount
+        ? ` · ${keyCount} key${keyCount > 1 ? 's' : ''}` : ' · no keys';
+    }
     label.appendChild(ver);
     if (d.id === activeDev().id) {
       const tag = document.createElement('span');
@@ -1562,12 +1833,13 @@ function removeDevice(id) {
   saveDevices();
   populateDeviceSelect();
   renderDeviceList();
+  refreshKeys();  // the removed row may have been the keys target
   if (wasActive) switchDevice(cfg.activeDevice);
 }
 
 $('settingsBtn').onclick = () => {
   if (settingsOpen()) { closeSettings(); return; }
-  fillDeviceForm(activeDev());
+  fillDeviceForm(activeDev());  // refreshes the keys cards for it too
   refreshLocal();
   refreshDeviceInfo();
   openSettings();
@@ -1591,7 +1863,7 @@ $('devForm').addEventListener('submit', (e) => {
   e.preventDefault();
   const fields = {
     name: devNameInput.value.trim() || hostInput.value.trim() || 'Device',
-    host: hostInput.value.trim() || '127.0.0.1',
+    host: normalizeHost(hostInput.value) || '127.0.0.1',
     vncPassword: vncPassInput.value,
   };
   if (!editingDevId) {
@@ -1614,10 +1886,12 @@ $('devForm').addEventListener('submit', (e) => {
   saveDevices();
   populateDeviceSelect();
   if (wasActive) {
-    connectDesktop();
+    if (screenDevId === d.id) disconnectDesktop();  // pick up new host/password
+    syncScreen();
     connectChat();
     loadModels();
     loadConversations();
+    refreshKeys();  // host/password may have changed — re-check key state
   }
   renderDeviceList();
 });
@@ -1639,10 +1913,12 @@ new ResizeObserver(() => {
 
 // ── boot ────────────────────────────────────────────────────────────────
 activeConvId = localStorage.getItem(convKey(activeDev().id)) || null;
+activeConvDevId = activeConvId ? activeDev().id : null;
 populateDeviceSelect();
-connectDesktop();
+syncScreen();
 connectChat();
 loadConversations();
+refreshKeys();
 setInterval(loadModels, 30000);
 setTimeout(loadModels, 1500);
 
@@ -1650,7 +1926,7 @@ setTimeout(loadModels, 1500);
 // desktop setup panel. "Configured" = a provider key was saved or the device
 // list was touched — without that, a stopped stack pops this on every launch.
 if (gut) {
-  refreshLocal().then(() => {
+  Promise.all([refreshLocal(), refreshKeys()]).then(() => {
     const fresh = !localStorage.getItem('gut.devices') &&
       !Object.values(localKeysSet).some(Boolean);
     if (fresh && localState && localState.stack !== 'running') {

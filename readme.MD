@@ -45,8 +45,9 @@ On Windows/Linux the button opens the release page instead.
 On a Debian/Ubuntu machine or VPS — no Docker, no compose:
 
 ```bash
-wget https://github.com/valteryde/gut/releases/latest/download/gut-bot_0.1.0_amd64.deb
-sudo apt install ./gut-bot_0.1.0_amd64.deb
+V=$(curl -fsSL https://api.github.com/repos/valteryde/gut/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+wget "https://github.com/valteryde/gut/releases/latest/download/gut-bot_${V}_amd64.deb"
+sudo apt install "./gut-bot_${V}_amd64.deb"
 ```
 
 The installer prints the address and a generated password:
@@ -58,10 +59,13 @@ The installer prints the address and a generated password:
     password  : xK9…
 ```
 
-Then: add at least one provider key to `/etc/gut/gut-bot.env`,
-`sudo systemctl restart gut-litellm`, and add the machine as a device in
-the app (host = its IP, password = the printed one). Re-print credentials
-anytime with `gut-bot info`; manage with `gut-bot status|logs|restart`.
+Then add the machine as a device in the app (host = its IP, password = the
+printed one) and paste at least one provider key in Settings → Provider
+keys — keys upload to and are stored on the server, so nothing needs
+editing on the host and no services restart. Keys can alternatively be set
+in `/etc/gut/gut-bot.env` (`sudo systemctl restart gut-bot` to apply).
+Re-print credentials anytime with `gut-bot info`; manage with
+`gut-bot status|logs|restart`.
 The app shows the backend's version on its device row and can push a
 release update to it (`POST /api/update` installs the new deb and restarts
 the services).
@@ -91,7 +95,8 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 │   ├── start.sh                # Xvfb + XFCE + x11vnc + noVNC + daemon launcher
 │   ├── agent_daemon.py         # FastAPI: WS chat, desktop control, LiteLLM, cost
 │   ├── requirements.txt
-│   └── wallpaper.png/.py
+│   ├── wallpaper.png/.py       # base desktop art + procedural generator
+│   └── device_wallpaper.py     # hue-rotates the base per DEVICE_NAME at boot
 ├── client/                     # the UI — static HTML/JS, loaded by Electron
 │   ├── index.html, app.js, styles.css
 │   └── vendor/                 # vendored noVNC + fonts (no CDN)
@@ -150,11 +155,22 @@ reports it via `GET /api/version`.
   plus the LLM message context, so a revisited conversation continues with
   full memory of the earlier run. A device runs one agent at a time — sending
   to a busy device tells you which conversation occupies it. `DEVICE_NAME`
-  labels the backend in the UI.
+  labels the backend in the UI and sets the desktop wallpaper's hue — every
+  device is a different color, so you can tell which machine a stream shows
+  at a glance (`WALLPAPER_HUE` pins the hue, `local` keeps the mint).
 - **Cost tracking.** The daemon mints a `gut-agent` LiteLLM virtual key on
   first boot and reads spend from LiteLLM's `/key/info` API. Per-request cost
   comes from the `x-litellm-response-cost` header. Models missing from
   LiteLLM's pricing map (e.g. local Ollama) report $0 but still track tokens.
+- **Provider keys.** Managed per device from Settings → Provider keys —
+  click a device row to see and edit its keys. Pasted keys upload to that
+  machine, are stored in the daemon's data dir
+  (`provider_keys.json`, mode 600) and synced into LiteLLM's DB model store
+  (`store_model_in_db`), so they apply live with no restarts and survive
+  reboots. Keys set in the backend's own env (`.env` / `gut-bot.env`) still
+  work — the daemon registers them the same way at boot — and a pushed key
+  overrides an env key for that provider. The app's own local stack is the
+  exception: its keys go into the stack's `.env` on this machine.
 - **Architecture**: the Docker image ships Google Chrome on amd64 and Debian's
   `chromium` on arm64; gut-bot always uses `chromium` (Google doesn't publish
   an apt repo the deb can depend on). `google-chrome` is aliased either way.
@@ -178,6 +194,13 @@ that protects both; the app sends it as a Bearer token / `?token=`.
 and device name. For remote backends, additionally firewall ports to your IP
 or front them with a TLS reverse proxy. Keep `LITELLM_MASTER_KEY` secret — it
 administers the proxy.
+
+Provider keys entered in the app are uploaded to the device they belong to
+and stored there (the daemon's data dir plus LiteLLM's internal DB) — the
+agent needs them to call model providers, and anyone with the device
+password can read that store. They travel over plain HTTP like everything
+else on :8000, so push keys only on networks you trust or put a TLS proxy
+in front.
 
 ## Human-in-the-loop
 

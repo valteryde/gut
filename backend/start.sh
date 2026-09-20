@@ -25,6 +25,18 @@ if [ "${X_UP}" != "1" ]; then
 fi
 
 echo "[gut] starting XFCE4 session"
+
+# Per-device wallpaper: same art, hue rotated from DEVICE_NAME so each
+# backend's desktop is a different color at a glance (WALLPAPER_HUE pins a
+# specific hue). Regenerated every boot; falls back to the shipped PNG.
+WALLPAPER_PATH="${GUT_DATA_DIR:-$HOME/.gut}/wallpaper.png"
+mkdir -p "$(dirname "$WALLPAPER_PATH")"
+python3 /opt/gut/device_wallpaper.py \
+    --name "${DEVICE_NAME:-$(hostname 2>/dev/null || echo local)}" \
+    --base /opt/gut/wallpaper.png --out "$WALLPAPER_PATH" \
+    || { echo "[gut] wallpaper gen failed — using shipped PNG" >&2
+         WALLPAPER_PATH=/opt/gut/wallpaper.png; }
+
 # Bigger UI = text stays legible in downscaled screenshots = more reliable
 # clicks at the same image-token cost. Xresources covers non-GTK apps; the
 # xfconf write must run inside the session bus, hence the wrapper script.
@@ -48,7 +60,7 @@ WSCOUNT=\$(xfconf-query -c xfwm4 -p /general/workspace_count 2>/dev/null || echo
 for ws in \$(seq 0 \$((WSCOUNT - 1))); do
   xfconf-query -c xfce4-desktop \
     -p /backdrop/screen0/monitor\${MON}/workspace\${ws}/last-image \
-    -n -t string -s /opt/gut/wallpaper.png >/dev/null 2>&1
+    -n -t string -s ${WALLPAPER_PATH} >/dev/null 2>&1
   xfconf-query -c xfce4-desktop \
     -p /backdrop/screen0/monitor\${MON}/workspace\${ws}/image-style \
     -n -t int -s 5 >/dev/null 2>&1
@@ -77,7 +89,9 @@ websockify --web /usr/share/novnc 6080 localhost:5900 &
 
 echo "[gut] waiting for LiteLLM at ${LITELLM_URL}"
 for _ in $(seq 1 120); do
+    # /health/liveliness exists on newer litellm; 1.9.x only has /health.
     curl -sf "${LITELLM_URL}/health/liveliness" >/dev/null 2>&1 && break
+    curl -sf "${LITELLM_URL}/health" >/dev/null 2>&1 && break
     sleep 1
 done
 

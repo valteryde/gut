@@ -213,6 +213,7 @@ function writeLitellmConfig(env) {
     'general_settings:\n' +
     '  master_key: os.environ/LITELLM_MASTER_KEY\n' +
     '  database_url: os.environ/DATABASE_URL\n' +
+    '  store_model_in_db: true\n' +
     'litellm_settings:\n' +
     '  store_prompts_in_spend_logs: false\n' +
     '  request_timeout: 600\n' +

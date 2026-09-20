@@ -7,6 +7,7 @@ Requires=postgresql.service
 Type=simple
 User=gut
 Group=gut
+Environment=PATH=/opt/gut/venv/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/gut/gut-bot.env
 # Localhost-only: only the agent daemon talks to it, and the admin UI would
 # otherwise expose the master key to the LAN.

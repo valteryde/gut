@@ -200,6 +200,7 @@ class AgentState:
         self.session_usd = 0.0
         self.tokens_in = 0
         self.tokens_out = 0
+        self.models_synced = False  # provider keys pushed into LiteLLM
 
     @property
     def running(self) -> bool:
@@ -496,6 +497,166 @@ async def push_cost() -> None:
         msg["conversation_id"] = state.conversation_id
         msg["conversation_usd"] = meta.get("cost_usd") or 0
     await broadcast(msg)
+
+
+# ── Provider keys (BYOK) ─────────────────────────────────────────────────────
+# Model provider keys reach the daemon two ways:
+#   * env vars on this process — compose's shared .env, or the deb's
+#     /etc/gut/gut-bot.env (source "env"), and
+#   * pushed from the app via POST /api/keys — persisted in
+#     PROVIDER_KEYS_FILE on the data volume (source "pushed").
+# Pushed keys win over env ones for the same provider. For every effective
+# key the daemon registers that provider's models in LiteLLM's DB-backed
+# model store (store_model_in_db) under deployment ids prefixed "gut-", so
+# keys take effect with no service restarts and the shipped config can stay
+# keyless. A static config.yaml entry under the same model_name suppresses
+# the managed deployment — hand-written config always wins.
+PROVIDER_MODELS = {
+    "ANTHROPIC_API_KEY": [
+        ("claude-sonnet-4-5", "anthropic/claude-sonnet-4-5-20250929"),
+        ("claude-haiku-4-5", "anthropic/claude-haiku-4-5-20251001"),
+    ],
+    "OPENAI_API_KEY": [
+        ("gpt-5", "openai/gpt-5"),
+        ("gpt-4o", "openai/gpt-4o"),
+    ],
+    "GEMINI_API_KEY": [
+        ("gemini-2.5-pro", "gemini/gemini-2.5-pro"),
+        ("gemini-2.5-flash", "gemini/gemini-2.5-flash"),
+    ],
+    "DEEPSEEK_API_KEY": [
+        ("deepseek-chat", "deepseek/deepseek-chat"),
+    ],
+    "OPENROUTER_API_KEY": [
+        ("openrouter/claude-sonnet-4.5",
+         "openrouter/anthropic/claude-sonnet-4.5"),
+        ("openrouter/gpt-5", "openrouter/openai/gpt-5"),
+        ("openrouter/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"),
+        ("openrouter/qwen3-vl", "openrouter/qwen/qwen3-vl-235b-a22b-instruct"),
+    ],
+}
+PROVIDER_KEYS = tuple(PROVIDER_MODELS)
+PROVIDER_KEYS_FILE = GUT_DATA_DIR / "provider_keys.json"
+MANAGED_PREFIX = "gut-"
+
+
+def load_provider_keys() -> dict:
+    try:
+        data = json.loads(PROVIDER_KEYS_FILE.read_text())
+        return {k: str(v).strip() for k, v in data.items()
+                if k in PROVIDER_KEYS and str(v).strip()}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def store_provider_keys(keys: dict) -> None:
+    PROVIDER_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PROVIDER_KEYS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(keys))
+    tmp.chmod(0o600)
+    tmp.replace(PROVIDER_KEYS_FILE)
+
+
+def effective_provider_keys() -> dict:
+    """{env key: (value, "env"|"pushed")} — pushed keys override env."""
+    eff = {k: (os.environ[k].strip(), "env") for k in PROVIDER_KEYS
+           if os.environ.get(k, "").strip()}
+    for k, v in load_provider_keys().items():
+        eff[k] = (v, "pushed")
+    return eff
+
+
+async def litellm_admin(method: str, path: str, **kw) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.request(
+            method, f"{LITELLM_URL}{path}",
+            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"}, **kw)
+        r.raise_for_status()
+        return r
+
+
+def _managed_id(m: dict) -> str:
+    """Deployment id when `m` is one of ours (DB-stored), else ''."""
+    info = m.get("model_info") or {}
+    mid = str(info.get("id") or "")
+    if mid.startswith(MANAGED_PREFIX) or info.get("managed_by") == "gut":
+        return mid
+    return ""
+
+
+def _deployment_id(model_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", model_name).strip("-").lower()
+    return f"{MANAGED_PREFIX}{slug}"
+
+
+async def litellm_deployments() -> list[dict]:
+    r = await litellm_admin("GET", "/model/info")
+    data = r.json()
+    items = data.get("data", []) if isinstance(data, dict) else data
+    return [m for m in items if isinstance(m, dict)]
+
+
+_reconcile_lock = asyncio.Lock()
+
+
+async def reconcile_models() -> None:
+    """Sync LiteLLM's deployments with the effective provider keys.
+
+    Deletes every managed (gut-*) deployment then re-adds the desired set —
+    cheap, idempotent, and self-healing when keys change or the LiteLLM DB
+    was reset. A model_name already served by a static (unmanaged) config
+    entry is left to it.
+    """
+    desired = {}
+    for env_key, models in PROVIDER_MODELS.items():
+        eff = effective_provider_keys().get(env_key)
+        if not eff:
+            continue
+        for name, litellm_model in models:
+            desired[name] = (litellm_model, eff[0])
+    async with _reconcile_lock:
+        current = await litellm_deployments()
+        static_names = {m.get("model_name") for m in current
+                        if m.get("model_name") and not _managed_id(m)}
+        for m in current:
+            mid = _managed_id(m)
+            if mid:
+                await litellm_admin("POST", "/model/delete",
+                                    json={"id": mid})
+        added = []
+        for name, (litellm_model, key) in desired.items():
+            if name in static_names:
+                continue
+            await litellm_admin("POST", "/model/new", json={
+                "model_name": name,
+                "litellm_params": {"model": litellm_model,
+                                   "api_key": key,
+                                   "max_tokens": 8192},
+                "model_info": {"id": _deployment_id(name),
+                               "managed_by": "gut"},
+            })
+            added.append(name)
+        # If the configured default model doesn't exist (no key for it),
+        # fall back to the first model that does — a task sent before the
+        # user picks a model shouldn't hit a missing deployment.
+        available = static_names | set(added)
+        if available and state.model not in available:
+            state.model = added[0] if added else sorted(available)[0]
+            await push_status()
+
+
+async def model_sync_loop() -> None:
+    """Retry reconcile until LiteLLM accepts it, then stay quiet. Key pushes
+    reset state.models_synced to trigger another pass."""
+    while True:
+        if not state.models_synced:
+            try:
+                await reconcile_models()
+                state.models_synced = True
+                print("[gut] litellm models synced")
+            except Exception as e:
+                print(f"[gut] model sync failed (retrying in 20s): {e}")
+        await asyncio.sleep(20)
 
 
 # ── WebSocket plumbing ───────────────────────────────────────────────────────
@@ -1728,8 +1889,12 @@ async def lifespan(_app: FastAPI):
     except OSError as e:
         print(f"[gut] conversation dir {CONV_DIR} unavailable: {e}")
     state.litellm_key = await provision_key()
+    sync_task = asyncio.create_task(model_sync_loop())
     print(f"[gut] agent ready, model={state.model}")
-    yield
+    try:
+        yield
+    finally:
+        sync_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1849,6 +2014,54 @@ async def api_update(body: dict = Body(default={})):
         subprocess.Popen(["setsid", *cmd], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"ok": True, "target": target}
+
+
+def _keys_state() -> dict:
+    eff = effective_provider_keys()
+    return {k: {"set": k in eff,
+                "source": eff[k][1] if k in eff else None}
+            for k in PROVIDER_KEYS}
+
+
+@app.get("/api/keys")
+async def api_keys():
+    """Which provider keys this device can serve models for — set flags and
+    where each came from, never the values."""
+    return _keys_state()
+
+
+@app.post("/api/keys")
+async def api_keys_set(body: dict = Body(...)):
+    """Upsert provider keys pushed from the app; an empty value removes.
+
+    Keys are stored on this device (PROVIDER_KEYS_FILE, next to the
+    conversation store) and synced into LiteLLM's model store — no restart
+    needed. Unknown key names are rejected so this can't write arbitrary
+    environment.
+    """
+    updates = body.get("keys")
+    if not isinstance(updates, dict):
+        raise HTTPException(400, 'expected {"keys": {NAME: value}}')
+    bad = sorted(k for k in updates if k not in PROVIDER_KEYS)
+    if bad:
+        raise HTTPException(400, "unknown provider keys: " + ", ".join(bad))
+    saved = load_provider_keys()
+    for k, v in updates.items():
+        v = str(v or "").strip()
+        if v:
+            saved[k] = v
+        else:
+            saved.pop(k, None)
+    store_provider_keys(saved)
+    state.models_synced = False  # the sync loop retries on failure
+    try:
+        await reconcile_models()
+        state.models_synced = True
+    except Exception as e:
+        return {"keys": _keys_state(), "applied": False,
+                "error": f"saved on device but LiteLLM rejected it "
+                         f"(retrying): {e}"}
+    return {"keys": _keys_state(), "applied": True}
 
 
 @app.get("/api/device")

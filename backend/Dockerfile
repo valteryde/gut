@@ -78,6 +78,7 @@ RUN ARCH="$(dpkg --print-architecture)" && \
 COPY backend/start.sh /opt/gut/start.sh
 COPY backend/agent_daemon.py /opt/gut/agent_daemon.py
 COPY backend/wallpaper.png /opt/gut/wallpaper.png
+COPY backend/device_wallpaper.py /opt/gut/device_wallpaper.py
 RUN echo "${GUT_VERSION}" > /opt/gut/VERSION && chmod +x /opt/gut/start.sh
 
 USER agent

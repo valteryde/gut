@@ -1,4 +1,4 @@
-fastapi==0.119.*
+fastapi>=0.136,<1
 uvicorn[standard]>=0.30,<1.0
 httpx==0.28.*
 pyautogui==0.9.54

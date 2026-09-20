@@ -24,7 +24,7 @@ case "$cmd" in
     echo "  password  : ${VNC_PASSWORD:-<unset>}"
     echo "  litellm   : http://127.0.0.1:4000 (localhost only)"
     echo
-    echo "config    : $ENV_FILE (add provider API keys there)"
+    echo "config    : $ENV_FILE (provider keys optional — the app can push them)"
     echo "services  : gut-bot.service, gut-litellm.service"
     ;;
   status)   systemctl status gut-bot.service gut-litellm.service ;;

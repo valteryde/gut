@@ -1,0 +1,6 @@
+# LiteLLM proxy + its DB layer, installed into /opt/gut/venv alongside
+# backend/requirements.txt. The `proxy` extra covers the web/auth deps;
+# prisma (DB client + engines) lives behind the separate `extra-proxy`
+# extra — pulled in directly here since that's all we use.
+litellm[proxy]==1.100.*
+prisma>=0.11,<1.0

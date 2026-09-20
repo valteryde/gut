@@ -3,9 +3,9 @@ set -e
 
 case "$1" in
   purge)
+    rm -rf /var/lib/gut /etc/gut /etc/systemd/system/gut-litellm.service.d
     systemctl daemon-reload 2>/dev/null || true
     deluser --quiet gut 2>/dev/null || true
-    rm -rf /var/lib/gut /etc/gut
     # LiteLLM's postgres data is left in place — drop manually if unwanted:
     #   su postgres -c "dropdb litellm; dropuser litellm"
   ;;
