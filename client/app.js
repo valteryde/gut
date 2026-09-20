@@ -487,6 +487,7 @@ function renderEvent(m, live) {
       break;
     case 'error':
       addMsg('error', m.text, 'Error');
+      if (live) notify(`${agentName} failed`, m.text || '');
       break;
   }
 }
@@ -988,6 +989,7 @@ function connectChat() {
         break;
       case 'error':
         addMsg('error', m.text, 'Error');
+        notify(`${agentName} failed`, m.text || '');
         break;
     }
   };

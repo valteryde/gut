@@ -2977,46 +2977,55 @@ async def agent_loop(conv_id: str, task_text: str,
     state.run_start = time.time()
     state.sent_files = {}
     state.output_nudge_done = False
-    # Snapshot the desktop before the run touches it — the end-of-run sweep
-    # only removes what appears after this point, so user-opened windows and
-    # tabs survive. Persisted so a crash mid-run still cleans up at boot.
-    baseline = await asyncio.to_thread(capture_baseline)
-    if GUT_CLEANUP:
-        await asyncio.to_thread(_persist_baseline, baseline)
-    await broadcast({"type": "status", "state": "running",
-                     "model": state.model, "conversation_id": conv_id})
-    # A revisited conversation resumes its own stored context; a fresh one
-    # starts from just the system prompt.
-    # The client resizes the display to fit its pane, so RESOLUTION (the
-    # Xvfb startup size / max) may be stale — report the live screen size.
+    # One try wraps setup AND the step loop: a crash anywhere in the run is
+    # reported by the except below, then the finally cleans up and drops
+    # status to idle. A failed task must never just go quiet — or sit on
+    # "running" — with no explanation for the user.
+    baseline = None
+    messages: list[dict] = []
     try:
-        res = "%dx%d" % tuple(pyautogui.size())
-    except Exception:
-        res = RESOLUTION
-    coords = COORD_PROMPT_NORM if coords_normalized() else COORD_PROMPT_PIXEL
-    messages = conv_load_context(conv_id) or [
-        {"role": "system", "content": SYSTEM_PROMPT.format(
-            res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
-            subcap=SUBAGENT_MAX_CONCURRENT)}]
-    sanitize_context(messages)
-    content = [{"type": "text", "text": task_text}]
-    # Attached images go inline so the model sees them directly; other files
-    # are referenced by path in the task text (attach_note).
-    for f in attachments or []:
-        if f["mime"].startswith("image/"):
-            content.append({"type": "image_url", "image_url": {
-                "url": f"data:{f['mime']};base64,{f['b64']}"}})
-    content.append(screenshot_block(force=True))
-    messages.append({"role": "user", "content": content})
-    done = False
-    recent_sigs, unchanged_streak, stuck_rescues = deque(maxlen=10), 0, 0
-    idle_replies = 0
-    state.todos = conv_load_todos(conv_id)
-    state.steps_since_todo = 0
-    state.steps_since_compact = 99
-    last_tin = 0        # prompt_tokens of the last request — compaction signal
-    overflow_retries = 0
-    try:
+        # Snapshot the desktop before the run touches it — the end-of-run
+        # sweep only removes what appears after this point, so user-opened
+        # windows and tabs survive. Persisted so a crash mid-run still
+        # cleans up at boot.
+        baseline = await asyncio.to_thread(capture_baseline)
+        if GUT_CLEANUP:
+            await asyncio.to_thread(_persist_baseline, baseline)
+        await broadcast({"type": "status", "state": "running",
+                         "model": state.model, "conversation_id": conv_id})
+        # A revisited conversation resumes its own stored context; a fresh
+        # one starts from just the system prompt.
+        # The client resizes the display to fit its pane, so RESOLUTION (the
+        # Xvfb startup size / max) may be stale — report the live screen size.
+        try:
+            res = "%dx%d" % tuple(pyautogui.size())
+        except Exception:
+            res = RESOLUTION
+        coords = COORD_PROMPT_NORM if coords_normalized() \
+            else COORD_PROMPT_PIXEL
+        messages = conv_load_context(conv_id) or [
+            {"role": "system", "content": SYSTEM_PROMPT.format(
+                res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
+                subcap=SUBAGENT_MAX_CONCURRENT)}]
+        sanitize_context(messages)
+        content = [{"type": "text", "text": task_text}]
+        # Attached images go inline so the model sees them directly; other
+        # files are referenced by path in the task text (attach_note).
+        for f in attachments or []:
+            if f["mime"].startswith("image/"):
+                content.append({"type": "image_url", "image_url": {
+                    "url": f"data:{f['mime']};base64,{f['b64']}"}})
+        content.append(screenshot_block(force=True))
+        messages.append({"role": "user", "content": content})
+        done = False
+        recent_sigs, unchanged_streak, stuck_rescues = \
+            deque(maxlen=10), 0, 0
+        idle_replies = 0
+        state.todos = conv_load_todos(conv_id)
+        state.steps_since_todo = 0
+        state.steps_since_compact = 99
+        last_tin = 0    # prompt_tokens of the last request — compaction signal
+        overflow_retries = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as http:
             for _ in range(MAX_STEPS):
                 while state.paused and not state.stop:
@@ -3219,8 +3228,19 @@ async def agent_loop(conv_id: str, task_text: str,
             else:
                 await broadcast({"type": "error",
                                  "text": f"hit step cap ({MAX_STEPS}); stopping"})
+    except Exception as e:
+        # Whatever killed the run — a malformed model reply, a blown tool,
+        # dead storage — the user hears why it stopped instead of watching
+        # the agent silently go idle.
+        await broadcast({"type": "error", "text": f"agent crashed: {e}"})
     finally:
-        await asyncio.to_thread(conv_save_context, conv_id, messages)
+        # messages is empty when setup died before the context loaded —
+        # saving then would clobber the stored conversation with nothing.
+        if messages:
+            try:
+                await asyncio.to_thread(conv_save_context, conv_id, messages)
+            except Exception as e:
+                print(f"[gut] context save failed: {e}")
         # The sweep runs on every exit path; the janitor only on natural
         # endings — an explicit stop hands the desktop back as-is.
         await cleanup_after_run(conv_id, baseline, janitor=not state.stop)
