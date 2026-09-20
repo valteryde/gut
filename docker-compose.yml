@@ -42,6 +42,15 @@ services:
       retries: 18
       start_period: 60s
 
+  # Metasearch for the agent's web_search tool. Internal only — never publish
+  # a port; the desktop reaches it by service name. SearXNG's bot limiter is
+  # off and JSON output on via searxng/settings.yml.
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+
   desktop:
     build:
       context: .
@@ -61,6 +70,7 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-sonnet-4-5}
       DEVICE_NAME: ${DEVICE_NAME:-local}
+      SEARXNG_URL: http://searxng:8080
     ports:
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
       - "127.0.0.1:${AGENT_PORT:-8000}:8000"
@@ -73,6 +83,8 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
+      searxng:
+        condition: service_started
 
 volumes:
   litellm-pgdata:

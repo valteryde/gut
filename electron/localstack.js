@@ -41,6 +41,7 @@ const envFile = (proj = MANAGED) => proj === 'gut'
 const envPath = () => envFile();
 const composePath = () => composeFile();
 const litellmPath = () => path.join(stackDir(), 'litellm.yaml');
+const searxngPath = () => path.join(stackDir(), 'searxng.yml');
 
 const imageTag = () =>
   process.env.GUT_DESKTOP_IMAGE ||
@@ -232,6 +233,27 @@ function writeLitellmConfig(env) {
   return entries.length > 0;
 }
 
+// SearXNG settings for the local stack's metasearch service — written once
+// so the generated secret_key stays stable across restarts/updates. The
+// service is internal-only (no published ports); limiter off and JSON on
+// because the daemon's web_search calls /search?format=json.
+function writeSearxngSettings() {
+  if (fs.existsSync(searxngPath())) return;
+  fs.writeFileSync(searxngPath(), `use_default_settings: true
+
+server:
+  secret_key: "${rand(32)}"
+  limiter: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  formats:
+    - html
+    - json
+`);
+}
+
 function writeCompose() {
   fs.writeFileSync(composePath(), `name: gut-local
 
@@ -275,6 +297,12 @@ services:
       retries: 18
       start_period: 60s
 
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./searxng.yml:/etc/searxng/settings.yml:ro
+
   desktop:
     image: ${imageTag()}
     restart: unless-stopped
@@ -288,6 +316,7 @@ services:
       LITELLM_MASTER_KEY: \${LITELLM_MASTER_KEY}
       DEFAULT_MODEL: \${DEFAULT_MODEL}
       DEVICE_NAME: local
+      SEARXNG_URL: http://searxng:8080
     ports:
       - "127.0.0.1:6080:6080"
       - "127.0.0.1:8000:8000"
@@ -299,6 +328,8 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
+      searxng:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/version || exit 1"]
       interval: 10s
@@ -427,6 +458,7 @@ async function start(keys, log) {
     env.DEFAULT_MODEL = litellmConfigFirstModel(env);
   }
   writeEnv(env);
+  writeSearxngSettings();
   writeCompose();
 
   log(`Pulling and starting the stack (image ${imageTag()}) — first run downloads several GB…`);
@@ -472,6 +504,7 @@ async function update(log) {
   if (!fs.existsSync(composePath())) {
     return { ok: false, error: 'local stack has not been created yet' };
   }
+  writeSearxngSettings();  // older stacks lack the file the compose mount needs
   writeCompose();  // refresh the image tag for the current app version
   log(`Updating the local desktop to ${imageTag()}…`);
   let r = await run('docker', [...composeArgs(), 'pull'], log);
