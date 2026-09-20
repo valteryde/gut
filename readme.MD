@@ -17,6 +17,8 @@ An open-source, vendor-neutral AI desktop environment governed by a vision-enabl
 - **Dual-Control Human Takeover:** The agent acts autonomously via mouse and keyboard simulation, but you can click into the live desktop screen at any second to handle 2FA, logins, or CAPTCHAs.
 - **Teammate-Style Chat:** Quiet by default — the agent messages you when it has something worth saying: milestone updates (`send_message`), clarifying questions (`ask_user`), file deliverables (`send_file`), inline screenshots (`send_image`), and a wrap-up summary when done (`task_complete`). Flip the **verbose** toggle to watch the full working log (thoughts, tool calls, results) live. The app raises a native notification when the agent finishes or needs you.
 - **File attachments:** Attach files from the composer (paperclip, drag-and-drop onto the chat, or paste an image). They're saved under `~/uploads` on the device and the agent reads them from there; attached images are also shown to the model inline.
+- **Parallel subagents:** The agent can spawn background helpers (`spawn_agent`) for headless work — web research, file and shell jobs — while it keeps driving the desktop. Helpers get `web_search`, `fetch_url`, `send_file` and a `run_command` with `DISPLAY` stripped, so nothing hijacks the screen or the browser; reports arrive as messages mid-run, or the agent blocks on `collect_agent`. Each helper can run a different (cheaper) model (`SUBAGENT_MODEL` or a per-spawn override).
+- **Long-horizon tasks:** On big multi-phase jobs the agent posts a plan (`share_plan` — a card in chat) and keeps a live checklist (`update_todos` — pinned above the transcript, restored when you revisit the conversation). When a run nears the model's context window, older history is automatically compacted into a handoff summary and work continues — a context-overflow 400 triggers the same path instead of killing the run. Tunable via `AGENT_COMPACT_RATIO`, `AGENT_CONTEXT_LIMIT` and `AGENT_COMPACT_KEEP`.
 
 ---
 
@@ -88,8 +90,9 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 ## Repository Structure
 
 ```text
-├── docker-compose.yml          # dev stack (db + litellm + desktop, built from source)
+├── docker-compose.yml          # dev stack (db + litellm + searxng + desktop, built from source)
 ├── litellm_config.yaml         # shared LiteLLM model config (compose + gut-bot)
+├── searxng/settings.yml        # metasearch config — JSON on, bot limiter off
 ├── .env.example
 ├── backend/
 │   ├── Dockerfile              # builds the gut-desktop image (context: repo root)
@@ -144,6 +147,12 @@ reports it via `GET /api/version`.
   localhost:9222 (profile at `~/.gut-chrome`), so the agent reads the DOM and
   clicks elements by `#ref` instead of guessing pixels. **Never publish port
   9222** — CDP is unauthenticated full browser control.
+- **Text-first web tools.** `web_search` (SearXNG on the internal compose
+  network — `SEARXNG_URL`, internal-only, never published — with a
+  DuckDuckGo HTML fallback when unset) and `fetch_url` (plain-HTTP page
+  text + links) let the agent research without opening Chrome: no
+  screenshots, no CAPTCHA walls, one turn instead of five. The `browser_*`
+  tools stay for what needs a real browser — JS-heavy pages, logins, forms.
 - **Cost controls.** Only the last `SCREENSHOT_HISTORY` frames stay in context
   (older ones become text placeholders), one screenshot is attached per turn
   and skipped when the frame is unchanged, Anthropic-style prompt caching is
