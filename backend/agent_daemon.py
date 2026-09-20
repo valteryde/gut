@@ -44,6 +44,11 @@ LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5")
 RESOLUTION = os.environ.get("RESOLUTION", "1920x1080")
 MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "150"))
+# Consecutive text-only replies (no tool calls) before the run is ended with
+# the model's last reply as the wrap-up. Weaker models answer in prose instead
+# of calling task_complete; without a cap the "continue" nudge loops to
+# MAX_STEPS paying full input cost every turn.
+IDLE_REPLY_LIMIT = int(os.environ.get("AGENT_IDLE_REPLY_LIMIT", "3"))
 ASK_USER_TIMEOUT = int(os.environ.get("ASK_USER_TIMEOUT", "600"))
 COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "60"))
 SCREENSHOT_MAX_EDGE = int(os.environ.get("SCREENSHOT_MAX_EDGE", "1568"))
@@ -1705,6 +1710,7 @@ async def agent_loop(conv_id: str, task_text: str,
     messages.append({"role": "user", "content": content})
     done = False
     recent_sigs, unchanged_streak, stuck_rescues = deque(maxlen=10), 0, 0
+    idle_replies = 0
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as http:
             for _ in range(MAX_STEPS):
@@ -1731,22 +1737,40 @@ async def agent_loop(conv_id: str, task_text: str,
 
                 msg = r.json()["choices"][0]["message"]
                 messages.append(assistant_to_dict(msg))
+                reply_text = ""
                 if msg.get("content"):
                     # Model narration goes to the verbose log, not the chat —
                     # the user only hears what the agent deliberately sends.
-                    text = msg["content"]
-                    if not isinstance(text, str):
-                        text = " ".join(str(b.get("text", "")) for b in text
-                                        if isinstance(b, dict))
-                    if text.strip():
+                    reply_text = msg["content"]
+                    if not isinstance(reply_text, str):
+                        reply_text = " ".join(
+                            str(b.get("text", "")) for b in reply_text
+                            if isinstance(b, dict))
+                    reply_text = reply_text.strip()
+                    if reply_text:
                         await broadcast({"type": "thought",
-                                         "text": text.strip()})
+                                         "text": reply_text})
 
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
-                    messages.append({"role": "user", "content":
-                        "Continue with tool calls, or call task_complete when done."})
+                    idle_replies += 1
+                    if idle_replies >= IDLE_REPLY_LIMIT:
+                        # The model insists on prose instead of calling
+                        # task_complete — end the run and deliver its last
+                        # reply as the wrap-up so it reaches the user.
+                        done = True
+                        await broadcast({"type": "done",
+                                         "text": (reply_text or "done")[:8000]})
+                        break
+                    nudge = ("Continue with tool calls, or call task_complete "
+                             "when done.") if idle_replies == 1 else (
+                        "Plain text doesn't reach the user and doesn't end "
+                        "the task. If you're finished, call task_complete now "
+                        "with your answer as `summary`; otherwise make your "
+                        "next tool call.")
+                    messages.append({"role": "user", "content": nudge})
                     continue
+                idle_replies = 0
 
                 acted_on_screen = False
                 for tc in tool_calls:
