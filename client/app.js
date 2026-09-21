@@ -671,13 +671,14 @@ function queueTag(mode, cid, seq) {
   const tag = document.createElement('span');
   tag.className = 'qtag';
   if (mode === 'steer') {
+    tag.classList.add('steer');
     tag.textContent = '⚡ sent to the agent';
   } else {
     tag.appendChild(document.createTextNode('queued'));
     if (seq != null && cid === runningConvId) {
       const now = document.createElement('button');
       now.type = 'button';
-      now.textContent = '· send now';
+      now.textContent = 'send now';
       now.title = "Push it into the run at the agent's next step";
       now.onclick = () => {
         send({ type: 'control', action: 'deliver', seq });
@@ -688,7 +689,7 @@ function queueTag(mode, cid, seq) {
     if (seq != null) {
       const rm = document.createElement('button');
       rm.type = 'button';
-      rm.textContent = '· drop';
+      rm.textContent = 'drop';
       rm.title = 'Remove from the queue';
       rm.onclick = () => send({ type: 'control', action: 'dequeue', seq });
       tag.appendChild(rm);

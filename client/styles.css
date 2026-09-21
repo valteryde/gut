@@ -474,24 +474,41 @@ body[data-agent="running"] #activityLine:not(:empty) {
   border-radius: var(--radius-card);
 }
 
-/* queued-for-delivery tag under a user message sent mid-run */
+/* queued-for-delivery tag under a user message sent mid-run — a footer
+   row on the clay bubble: status left, actions right */
 .qtag {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  margin-top: 6px;
-  font-size: 11px;
-  color: var(--text-3);
+  gap: 10px;
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--clay-line);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--clay-ink);
 }
-.qtag.dropped { text-decoration: line-through; }
+.qtag::before {
+  content: '';
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.qtag.steer::before { display: none; }
+.qtag.dropped { text-decoration: line-through; opacity: 0.7; }
 .qtag button {
   padding: 0;
   border: 0;
   background: none;
   font: inherit;
-  color: var(--mint);
+  color: var(--mint-ink);
   cursor: pointer;
 }
+.qtag button:first-of-type { margin-left: auto; }
 .qtag button:hover { text-decoration: underline; }
 .qtag button:disabled { color: var(--text-3); cursor: default; text-decoration: none; }
 
