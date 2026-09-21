@@ -19,7 +19,7 @@ An open-source, vendor-neutral AI desktop environment governed by a vision-enabl
 - **Queue & steer mid-run:** Keep typing while the agent works — messages queue and are picked up when the run finishes (a follow-up to the same conversation lands before the end-of-run cleanup, so the desktop is still as the agent left it). Hit ⚡ or ⌘/Ctrl+Enter to steer instead: the message is injected into the run at the agent's next step. Queued messages can be sent-now or dropped from the tag under them; whatever is still queued when a run ends — even a stopped one — starts the next task automatically.
 - **File attachments:** Attach files from the composer (paperclip, drag-and-drop onto the chat, or paste an image). They're saved under `~/uploads` on the device and the agent reads them from there; attached images are also shown to the model inline.
 - **Parallel subagents:** The agent can spawn background helpers (`spawn_agent`) for headless work — web research, file and shell jobs — while it keeps driving the desktop. Helpers get `web_search`, `fetch_url`, `send_file` and a `run_command` with `DISPLAY` stripped, so nothing hijacks the screen or the browser; reports arrive as messages mid-run, or the agent blocks on `collect_agent`. Each helper can run a different (cheaper) model (`SUBAGENT_MODEL` or a per-spawn override).
-- **Long-horizon tasks:** On big multi-phase jobs the agent posts a plan (`share_plan` — a card in chat) and keeps a live checklist (`update_todos` — pinned above the transcript, restored when you revisit the conversation). When a run nears the model's context window, older history is automatically compacted into a handoff summary and work continues — a context-overflow 400 triggers the same path instead of killing the run. Tunable via `AGENT_COMPACT_RATIO`, `AGENT_CONTEXT_LIMIT` and `AGENT_COMPACT_KEEP`.
+- **Long-horizon tasks:** On big multi-phase jobs the agent posts a plan and keeps a live checklist via `plan` — the summary shows as a card in chat, the steps pin above the transcript and are restored when you revisit the conversation. When a run nears the model's context window, older history is automatically compacted into a handoff summary and work continues — a context-overflow 400 triggers the same path instead of killing the run. Tunable via `AGENT_COMPACT_RATIO`, `AGENT_CONTEXT_LIMIT` and `AGENT_COMPACT_KEEP`.
 
 ---
 
@@ -169,6 +169,15 @@ reports it via `GET /api/version`.
   (`/extract`), so JS-heavy sites still read as text. The `browser_*`
   tools stay for what needs a real browser — logins, forms, interactive
   pages.
+- **Lean tool list.** The schema the model weighs each step is kept short:
+  the variants are folded into single tools (`click` covers
+  left/right/middle/double via `button`/`count`, `plan` posts the plan card
+  and the checklist together), planning and text-web tools are declared
+  first, and ref-based tools stay hidden until they can work —
+  `browser_click`/`browser_type` appear after `browser_dom` has produced
+  refs, `desktop_*` actions after `desktop_tree`, `office_eval` while
+  LibreOffice runs, `collect_agent` while a helper exists. Once shown a
+  tool stays shown for the run, so history and schema never disagree.
 - **Cost controls.** Only the last `SCREENSHOT_HISTORY` frames stay in context
   (older ones become text placeholders), one screenshot is attached per turn
   and skipped when the frame is unchanged, Anthropic-style prompt caching is

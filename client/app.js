@@ -713,6 +713,10 @@ const fileBase = (p) => String(p || '').split('/').pop() || 'a file';
 const TOOL_STATUS = {
   screenshot:       () => 'looking at the screen',
   wait:             (a) => a.seconds ? `waiting ${a.seconds}s` : 'waiting',
+  click:            (a) => a.count >= 2 ? 'double-clicking'
+                           : a.button === 'right' ? 'right-clicking'
+                           : a.button === 'middle' ? 'middle-clicking'
+                           : 'clicking',
   left_click:       () => 'clicking',
   middle_click:     () => 'middle-clicking',
   right_click:      () => 'right-clicking',
@@ -747,6 +751,8 @@ const TOOL_STATUS = {
   ask_user:         () => 'asking you',
   spawn_agent:      (a) => `delegating to ${clip(a.name, 20) || 'a helper'}`,
   collect_agent:    () => 'collecting a helper report',
+  plan:             (a) => a.summary ? 'posting a plan'
+                                     : 'updating the checklist',
   share_plan:       () => 'posting a plan',
   update_todos:     () => 'updating the checklist',
   task_complete:    () => 'wrapping up',
@@ -780,6 +786,7 @@ const TICONS = {
 
 const TOOL_ICON = {
   screenshot: 'eye', wait: 'clock',
+  click: 'cursor',
   left_click: 'cursor', middle_click: 'cursor', right_click: 'cursor',
   double_click: 'cursor', mouse_move: 'cursor', scroll: 'cursor',
   desktop_act: 'cursor', desktop_click: 'cursor', browser_click: 'cursor',
@@ -790,6 +797,7 @@ const TOOL_ICON = {
   list_windows: 'grid', focus_window: 'grid', desktop_tree: 'grid',
   send_message: 'chat', ask_user: 'chat', send_file: 'doc',
   send_image: 'image', spawn_agent: 'helper', collect_agent: 'helper',
+  plan: 'plan',
   share_plan: 'plan', update_todos: 'plan', task_complete: 'check',
 };
 

@@ -191,7 +191,7 @@ JANITOR_MODEL = os.environ.get("JANITOR_MODEL", "")
 COMPACT_RATIO = float(os.environ.get("AGENT_COMPACT_RATIO", "0.75"))
 COMPACT_CONTEXT_LIMIT = int(os.environ.get("AGENT_CONTEXT_LIMIT", "128000"))
 COMPACT_KEEP = int(os.environ.get("AGENT_COMPACT_KEEP", "6"))
-# Steps without an update_todos call before the checklist is nudged back
+# Steps without a plan call before the checklist is nudged back
 # into view on long tasks. TODO_NUDGE_STEPS covers the empty case — a run
 # that deep with no checklist usually means the task only looked small.
 TODO_REMIND_STEPS = int(os.environ.get("TODO_REMIND_STEPS", "20"))
@@ -361,10 +361,10 @@ Environment:
 - Google Chrome is installed with DevTools on localhost:{cdp}. Use the
   browser_* tools only when the text tools can't do the job — pages needing
   JS, logins/sessions, forms, or visual checks (DOM refs, not pixels):
-  open_url or browser_navigate to get somewhere, browser_text to read the
+  open_url to get somewhere, browser_text to read the
   page's text, browser_dom to list interactive elements as #refs, then
   browser_click / browser_type by ref; browser_eval runs arbitrary JS.
-  Both navigation tools report the HTTP status and title: a 404 means the
+  open_url reports the HTTP status and title: a 404 means the
   URL was wrong — go back to web_search, don't try variations of it. Read
   pages with browser_text/fetch_url, not by scrolling through screenshots.
   Fall back to pixel tools for anything outside the page.
@@ -423,13 +423,13 @@ Planning — match the effort to the task:
 - Anything with several distinct phases or likely more than ~15 steps
   (research-then-write, multi-site collection, install-and-configure) —
   and any task that gathers data and then produces a file always counts:
-  call share_plan once with a concise plan (it posts to the user as a card
-  — no approval needed, keep working), then update_todos with the step
-  list, both before you start acting.
-  Pass the full list every call, keep exactly one item in_progress, mark
-  steps done as you go. When in doubt, share the plan and make the
-  checklist — they cost little and the user watches both live. If the
-  scope changes, share_plan again and rewrite the list.
+  call plan once before you start acting, with `summary` (a concise plan
+  — it posts to the user as a card, no approval needed, keep working)
+  and `steps` (your checklist).
+  Pass the full `steps` list every call, keep exactly one item
+  in_progress, mark steps done as you go. When in doubt, post the plan
+  and checklist — they cost little and the user watches both live. If
+  the scope changes, call plan again with a new summary and list.
 - On very long runs your older context gets compacted into a handoff
   summary — the checklist always survives it. Anything else worth keeping
   (paths, URLs, decisions, findings) belongs in the todo text or in files
@@ -556,7 +556,7 @@ class AgentState:
             self.shot_size = (1024, 768)
         self.frame_hash: str | None = None  # last frame sent to the model
         self.browser_ws: str | None = None  # CDP ws url of the active page
-        # Consecutive open_url/browser_navigate calls that hit an error
+        # Consecutive open_url calls that hit an error
         # status — the model constructing URLs from memory instead of using
         # ones a tool returned.
         self.url_fail_streak = 0
@@ -566,6 +566,12 @@ class AgentState:
         # Last desktop_tree ref map: ref -> a11y path ("app|i,j,...").
         # Stale after any UI change — desktop_tree refreshes it.
         self.a11y_map: dict[int, str] = {}
+        # Contextual disclosure (tools_for_run): a browser_dom/desktop_tree
+        # this run has produced refs to act on; tools_shown is the monotonic
+        # set of CONTEXT_TOOLS already declared to the model.
+        self.dom_seen = False
+        self.tree_seen = False
+        self.tools_shown: set[str] = set()
         self.conversation_id: str | None = None  # conversation of the current/last run
         self.session_usd = 0.0
         self.tokens_in = 0
@@ -583,7 +589,7 @@ class AgentState:
         # picked up when the run ends — same-conversation ones even before
         # the end-of-run cleanup sweep.
         self.user_msgs = deque()
-        # The running conversation's update_todos checklist (persisted at
+        # The running conversation's `plan` checklist (persisted at
         # <cid>.todos.json) and the long-horizon bookkeeping for reminders
         # and compaction.
         self.todos: list[dict] = []
@@ -762,9 +768,12 @@ def conv_load_context(cid: str) -> list | None:
     _, _, ctx_path = _conv_paths(cid)
     try:
         messages = json.loads(ctx_path.read_text())
-        return messages if isinstance(messages, list) and messages else None
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(messages, list) or not messages:
+        return None
+    migrate_legacy_tools(messages)
+    return messages
 
 
 def conv_save_context(cid: str, messages: list) -> None:
@@ -1832,13 +1841,6 @@ async def _navigate(ws, url: str) -> str:
     return out
 
 
-async def browser_navigate(url: str) -> str:
-    await ensure_browser()
-    ws_url = await cdp_page_ws_url()
-    async with ws_connect(ws_url, max_size=20 * 1024 * 1024) as ws:
-        return await _navigate(ws, url)
-
-
 async def browser_dom() -> str:
     await ensure_browser()
     ws_url = await cdp_page_ws_url()
@@ -2245,92 +2247,40 @@ async def fetch_url(url: str, max_chars: int = 6000) -> str:
 # Screen-mutating tools trigger one fresh screenshot per turn, attached to the
 # last tool result (skipped when the frame is unchanged). See agent_loop.
 SCREEN_TOOLS = {
-    "left_click", "right_click", "middle_click", "double_click", "mouse_move",
-    "scroll", "type_text", "key", "run_command", "wait",
-    "browser_navigate", "browser_click", "browser_type", "open_url",
-    "focus_window",
+    "click", "mouse_move", "scroll", "type_text", "key", "run_command",
+    "wait", "browser_click", "browser_type", "open_url", "focus_window",
     "desktop_act", "desktop_click", "desktop_type", "office_eval",
 }
 
+# Declared in the order the prompt wants them weighed: plan first, then the
+# cheap text web tools, browser refs, the screen, native-app refs, pixel
+# fallbacks, helpers, and the user-facing tools last. Models attend more to
+# the head of a long list — this used to open with eight pixel tools and end
+# with the planning ones.
 TOOLS = [
     {"type": "function", "function": {
-        "name": "screenshot",
-        "description": "Capture the current screen. Pass `region` "
-                       "[x, y, w, h] (in screenshot coordinates) to zoom "
-                       "into a detail — the crop is enlarged for "
-                       "readability. Positions in a crop are relative to "
-                       "the crop: keep issuing clicks in normal "
-                       "full-screen coordinates.",
+        "name": "plan",
+        "description": "Post your plan and keep your checklist current — one "
+                       "call does both. `summary` (markdown) is shown to the "
+                       "user as a plan card: give it on the first call and "
+                       "again only if the plan changes. `steps` replaces "
+                       "your working checklist, pinned live above the chat "
+                       "and kept across context compaction: pass the full "
+                       "list every time with exactly one item in_progress "
+                       "and mark steps done as you go. Multi-phase tasks: "
+                       "call this before you start acting. Quick one-off "
+                       "actions: skip it.",
         "parameters": {"type": "object", "properties": {
-            "region": {"type": "array", "items": {"type": "integer"},
-                       "minItems": 4, "maxItems": 4,
-                       "description": "optional [x, y, w, h] crop"}}}}},
-    {"type": "function", "function": {
-        "name": "wait",
-        "description": "Wait for the screen to change (page loads, app launches, "
-                       "animations). Sleeps the given seconds, then returns a "
-                       "fresh screenshot.",
-        "parameters": {"type": "object", "properties": {
-            "seconds": {"type": "number",
-                        "description": "seconds to wait, 0.1–60"}},
-            "required": ["seconds"]}}},
-    {"type": "function", "function": {
-        "name": "left_click", "description": "Left-click at [x, y].",
-        "parameters": {"type": "object", "properties": {
-            "coordinate": {"type": "array", "items": {"type": "integer"},
-                           "minItems": 2, "maxItems": 2}},
-            "required": ["coordinate"]}}},
-    {"type": "function", "function": {
-        "name": "middle_click", "description": "Middle-click at [x, y].",
-        "parameters": {"type": "object", "properties": {
-            "coordinate": {"type": "array", "items": {"type": "integer"},
-                           "minItems": 2, "maxItems": 2}},
-            "required": ["coordinate"]}}},
-    {"type": "function", "function": {
-        "name": "right_click", "description": "Right-click at [x, y].",
-        "parameters": {"type": "object", "properties": {
-            "coordinate": {"type": "array", "items": {"type": "integer"},
-                           "minItems": 2, "maxItems": 2}},
-            "required": ["coordinate"]}}},
-    {"type": "function", "function": {
-        "name": "double_click", "description": "Double-click at [x, y].",
-        "parameters": {"type": "object", "properties": {
-            "coordinate": {"type": "array", "items": {"type": "integer"},
-                           "minItems": 2, "maxItems": 2}},
-            "required": ["coordinate"]}}},
-    {"type": "function", "function": {
-        "name": "mouse_move", "description": "Move the pointer to [x, y] without clicking.",
-        "parameters": {"type": "object", "properties": {
-            "coordinate": {"type": "array", "items": {"type": "integer"},
-                           "minItems": 2, "maxItems": 2}},
-            "required": ["coordinate"]}}},
-    {"type": "function", "function": {
-        "name": "scroll", "description": "Scroll at [x, y] (or current position).",
-        "parameters": {"type": "object", "properties": {
-            "coordinate": {"type": "array", "items": {"type": "integer"},
-                           "minItems": 2, "maxItems": 2},
-            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-            "amount": {"type": "integer",
-                       "description": "mouse-wheel clicks, NOT pixels: 3 "
-                                      f"default, ~10 is a screenful, max "
-                                      f"{SCROLL_MAX_CLICKS}"}},
-            "required": ["direction"]}}},
-    {"type": "function", "function": {
-        "name": "type_text", "description": "Type text at the current focus.",
-        "parameters": {"type": "object", "properties": {
-            "text": {"type": "string"}}, "required": ["text"]}}},
-    {"type": "function", "function": {
-        "name": "key",
-        "description": "Press a key, combo, or sequence, e.g. 'enter', "
-                       "'ctrl+c', 'alt+tab', 'f5', 'tab tab tab'.",
-        "parameters": {"type": "object", "properties": {
-            "keys": {"type": "string"}}, "required": ["keys"]}}},
-    {"type": "function", "function": {
-        "name": "run_command",
-        "description": f"Run a bash command in the desktop session (cwd {HOME_DIR}). "
-                       "Append '&' when launching GUI apps so it returns immediately.",
-        "parameters": {"type": "object", "properties": {
-            "command": {"type": "string"}}, "required": ["command"]}}},
+            "summary": {"type": "string",
+                        "description": "concise plan for the user — first "
+                                       "call, or when the plan changes"},
+            "steps": {"type": "array", "items": {"type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "status": {"type": "string",
+                               "enum": ["pending", "in_progress", "done"]}},
+                "required": ["content", "status"]}}},
+            "required": ["steps"]}}},
     {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the web — returns numbered results with title, "
@@ -2366,24 +2316,38 @@ TOOLS = [
                           "description": "text cap, default 6000 (max 16000)"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
-        "name": "browser_navigate",
-        "description": "Navigate the current Chrome tab to a URL (starts Chrome "
-                       "with DevTools if it isn't running); returns the HTTP "
-                       "status and title.",
+        "name": "run_command",
+        "description": f"Run a bash command in the desktop session (cwd {HOME_DIR}). "
+                       "Append '&' when launching GUI apps so it returns immediately.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}}, "required": ["url"]}}},
+            "command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {
-        "name": "browser_dom",
-        "description": "List the current page's interactive elements (links, "
-                       "buttons, inputs, ...) as numbered #refs with their "
-                       "on-screen positions. Required before browser_click or "
-                       "browser_type; re-run after navigation or DOM changes.",
-        "parameters": {"type": "object", "properties": {}}}},
+        "name": "open_url",
+        "description": "Open a URL in Chrome (launches it if needed) in your "
+                       "current tab, replacing the page there; returns the "
+                       "HTTP status and title. Only open URLs a tool result "
+                       "gave you — never construct them. Prefer this over "
+                       "clicking the Chrome icon and typing in the address "
+                       "bar.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "new_tab": {"type": "boolean",
+                        "description": "open in a new tab and keep the "
+                                       "current page (default false)"}},
+            "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "browser_text",
         "description": "Read the current page as text (URL, title, body "
                        "text). Much cheaper than reading screenshots — use "
                        "it to extract info, listings, contact details, etc.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "browser_dom",
+        "description": "List the current page's interactive elements (links, "
+                       "buttons, inputs, ...) as numbered #refs with their "
+                       "on-screen positions. Required before browser_click or "
+                       "browser_type (which appear once you've called this); "
+                       "re-run after navigation or DOM changes.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "browser_click",
@@ -2407,28 +2371,26 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "expression": {"type": "string"}}, "required": ["expression"]}}},
     {"type": "function", "function": {
-        "name": "open_url",
-        "description": "Open a URL in Chrome (launches it if needed) in your "
-                       "current tab, replacing the page there; returns the "
-                       "HTTP status and title. Only open URLs a tool result "
-                       "gave you — never construct them. Prefer this over "
-                       "clicking the Chrome icon and typing in the address "
-                       "bar.",
+        "name": "screenshot",
+        "description": "Capture the current screen. Pass `region` "
+                       "[x, y, w, h] (in screenshot coordinates) to zoom "
+                       "into a detail — the crop is enlarged for "
+                       "readability. Positions in a crop are relative to "
+                       "the crop: keep issuing clicks in normal "
+                       "full-screen coordinates.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"},
-            "new_tab": {"type": "boolean",
-                        "description": "open in a new tab and keep the "
-                                       "current page (default false)"}},
-            "required": ["url"]}}},
+            "region": {"type": "array", "items": {"type": "integer"},
+                       "minItems": 4, "maxItems": 4,
+                       "description": "optional [x, y, w, h] crop"}}}}},
     {"type": "function", "function": {
-        "name": "list_windows",
-        "description": "List open windows (id, desktop, title) via wmctrl.",
-        "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {
-        "name": "focus_window",
-        "description": "Raise/focus the window whose title contains `match`.",
+        "name": "wait",
+        "description": "Wait for the screen to change (page loads, app launches, "
+                       "animations). Sleeps the given seconds, then returns a "
+                       "fresh screenshot.",
         "parameters": {"type": "object", "properties": {
-            "match": {"type": "string"}}, "required": ["match"]}}},
+            "seconds": {"type": "number",
+                        "description": "seconds to wait, 0.1–60"}},
+            "required": ["seconds"]}}},
     {"type": "function", "function": {
         "name": "desktop_tree",
         "description": "Dump the focused window's accessibility tree — the "
@@ -2436,8 +2398,9 @@ TOOLS = [
                        "with role, name, available actions and on-screen "
                        "bounds. Pass `app` (name substring) to target a "
                        "window that isn't focused. Required before "
-                       "desktop_act/desktop_click/desktop_type; re-run after "
-                       "the UI changes — refs go stale.",
+                       "desktop_act/desktop_click/desktop_type (which appear "
+                       "once you've called this); re-run after the UI "
+                       "changes — refs go stale.",
         "parameters": {"type": "object", "properties": {
             "app": {"type": "string",
                     "description": "app name substring, e.g. 'libreoffice'"}}}}},
@@ -2454,12 +2417,6 @@ TOOLS = [
                        "description": "action name from the ref's [..] list"}},
             "required": ["ref"]}}},
     {"type": "function", "function": {
-        "name": "desktop_click",
-        "description": "Pixel-click the center of #ref's bounds from the last "
-                       "desktop_tree — for elements with no useful action.",
-        "parameters": {"type": "object", "properties": {
-            "ref": {"type": "integer"}}, "required": ["ref"]}}},
-    {"type": "function", "function": {
         "name": "desktop_type",
         "description": "Set the text of editable #ref directly (no "
                        "keystrokes); falls back to focusing the node and "
@@ -2468,16 +2425,92 @@ TOOLS = [
             "ref": {"type": "integer"}, "text": {"type": "string"}},
             "required": ["ref", "text"]}}},
     {"type": "function", "function": {
+        "name": "desktop_click",
+        "description": "Pixel-click the center of #ref's bounds from the last "
+                       "desktop_tree — for elements with no useful action.",
+        "parameters": {"type": "object", "properties": {
+            "ref": {"type": "integer"}}, "required": ["ref"]}}},
+    {"type": "function", "function": {
         "name": "office_eval",
         "description": "Run Python-UNO code against the LIVE LibreOffice "
                        "document — insert content, format, save, export as "
                        "PDF — without touching the GUI. Globals: `doc` (the "
                        "open document, None if none), `desktop`, `load(path)` "
                        "to open a file, `file_url`, `uno`; assign `result` "
-                       "to return a value. Starts LibreOffice with the "
-                       "listener if it isn't running.",
+                       "to return a value.",
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string"}}, "required": ["code"]}}},
+    {"type": "function", "function": {
+        "name": "list_windows",
+        "description": "List open windows (id, desktop, title) via wmctrl.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "focus_window",
+        "description": "Raise/focus the window whose title contains `match`.",
+        "parameters": {"type": "object", "properties": {
+            "match": {"type": "string"}}, "required": ["match"]}}},
+    {"type": "function", "function": {
+        "name": "click",
+        "description": "Click at [x, y] — the pixel fallback; prefer "
+                       "browser_click / desktop_act refs on pages and native "
+                       "apps. `button` left (default), right or middle; "
+                       "`count` 2 for a double-click.",
+        "parameters": {"type": "object", "properties": {
+            "coordinate": {"type": "array", "items": {"type": "integer"},
+                           "minItems": 2, "maxItems": 2},
+            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+            "count": {"type": "integer", "enum": [1, 2]}},
+            "required": ["coordinate"]}}},
+    {"type": "function", "function": {
+        "name": "mouse_move", "description": "Move the pointer to [x, y] without clicking.",
+        "parameters": {"type": "object", "properties": {
+            "coordinate": {"type": "array", "items": {"type": "integer"},
+                           "minItems": 2, "maxItems": 2}},
+            "required": ["coordinate"]}}},
+    {"type": "function", "function": {
+        "name": "scroll", "description": "Scroll at [x, y] (or current position).",
+        "parameters": {"type": "object", "properties": {
+            "coordinate": {"type": "array", "items": {"type": "integer"},
+                           "minItems": 2, "maxItems": 2},
+            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+            "amount": {"type": "integer",
+                       "description": "mouse-wheel clicks, NOT pixels: 3 "
+                                      f"default, ~10 is a screenful, max "
+                                      f"{SCROLL_MAX_CLICKS}"}},
+            "required": ["direction"]}}},
+    {"type": "function", "function": {
+        "name": "type_text", "description": "Type text at the current focus.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "key",
+        "description": "Press a key, combo, or sequence, e.g. 'enter', "
+                       "'ctrl+c', 'alt+tab', 'f5', 'tab tab tab'.",
+        "parameters": {"type": "object", "properties": {
+            "keys": {"type": "string"}}, "required": ["keys"]}}},
+    {"type": "function", "function": {
+        "name": "spawn_agent",
+        "description": "Spawn a background helper agent on a self-contained "
+                       "headless subtask — web research, file and data work. "
+                       "It gets web_search, fetch_url, run_command and "
+                       "send_file (no screen, no browser, no user contact) "
+                       "and reports back as a message when done. You keep "
+                       "working meanwhile; collect_agent waits for a report.",
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string",
+                     "description": "complete instructions — the helper sees "
+                                    "only this, not your conversation"},
+            "name": {"type": "string",
+                     "description": "short label, e.g. 'visa-research'"},
+            "model": {"type": "string",
+                      "description": "override model (default: yours)"}},
+            "required": ["task"]}}},
+    {"type": "function", "function": {
+        "name": "collect_agent",
+        "description": "Wait for a spawned helper to finish and return its "
+                       "report. With no name, waits for the next one done.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}}}},
     {"type": "function", "function": {
         "name": "send_message",
         "description": "Send a chat message to the user. Like a teammate: "
@@ -2510,53 +2543,6 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "question": {"type": "string"}}, "required": ["question"]}}},
     {"type": "function", "function": {
-        "name": "spawn_agent",
-        "description": "Spawn a background helper agent on a self-contained "
-                       "headless subtask — web research, file and data work. "
-                       "It gets web_search, fetch_url, run_command and "
-                       "send_file (no screen, no browser, no user contact) "
-                       "and reports back as a message when done. You keep "
-                       "working meanwhile; collect_agent waits for a report.",
-        "parameters": {"type": "object", "properties": {
-            "task": {"type": "string",
-                     "description": "complete instructions — the helper sees "
-                                    "only this, not your conversation"},
-            "name": {"type": "string",
-                     "description": "short label, e.g. 'visa-research'"},
-            "model": {"type": "string",
-                      "description": "override model (default: yours)"}},
-            "required": ["task"]}}},
-    {"type": "function", "function": {
-        "name": "collect_agent",
-        "description": "Wait for a spawned helper to finish and return its "
-                       "report. With no name, waits for the next one done.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}}}}},
-    {"type": "function", "function": {
-        "name": "share_plan",
-        "description": "Post your plan to the user as a card in chat. On "
-                       "multi-phase tasks share the plan once before "
-                       "starting, then track the steps with update_todos. "
-                       "Quick one-off actions need neither.",
-        "parameters": {"type": "object", "properties": {
-            "plan": {"type": "string",
-                     "description": "concise plan, markdown ok"}},
-            "required": ["plan"]}}},
-    {"type": "function", "function": {
-        "name": "update_todos",
-        "description": "Replace your working checklist — the user watches it "
-                       "as a live card. Pass the full list every call and "
-                       "keep exactly one item in_progress. It survives "
-                       "context compaction; keep it current on long tasks.",
-        "parameters": {"type": "object", "properties": {
-            "items": {"type": "array", "items": {"type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "status": {"type": "string",
-                               "enum": ["pending", "in_progress", "done"]}},
-                "required": ["content", "status"]}}},
-            "required": ["items"]}}},
-    {"type": "function", "function": {
         "name": "task_complete",
         "description": "End the task. `summary` is sent to the user as your "
                        "wrap-up message — cover what was done, where results "
@@ -2565,6 +2551,79 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
+
+# Tools that only make sense once something else has happened — a ref tool
+# with no refs to act on, office_eval with no document, collect_agent with
+# no helper. Hidden until then: the list the model weighs is shorter, and a
+# browser_click with a guessed ref before any browser_dom (seen in the wild)
+# becomes impossible. Once shown, a tool stays shown for the rest of the run
+# — a request that no longer declares a tool its own history calls is
+# something providers may reject, and it keeps the cached prefix stable.
+CONTEXT_TOOLS = {
+    "browser_click": lambda: state.dom_seen,
+    "browser_type": lambda: state.dom_seen,
+    "desktop_act": lambda: state.tree_seen,
+    "desktop_click": lambda: state.tree_seen,
+    "desktop_type": lambda: state.tree_seen,
+    "office_eval": lambda: office_running(),
+    "collect_agent": lambda: bool(state.subagents),
+}
+
+
+def office_running() -> bool:
+    return subprocess.run(["pgrep", "-f", "soffice"], capture_output=True,
+                          check=False).returncode == 0
+
+
+def tools_for_run(messages: list) -> list:
+    """The main agent's tool list for this request — TOOLS minus the
+    CONTEXT_TOOLS whose precondition hasn't been met yet in this run."""
+    for name, ready in CONTEXT_TOOLS.items():
+        if name not in state.tools_shown and ready():
+            state.tools_shown.add(name)
+    for m in messages:  # tools the stored history calls stay declared
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                state.tools_shown.add((tc.get("function") or {}).get("name"))
+    return [t for t in TOOLS
+            if t["function"]["name"] not in CONTEXT_TOOLS
+            or t["function"]["name"] in state.tools_shown]
+
+
+# Pre-consolidation names → the current tool set. Stored conversations still
+# carry them (migrated on load) and a resumed model may echo one.
+def legacy_call(name: str, args: dict) -> tuple[str, dict]:
+    if name in ("left_click", "right_click", "middle_click", "double_click"):
+        button = "left" if name == "double_click" else name.split("_")[0]
+        out = {**args, "button": button}
+        if name == "double_click":
+            out["count"] = 2
+        return "click", out
+    if name == "browser_navigate":
+        return "open_url", args
+    if name == "share_plan":
+        return "plan", {"summary": args.get("plan", "")}
+    if name == "update_todos":
+        return "plan", {"steps": args.get("items")}
+    return name, args
+
+
+def migrate_legacy_tools(messages: list) -> None:
+    """Rewrite legacy tool names/arguments inside a stored context so the
+    history matches the tools the request declares."""
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            name, new_args = legacy_call(fn.get("name", ""), args)
+            if name != fn.get("name"):
+                fn["name"] = name
+                fn["arguments"] = json.dumps(new_args)
 
 
 # Background helpers (spawn_agent) get a headless subset — nothing that
@@ -2791,6 +2850,7 @@ async def execute_tool(name: str, args: dict,
                    else SUBAGENT_TOOL_NAMES)
         if name not in allowed:
             return f"{name} isn't available to the {agent} agent", False
+    name, args = legacy_call(name, args)
     try:
         if name == "screenshot":
             region = args.get("region")
@@ -2820,14 +2880,12 @@ async def execute_tool(name: str, args: dict,
                 await asyncio.sleep(step)
                 slept += step
             result = f"waited {slept:.1f}s"
-        elif name == "left_click":
-            result = await asyncio.to_thread(_click_at, args)
-        elif name == "right_click":
-            result = await asyncio.to_thread(_click_at, args, "right")
-        elif name == "middle_click":
-            result = await asyncio.to_thread(_click_at, args, "middle")
-        elif name == "double_click":
-            result = await asyncio.to_thread(_click_at, args, "left", True)
+        elif name == "click":
+            button = str(args.get("button") or "left").lower()
+            if button not in ("left", "right", "middle"):
+                button = "left"
+            result = await asyncio.to_thread(
+                _click_at, args, button, int(args.get("count") or 1) >= 2)
         elif name == "mouse_move":
             x, y, pos = _pos(args)
             info = await asyncio.to_thread(_a11y_at, x, y)
@@ -2879,10 +2937,9 @@ async def execute_tool(name: str, args: dict,
         elif name == "fetch_url":
             result = await fetch_url(str(args.get("url", "")),
                                      int(args.get("max_chars") or 6000))
-        elif name == "browser_navigate":
-            result = await browser_navigate(str(args.get("url", "")))
         elif name == "browser_dom":
             result = await browser_dom()
+            state.dom_seen = True
         elif name == "browser_text":
             result = await browser_text()
         elif name == "browser_click":
@@ -2902,6 +2959,7 @@ async def execute_tool(name: str, args: dict,
         elif name == "desktop_tree":
             result = await asyncio.to_thread(desktop_tree,
                                              str(args.get("app", "")))
+            state.tree_seen = True
         elif name == "desktop_act":
             result = await asyncio.to_thread(desktop_act, args.get("ref"),
                                              str(args.get("action", "")))
@@ -2933,16 +2991,19 @@ async def execute_tool(name: str, args: dict,
             result = await collect_agent(str(args.get("name", "")))
         elif name == "ask_user":
             return await ask_user(str(args.get("question", ""))), False
-        elif name == "share_plan":
-            plan = str(args.get("plan", "")).strip()
-            if not plan:
-                return "empty plan — nothing shared", False
-            state.plan_shared = True
-            await broadcast({"type": "plan", "text": plan})
-            result = ("plan shared with the user — now execute it; keep "
-                      "progress current via update_todos")
-        elif name == "update_todos":
-            result = await update_todos(args.get("items"))
+        elif name == "plan":
+            summary = str(args.get("summary") or "").strip()
+            if summary:
+                state.plan_shared = True
+                await broadcast({"type": "plan", "text": summary})
+            if "steps" in args:
+                result = await update_todos(args.get("steps"))
+            elif summary:
+                result = "checklist unchanged"
+            else:
+                return "empty plan — pass `steps` (and `summary`)", False
+            if summary:
+                result = "plan shared with the user; " + result
         elif name == "task_complete":
             unsent = unsent_outputs() if agent is None else []
             if unsent and not state.output_nudge_done:
@@ -3296,7 +3357,8 @@ async def spend_rescue(stall: StallDetector, messages: list, conv_id: str,
 
 
 async def llm_request_forcing(http: httpx.AsyncClient, messages: list,
-                              force: str | None) -> httpx.Response:
+                              force: str | None,
+                              tools: list) -> httpx.Response:
     """llm_request with the reply pinned to tool `force` — how the checklist
     nudge and the final-step task_complete stop being suggestions the model
     answers in prose. A provider that rejects tool_choice (some OpenRouter
@@ -3304,7 +3366,7 @@ async def llm_request_forcing(http: httpx.AsyncClient, messages: list,
     the 400 is paid once per model, not once per nudge."""
     if force and state.model not in state.no_tool_choice:
         try:
-            return await llm_request(http, messages, tool_choice={
+            return await llm_request(http, messages, tools=tools, tool_choice={
                 "type": "function", "function": {"name": force}})
         except httpx.HTTPStatusError as e:
             if e.response.status_code != 400 or is_context_overflow(e):
@@ -3312,7 +3374,7 @@ async def llm_request_forcing(http: httpx.AsyncClient, messages: list,
             state.no_tool_choice.add(state.model)
             print(f"[gut] {state.model} rejected tool_choice "
                   f"({force}): {e.response.text[:200]}")
-    return await llm_request(http, messages)
+    return await llm_request(http, messages, tools=tools)
 
 
 def _inject_note(messages: list, text: str) -> None:
@@ -3352,7 +3414,9 @@ async def llm_request(http: httpx.AsyncClient, messages: list,
     """
     payload = {"model": model or state.model, "messages": messages,
                "tools": tools if tools is not None else TOOLS}
-    if tool_choice and payload["tools"]:
+    if tool_choice and any(t["function"]["name"]
+                           == tool_choice["function"]["name"]
+                           for t in payload["tools"]):
         payload["tool_choice"] = tool_choice
     if not payload["tools"]:
         del payload["tools"]  # no tools wanted (compaction) — an empty
@@ -4047,9 +4111,9 @@ def heal_desktop() -> list[str]:
 # (cleanup must never block) and no send_* (the wrap-up already went out).
 JANITOR_NAME = "janitor"
 JANITOR_TOOL_NAMES = {
-    "screenshot", "wait", "list_windows", "focus_window", "left_click",
-    "right_click", "double_click", "mouse_move", "scroll", "type_text",
-    "key", "desktop_tree", "desktop_act", "desktop_click", "task_complete",
+    "screenshot", "wait", "list_windows", "focus_window", "click",
+    "mouse_move", "scroll", "type_text", "key", "desktop_tree",
+    "desktop_act", "desktop_click", "task_complete",
 }
 JANITOR_TOOLS = [t for t in TOOLS
                  if t["function"]["name"] in JANITOR_TOOL_NAMES]
@@ -4275,6 +4339,9 @@ async def agent_loop(conv_id: str, task_text: str,
         state.steps_since_todo = 0
         state.steps_since_compact = 99
         state.url_fail_streak = 0
+        state.dom_seen = False
+        state.tree_seen = False
+        state.tools_shown = set()
         last_tin = 0    # prompt_tokens of the last request — compaction signal
         overflow_retries = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as http:
@@ -4309,7 +4376,7 @@ async def agent_loop(conv_id: str, task_text: str,
                 # is deep with none, or poke a stale one back into view. The
                 # note alone got answered in prose ("Del 1… Del 2…") and
                 # ignored six times over in one run, so the next request
-                # also pins the reply to update_todos — the checklist gets
+                # also pins the reply to plan — the checklist gets
                 # made, not merely suggested.
                 force: str | None = None
                 state.steps_since_todo += 1
@@ -4321,22 +4388,22 @@ async def agent_loop(conv_id: str, task_text: str,
                         note = (
                             f"your checklist hasn't changed in "
                             f"{TODO_REMIND_STEPS} steps — post the updated "
-                            "list now with update_todos (full list, exactly "
+                            "list now with plan (full `steps` list, exactly "
                             "one item in_progress), then carry on.")
                     elif state.plan_shared:
                         note = (
                             f"{TODO_NUDGE_STEPS} steps in and no checklist — "
-                            "post it now with update_todos (full step list, "
+                            "post it now with plan (full `steps` list, "
                             "one item in_progress), then carry on.")
                     else:
                         note = (
                             f"{TODO_NUDGE_STEPS} steps in and no plan — this "
-                            "task has outgrown a quick action. Post your "
-                            "checklist now with update_todos (full step "
-                            "list, one item in_progress); if more than one "
-                            "phase is left, share_plan a short plan too.")
+                            "task has outgrown a quick action. Call plan now "
+                            "with `summary` (a short plan for the user) and "
+                            "`steps` (full checklist, one item in_progress), "
+                            "then carry on.")
                     _inject_note(messages, note)
-                    force = "update_todos"
+                    force = "plan"
 
                 # Step-cap countdown: one heads-up to switch from exploring
                 # to delivering, then task_complete pinned on the last step
@@ -4351,8 +4418,9 @@ async def agent_loop(conv_id: str, task_text: str,
                 prune_tool_results(messages)
                 if cache_friendly():
                     apply_cache_control(messages)
+                tools = tools_for_run(messages)
                 try:
-                    r = await llm_request_forcing(http, messages, force)
+                    r = await llm_request_forcing(http, messages, force, tools)
                 except httpx.HTTPError as e:
                     body = getattr(e.response, "text", "") if hasattr(e, "response") else ""
                     # Context-window overflow: compact and retry rather than
@@ -4438,6 +4506,9 @@ async def agent_loop(conv_id: str, task_text: str,
                         args = json.loads(fn.get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
+                    # A resumed context or a model echoing pre-consolidation
+                    # names still works — left_click → click, etc.
+                    name, args = legacy_call(name, args)
                     # Back-to-back screen actions in one batch were planned
                     # against the same frame — let the last one's effect
                     # render before the next click lands.
