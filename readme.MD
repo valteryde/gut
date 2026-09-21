@@ -161,7 +161,10 @@ reports it via `GET /api/version`.
   screenshots, no CAPTCHA walls, one turn instead of five. `SEARCH_LANG` /
   `SEARCH_REGION` (or per-call `lang`/`region` args) localize search —
   unset follows the container IP's locale, which is wrong for non-English
-  or location-specific queries. When a plain GET returns a thin JS-shell
+  or location-specific queries. Megasearch engines follow the query
+  language (`OPENSERP_ENGINES` pins a list) — Baidu and Yandex only join
+  for their own languages, since they answer a Danish query with Chinese
+  or Russian hits that bury the real ones. When a plain GET returns a thin JS-shell
   page, `fetch_url` re-renders it through openserp's bundled Chrome
   (`/extract`), so JS-heavy sites still read as text. The `browser_*`
   tools stay for what needs a real browser — logins, forms, interactive
@@ -169,11 +172,20 @@ reports it via `GET /api/version`.
 - **Cost controls.** Only the last `SCREENSHOT_HISTORY` frames stay in context
   (older ones become text placeholders), one screenshot is attached per turn
   and skipped when the frame is unchanged, Anthropic-style prompt caching is
-  enabled for `claude`/`anthropic` models, and repeated/no-op actions trigger
-  warnings then a user check-in instead of silently burning steps. Stale
+  enabled for `claude`/`anthropic` models, and stuck runs are caught two
+  ways: an exact call repeated 5 times is disabled, and a *cycle* — a run
+  whose last `AGENT_CYCLE_WINDOW` actions were all repeats of earlier ones,
+  the loop a short repeat counter never sees — has every call in it
+  disabled at once. Each catch spends a rescue toward escalation or a user
+  check-in; a repainted screen no longer resets that count. `open_url`
+  reports the HTTP status and title (guessed 404s get a nudge back to
+  search) and reuses the agent's tab, `scroll` caps `amount` at
+  `SCROLL_MAX_CLICKS`, and `AGENT_WRAP_UP_STEPS` before the step cap the
+  run is told to deliver what it has instead of ending empty-handed. Stale
   tool results — DOM dumps, page text, command output — are truncated to
   `TOOL_RESULT_STUB_CHARS` once older than the newest `TOOL_RESULT_HISTORY`
-  results (the largest recurring re-bill in a long run), auto-attached
+  results (the largest recurring re-bill in a long run) — `web_search`
+  results excepted, they are the run's leads — auto-attached
   frames can be downscaled via `SCREENSHOT_AUTO_PIXELS`, and `AGENT_MAX_USD`
   caps a single run's spend. Compaction and the cleanup janitor can run on
   cheaper models (`COMPACT_MODEL`, `JANITOR_MODEL`).

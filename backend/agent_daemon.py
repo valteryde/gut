@@ -68,13 +68,15 @@ CONFIG_GLOBALS = {
     "AGENT_CONTEXT_LIMIT": "COMPACT_CONTEXT_LIMIT",
     "AGENT_COMPACT_KEEP": "COMPACT_KEEP",
     "AGENT_COMPACT_INPUT_CHARS": "COMPACT_INPUT_MAX_CHARS",
+    "AGENT_CYCLE_WINDOW": "CYCLE_WINDOW",
+    "AGENT_WRAP_UP_STEPS": "WRAP_UP_STEPS",
     "SCREENSHOT_AUTO_PIXELS": "SHOT_AUTO_PIXELS",
     "GUT_UNO_PORT": "UNO_PORT",
 }
 CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "DEFAULT_MODEL", "ESCALATION_MODEL", "ESCALATION_RESCUES",
     "SUBAGENT_MODEL", "SUBAGENT_MAX_STEPS", "SUBAGENT_MAX_CONCURRENT",
-    "COMPACT_MODEL", "JANITOR_MODEL",
+    "COMPACT_MODEL", "JANITOR_MODEL", "SCROLL_MAX_CLICKS",
     "AGENT_MAX_USD", "TOOL_RESULT_HISTORY", "TOOL_RESULT_STUB_CHARS",
     "SCREENSHOT_MAX_EDGE", "SCREENSHOT_MAX_PIXELS", "SCREENSHOT_HISTORY",
     "TODO_REMIND_STEPS", "TODO_NUDGE_STEPS", "TODO_MAX_ITEMS",
@@ -82,7 +84,7 @@ CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "CLICK_A11Y", "CLICK_SNAP_PX", "NORMALIZED_COORD_MODELS",
     "LLM_MAX_RETRIES", "ASK_USER_TIMEOUT", "COMMAND_TIMEOUT",
     "SEND_FILE_MAX_BYTES", "ATTACH_TOTAL_MAX_BYTES",
-    "GUT_CLEANUP", "JANITOR_MAX_STEPS", "OPENSERP_URL",
+    "GUT_CLEANUP", "JANITOR_MAX_STEPS", "OPENSERP_URL", "OPENSERP_ENGINES",
     "SEARCH_LANG", "SEARCH_REGION",
     # Boot-time settings — persisted here, applied by start.sh next boot.
     "RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE", "CDP_PORT",
@@ -154,6 +156,18 @@ SUBAGENT_MODEL = os.environ.get("SUBAGENT_MODEL", "")
 ESCALATION_MODEL = os.environ.get("ESCALATION_MODEL", "")
 # Unstick rescues the run gets on the starting model before switching.
 ESCALATION_RESCUES = int(os.environ.get("ESCALATION_RESCUES", "2"))
+# Stall detection (see StallDetector). The exact-repeat counter only sees
+# the last 10 calls, so a loop longer than that never trips it: a run that
+# cycles through the same 16 dead ends repeats each one once per lap. The
+# cycle detector fires when AGENT_CYCLE_WINDOW acting calls in a row were
+# all seen earlier in the run and disables the whole cycle at once.
+CYCLE_WINDOW = int(os.environ.get("AGENT_CYCLE_WINDOW", "12"))
+# Steps before the cap at which the run is told to stop exploring and
+# deliver what it has — a run cut off mid-research delivers nothing at all.
+WRAP_UP_STEPS = int(os.environ.get("AGENT_WRAP_UP_STEPS", "10"))
+# Wheel clicks per scroll call. Models pass pixel counts at times ("500"),
+# which jumps to the page end and back without ever showing the middle.
+SCROLL_MAX_CLICKS = int(os.environ.get("SCROLL_MAX_CLICKS", "20"))
 # Per-run dollar ceiling — bounds the worst case of a runaway loop. The run
 # stops with an error once its spend passes this; 0 = no cap.
 AGENT_MAX_USD = float(os.environ.get("AGENT_MAX_USD", "0"))
@@ -240,6 +254,11 @@ OPENSERP_URL = os.environ.get("OPENSERP_URL", "").rstrip("/")
 # or location-specific queries. The model can override per call.
 SEARCH_LANG = os.environ.get("SEARCH_LANG", "")
 SEARCH_REGION = os.environ.get("SEARCH_REGION", "")
+# Engines openserp's /mega/search fans out to, comma-separated. Empty =
+# chosen per query language (see _openserp_engines): Baidu answers every
+# query in Chinese whatever `lang` says and Yandex leans Russian, so for a
+# Danish price query they only push the real hits down the list.
+OPENSERP_ENGINES = os.environ.get("OPENSERP_ENGINES", "")
 SHOT_PATH = Path("/tmp/gut_screen.png")
 HOME_DIR = Path(os.environ.get("HOME") or Path.home())
 KEY_FILE = Path(os.environ.get("GUT_KEY_FILE") or HOME_DIR / ".gut_litellm_key")
@@ -345,6 +364,9 @@ Environment:
   open_url or browser_navigate to get somewhere, browser_text to read the
   page's text, browser_dom to list interactive elements as #refs, then
   browser_click / browser_type by ref; browser_eval runs arbitrary JS.
+  Both navigation tools report the HTTP status and title: a 404 means the
+  URL was wrong — go back to web_search, don't try variations of it. Read
+  pages with browser_text/fetch_url, not by scrolling through screenshots.
   Fall back to pixel tools for anything outside the page.
 - LibreOffice Writer, Calc and Impress are installed
   (`libreoffice --writer/--calc/--impress`). office_eval runs Python-UNO
@@ -399,9 +421,11 @@ Talking to the user — act like a teammate, not a live feed:
 Planning — match the effort to the task:
 - Quick one-off actions: just do them — no plan, no checklist.
 - Anything with several distinct phases or likely more than ~15 steps
-  (research-then-write, multi-site collection, install-and-configure): call
-  share_plan once with a concise plan (it posts to the user as a card — no
-  approval needed, keep working), then update_todos with the step list.
+  (research-then-write, multi-site collection, install-and-configure) —
+  and any task that gathers data and then produces a file always counts:
+  call share_plan once with a concise plan (it posts to the user as a card
+  — no approval needed, keep working), then update_todos with the step
+  list, both before you start acting.
   Pass the full list every call, keep exactly one item in_progress, mark
   steps done as you go. When in doubt, share the plan and make the
   checklist — they cost little and the user watches both live. If the
@@ -532,6 +556,13 @@ class AgentState:
             self.shot_size = (1024, 768)
         self.frame_hash: str | None = None  # last frame sent to the model
         self.browser_ws: str | None = None  # CDP ws url of the active page
+        # Consecutive open_url/browser_navigate calls that hit an error
+        # status — the model constructing URLs from memory instead of using
+        # ones a tool returned.
+        self.url_fail_streak = 0
+        # Tabs open before the run started — the user's; open_url never
+        # navigates those away (the cleanup sweep leaves them alone too).
+        self.baseline_tabs: set[str] = set()
         # Last desktop_tree ref map: ref -> a11y path ("app|i,j,...").
         # Stale after any UI change — desktop_tree refreshes it.
         self.a11y_map: dict[int, str] = {}
@@ -560,6 +591,7 @@ class AgentState:
         self.steps_since_todo = 0
         self.steps_since_compact = 99
         self.ctx_limit: dict[str, int] = {}  # model -> max_input_tokens
+        self.no_tool_choice: set[str] = set()  # models that 400 on tool_choice
         # Delivery bookkeeping for the unsent-output nudge at task_complete:
         # run_start marks the current task's beginning; delivered maps an
         # attachment's resolved path -> mtime when the user sent it (cumulative
@@ -1743,14 +1775,68 @@ async def _wait_for_load(ws, timeout: float = 8.0) -> None:
         await asyncio.sleep(0.25)
 
 
+# Outcome of the navigation that just settled: the document's HTTP status
+# (Chrome 109+ exposes it on the navigation timing entry; 0 = unknown), the
+# title and the final URL.
+_PAGE_INFO_JS = r"""
+(() => {
+  const nav = performance.getEntriesByType('navigation')[0];
+  return {status: (nav && nav.responseStatus) || 0,
+          title: (document.title || '').trim().replace(/\s+/g, ' ').slice(0, 120),
+          url: location.href};
+})()
+"""
+
+_URL_GUESS_NOTE = (
+    "That is {n} URLs in a row that don't resolve to a real page. Stop "
+    "constructing URLs from memory — find real ones with web_search and "
+    "open only URLs a tool result gave you (search results, links from "
+    "fetch_url or browser_dom).")
+
+
+async def _navigate(ws, url: str) -> str:
+    """Page.navigate, settle, and say what came back — an error status and
+    the title — so a 404 or an error page lives on in text. The frame that
+    showed it is pruned from context a few steps later; the tool result is
+    what the model still sees when it considers opening the same URL again.
+    Repeated misses add a nudge back to search."""
+    await cdp_send(ws, "Page.enable")
+    nav = await cdp_send(ws, "Page.navigate", {"url": url})
+    err = nav.get("errorText")
+    status, title, final = 0, "", url
+    if not err:
+        await _wait_for_load(ws)
+        try:
+            info = await cdp_eval(ws, _PAGE_INFO_JS) or {}
+        except CDPError:
+            info = {}
+        status = int(info.get("status") or 0)
+        title = str(info.get("title") or "")
+        final = str(info.get("url") or url)
+    if err:
+        out = f"FAILED to load {url}: {err}"
+    else:
+        out = f"opened {url}"
+        if final.rstrip("/") != url.rstrip("/"):
+            out += f" → {final}"
+        if status >= 400:
+            out += f" — HTTP {status}"
+        if title:
+            out += f' — title "{title}"'
+    if err or status >= 400:
+        state.url_fail_streak += 1
+        if state.url_fail_streak >= 2:
+            out += "\n" + _URL_GUESS_NOTE.format(n=state.url_fail_streak)
+    else:
+        state.url_fail_streak = 0
+    return out
+
+
 async def browser_navigate(url: str) -> str:
     await ensure_browser()
     ws_url = await cdp_page_ws_url()
     async with ws_connect(ws_url, max_size=20 * 1024 * 1024) as ws:
-        await cdp_send(ws, "Page.enable")
-        await cdp_send(ws, "Page.navigate", {"url": url})
-        await _wait_for_load(ws)
-    return f"navigated to {url}"
+        return await _navigate(ws, url)
 
 
 async def browser_dom() -> str:
@@ -1816,15 +1902,53 @@ async def browser_eval(expression: str) -> str:
     return str(val)[:4000]
 
 
-async def open_url(url: str) -> str:
-    if await cdp_up():
-        await cdp_page_ws_url(new_tab_url=url)
-        await asyncio.sleep(0.8)
-        return f"opened new tab: {url}"
-    status = await ensure_browser(url)  # launches chrome with the URL as arg
-    state.browser_ws = None  # next browser_* call picks the first page target
-    await asyncio.sleep(0.8)
-    return f"{status}; opened {url}"
+async def _agent_tab() -> tuple[str, str] | None:
+    """(ws url, target id) of a tab this run may navigate away: the active
+    agent tab if it still exists, else any page that isn't one of the user's
+    pre-run tabs. None when there is nothing to reuse."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            targets = (await c.get(f"{CDP_HTTP}/json/list")).json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    ours = [(t["webSocketDebuggerUrl"], t["id"]) for t in targets
+            if t.get("type") == "page" and t.get("id") not in state.baseline_tabs]
+    for ws_url, tid in ours:
+        if ws_url == state.browser_ws:
+            return ws_url, tid
+    return ours[0] if ours else None
+
+
+async def open_url(url: str, new_tab: bool = False) -> str:
+    """Navigate the agent's tab to `url`; a fresh tab only on request or
+    when there is none to reuse (Chrome just launched, or every open tab is
+    the user's). A new tab per call used to leave dozens of pages open by
+    the end of a long run — heavy on a small VPS and slow to screenshot."""
+    launched = await ensure_browser() != "chrome already running"
+    if launched:
+        state.browser_ws = None
+    tab = None
+    if not new_tab:
+        for _ in range(12 if launched else 1):
+            tab = await _agent_tab()  # the first tab trails CDP by a beat
+            if tab or not launched:
+                break
+            await asyncio.sleep(0.25)
+    if tab is None:
+        ws_url = await cdp_page_ws_url(new_tab_url="about:blank")
+    else:
+        ws_url, tid = tab
+        state.browser_ws = ws_url
+        try:  # foreground it so screenshots and the DOM agree
+            async with httpx.AsyncClient(timeout=5) as c:
+                ver = (await c.get(f"{CDP_HTTP}/json/version")).json()
+            async with ws_connect(ver["webSocketDebuggerUrl"]) as bws:
+                await cdp_send(bws, "Target.activateTarget", {"targetId": tid})
+        except (httpx.HTTPError, CDPError, OSError, KeyError):
+            pass
+    async with ws_connect(ws_url, max_size=20 * 1024 * 1024) as ws:
+        out = await _navigate(ws, url)
+    return f"chrome started; {out}" if launched else out
 
 
 # ── Web search & fetch ─────────────────────────────────────────────────────
@@ -1966,6 +2090,20 @@ async def _ddg_search(query: str, lang: str = "", region: str = "") -> list[dict
     return p.results
 
 
+def _openserp_engines(lang: str) -> str:
+    """Engines for /mega/search: the western trio, plus the regional engine
+    only for the languages it actually serves."""
+    if OPENSERP_ENGINES:
+        return OPENSERP_ENGINES
+    engines = ["google", "bing", "duckduckgo"]
+    lang = lang.upper()
+    if lang in ("RU", "UK", "BE", "KK", "KY", "UZ", "TG", "HY", "AZ", "TT"):
+        engines.append("yandex")
+    if lang.startswith("ZH"):
+        engines.append("baidu")
+    return ",".join(engines)
+
+
 async def web_search(query: str, max_results: int = 8,
                      lang: str = "", region: str = "") -> str:
     query = query.strip()
@@ -1977,9 +2115,10 @@ async def web_search(query: str, max_results: int = 8,
     results, backend = [], ""
     if OPENSERP_URL:
         try:
-            # /mega/search fans out to every engine and merges+dedupes —
-            # per-engine blocks (CAPTCHA, rate limits) don't sink the query.
-            params: dict = {"text": query, "limit": n}
+            # /mega/search fans out to the listed engines and merges+dedupes
+            # — per-engine blocks (CAPTCHA, rate limits) don't sink the query.
+            params: dict = {"text": query, "limit": n,
+                            "engines": _openserp_engines(lang)}
             if lang:
                 params["lang"] = lang
             if region:
@@ -2171,7 +2310,10 @@ TOOLS = [
             "coordinate": {"type": "array", "items": {"type": "integer"},
                            "minItems": 2, "maxItems": 2},
             "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-            "amount": {"type": "integer", "description": "scroll clicks, ~3 default"}},
+            "amount": {"type": "integer",
+                       "description": "mouse-wheel clicks, NOT pixels: 3 "
+                                      f"default, ~10 is a screenful, max "
+                                      f"{SCROLL_MAX_CLICKS}"}},
             "required": ["direction"]}}},
     {"type": "function", "function": {
         "name": "type_text", "description": "Type text at the current focus.",
@@ -2226,7 +2368,8 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "browser_navigate",
         "description": "Navigate the current Chrome tab to a URL (starts Chrome "
-                       "with DevTools if it isn't running).",
+                       "with DevTools if it isn't running); returns the HTTP "
+                       "status and title.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"}}, "required": ["url"]}}},
     {"type": "function", "function": {
@@ -2265,11 +2408,18 @@ TOOLS = [
             "expression": {"type": "string"}}, "required": ["expression"]}}},
     {"type": "function", "function": {
         "name": "open_url",
-        "description": "Open a URL in Chrome — new tab if already running, "
-                       "launches Chrome otherwise. Prefer this over clicking "
-                       "the Chrome icon and typing in the address bar.",
+        "description": "Open a URL in Chrome (launches it if needed) in your "
+                       "current tab, replacing the page there; returns the "
+                       "HTTP status and title. Only open URLs a tool result "
+                       "gave you — never construct them. Prefer this over "
+                       "clicking the Chrome icon and typing in the address "
+                       "bar.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}}, "required": ["url"]}}},
+            "url": {"type": "string"},
+            "new_tab": {"type": "boolean",
+                        "description": "open in a new tab and keep the "
+                                       "current page (default false)"}},
+            "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "list_windows",
         "description": "List open windows (id, desktop, title) via wmctrl.",
@@ -2688,13 +2838,19 @@ async def execute_tool(name: str, args: dict,
         elif name == "scroll":
             if args.get("coordinate"):
                 x, y, _ = _pos(args); pyautogui.moveTo(x, y)
-            clicks = int(args.get("amount") or 3)
+            asked = abs(int(args.get("amount") or 3))
+            clicks = max(1, min(asked, SCROLL_MAX_CLICKS))
             direction = args.get("direction", "down")
             if direction in ("up", "down"):
                 pyautogui.scroll(clicks if direction == "up" else -clicks)
             else:
                 pyautogui.hscroll(clicks if direction == "right" else -clicks)
             result = f"scrolled {direction} {clicks}"
+            if asked > clicks:
+                result += (f" — amount is wheel clicks, not pixels; capped "
+                           f"{asked} to {clicks} (~10 clicks is a screenful). "
+                           "To read a whole page use browser_text instead of "
+                           "scrolling.")
         elif name == "type_text":
             result = type_text(str(args.get("text", "")))
             warn = _unfocused_warning()
@@ -2737,7 +2893,8 @@ async def execute_tool(name: str, args: dict,
         elif name == "browser_eval":
             result = await browser_eval(str(args.get("expression", "")))
         elif name == "open_url":
-            result = await open_url(str(args.get("url", "")))
+            result = await open_url(str(args.get("url", "")),
+                                    bool(args.get("new_tab")))
         elif name == "list_windows":
             result = list_windows()
         elif name == "focus_window":
@@ -2873,6 +3030,9 @@ def prune_images(messages: list, keep: int | None = None) -> None:
                               "text": "[earlier image omitted]"})
 
 
+PRUNE_EXEMPT_TOOLS = {"web_search"}
+
+
 def prune_tool_results(messages: list, keep: int | None = None) -> None:
     """Truncate tool results older than the newest `keep` to a stub.
 
@@ -2884,12 +3044,19 @@ def prune_tool_results(messages: list, keep: int | None = None) -> None:
     """
     if keep is None:
         keep = TOOL_RESULT_HISTORY
+    # Search results stay whole: they are the run's leads, small (a numbered
+    # URL list), and a 300-char stub keeps exactly the first hit — a run
+    # once found the right page as result #2, lost it to the stub eight
+    # steps later and never got back to it.
+    exempt = {tc.get("id") for m in messages if m.get("role") == "assistant"
+              for tc in (m.get("tool_calls") or [])
+              if (tc.get("function") or {}).get("name") in PRUNE_EXEMPT_TOOLS}
     seen = 0
     for msg in reversed(messages):
         if msg.get("role") != "tool":
             continue
         seen += 1
-        if seen <= keep:
+        if seen <= keep or msg.get("tool_call_id") in exempt:
             continue
         content = msg.get("content")
         if isinstance(content, str):
@@ -3034,17 +3201,159 @@ def _unstick_note(reason: str) -> str:
 STUCK_ASK_USER = ("I've brainstormed and tried several different approaches "
                   "and I'm still stuck. Any guidance?")
 
+# Tools that only read — re-running them with identical arguments after
+# every change is correct behavior, so they never count as stalling and are
+# never disabled.
+OBSERVE_TOOLS = {"screenshot", "browser_dom", "browser_text", "desktop_tree",
+                 "list_windows", "collect_agent"}
+
+
+class StallDetector:
+    """Loop detection for one run, on tool signatures (name + sorted args).
+
+    Two signals:
+    * exact repeats — the same call 3 times in the last 10 earns a warning,
+      5 times disables that exact call for the rest of the run;
+    * cycles — CYCLE_WINDOW acting calls in a row that were each seen
+      earlier in the run. A long loop (open A, scroll, open B, open C, wait,
+      …) repeats every element once per lap and never trips the repeat
+      counter, yet nothing new is being tried. Every call in the window is
+      disabled at once, so the model has to change approach.
+
+    `rescues` counts the unstick directives spent; the loop escalates or
+    checks in with the user on it. It is not reset by a repainted screen —
+    a cycle changes the screen every step and still goes nowhere.
+    """
+
+    def __init__(self) -> None:
+        self.recent: deque = deque(maxlen=10)
+        self.seen: set[str] = set()
+        # AGENT_CYCLE_WINDOW <= 1 turns cycle detection off.
+        self.novelty: deque | None = (deque(maxlen=CYCLE_WINDOW)
+                                      if CYCLE_WINDOW > 1 else None)
+        self.blocked: set[str] = set()
+        self.rescues = 0
+
+    @staticmethod
+    def signature(name: str, args: dict) -> str:
+        if name in ("ask_user", "task_complete"):
+            return ""
+        return name + " " + json.dumps(args, sort_keys=True, default=str)
+
+    def observe(self, name: str, sig: str) -> tuple[str, bool]:
+        """Record an executed call. Returns (note, stuck): `note` is text
+        to append to the tool result, `stuck` means a rescue was spent."""
+        note, stuck = "", False
+        reads = name in OBSERVE_TOOLS
+        self.recent.append(sig)
+        repeats = sum(1 for s in self.recent if s == sig)
+        if repeats == 3:
+            note = ("WARNING: you've done this exact action 3 times in your "
+                    f"last {len(self.recent)} steps with no progress — "
+                    "switch tactics now.")
+        elif repeats >= 5 and not reads:
+            note = _unstick_note(f"you've repeated this exact action "
+                                 f"{repeats} times with no progress")
+            self.blocked.add(sig)
+            self.recent.clear()
+            stuck = True
+        if not reads and self.novelty is not None:
+            self.novelty.append((sig, sig not in self.seen))
+            self.seen.add(sig)
+            if (len(self.novelty) == self.novelty.maxlen
+                    and not any(new for _, new in self.novelty)):
+                cycle = {s for s, _ in self.novelty}
+                self.blocked |= cycle
+                self.novelty.clear()
+                self.recent.clear()
+                cycle_note = _unstick_note(
+                    f"your last {self.novelty.maxlen} actions were all "
+                    "repeats of things you already did earlier in this run "
+                    f"— you are cycling through {len(cycle)} dead ends. All "
+                    "of them are now disabled")
+                note = (note + "\n" + cycle_note) if note else cycle_note
+                stuck = True
+        if stuck:
+            self.rescues += 1
+        return note, stuck
+
+
+async def spend_rescue(stall: StallDetector, messages: list, conv_id: str,
+                       reason: str) -> str:
+    """After an unstick directive: switch to ESCALATION_MODEL once the
+    starting model has burnt ESCALATION_RESCUES of them, and check in with
+    the user when even that (or no escalation model) leaves the run stuck.
+    Returns a note to append to the tool result, "" when nothing happened."""
+    if (stall.rescues >= ESCALATION_RESCUES
+            and await maybe_escalate(messages, conv_id, reason)):
+        stall.rescues = 0
+        return ""
+    if stall.rescues >= (3 if ESCALATION_MODEL else 2):
+        stall.rescues = 0
+        answer = await ask_user(STUCK_ASK_USER)
+        return f"[user replied]: {answer}"
+    return ""
+
+
+async def llm_request_forcing(http: httpx.AsyncClient, messages: list,
+                              force: str | None) -> httpx.Response:
+    """llm_request with the reply pinned to tool `force` — how the checklist
+    nudge and the final-step task_complete stop being suggestions the model
+    answers in prose. A provider that rejects tool_choice (some OpenRouter
+    routes, Ollama) gets the plain request instead and is remembered, so
+    the 400 is paid once per model, not once per nudge."""
+    if force and state.model not in state.no_tool_choice:
+        try:
+            return await llm_request(http, messages, tool_choice={
+                "type": "function", "function": {"name": force}})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 400 or is_context_overflow(e):
+                raise
+            state.no_tool_choice.add(state.model)
+            print(f"[gut] {state.model} rejected tool_choice "
+                  f"({force}): {e.response.text[:200]}")
+    return await llm_request(http, messages)
+
+
+def _inject_note(messages: list, text: str) -> None:
+    """Put a system-side note where the next request will read it: onto the
+    last tool result or user message, else as a user message of its own."""
+    if messages and messages[-1].get("role") in ("tool", "user"):
+        messages[-1]["content"] = _note(messages[-1]["content"], text)
+    else:
+        messages.append({"role": "user", "content": text})
+
+
+def wrap_up_note(remaining: int) -> str:
+    """Countdown to the step cap: a run that spends its last steps exploring
+    ends with nothing delivered, when a flagged partial result was there
+    for the taking."""
+    if remaining <= 1:
+        return ("FINAL STEP: the run ends after this call. Call task_complete "
+                "now — say what you found, what is unverified or missing, "
+                "and where any files are (send_file first if you have one).")
+    return (f"NOTICE: only {remaining} steps remain before this run is cut "
+            "off. Stop exploring and deliver: write up what you have — mark "
+            "unverified values as estimates — send_file every deliverable, "
+            "then call task_complete. A flagged partial result beats an "
+            "empty run.")
+
 
 async def llm_request(http: httpx.AsyncClient, messages: list,
                       model: str | None = None,
-                      tools: list | None = None) -> httpx.Response:
+                      tools: list | None = None,
+                      tool_choice: dict | None = None) -> httpx.Response:
     """One chat-completion call with retry on transient failures.
 
     A single 429/5xx mid-task used to kill the run and waste all prior spend.
     Retries with backoff; non-retryable 4xx propagates immediately.
+    `tool_choice` pins the reply to one tool (OpenAI shape — LiteLLM
+    translates it for Anthropic/Gemini).
     """
     payload = {"model": model or state.model, "messages": messages,
                "tools": tools if tools is not None else TOOLS}
+    if tool_choice and payload["tools"]:
+        payload["tool_choice"] = tool_choice
     if not payload["tools"]:
         del payload["tools"]  # no tools wanted (compaction) — an empty
                               # array is rejected by some providers
@@ -3928,6 +4237,7 @@ async def agent_loop(conv_id: str, task_text: str,
         # windows and tabs survive. Persisted so a crash mid-run still
         # cleans up at boot.
         baseline = await asyncio.to_thread(capture_baseline)
+        state.baseline_tabs = set(baseline.get("tabs") or [])
         if GUT_CLEANUP:
             await asyncio.to_thread(_persist_baseline, baseline)
         await broadcast({"type": "status", "state": "running",
@@ -3958,18 +4268,17 @@ async def agent_loop(conv_id: str, task_text: str,
         content.append(screenshot_block(force=True))
         messages.append({"role": "user", "content": content})
         done = False
-        recent_sigs, unchanged_streak, stuck_rescues = \
-            deque(maxlen=10), 0, 0
-        blocked_sigs: set[str] = set()
+        stall, unchanged_streak = StallDetector(), 0
         idle_replies = 0
         state.todos = conv_load_todos(conv_id)
         state.plan_shared = False
         state.steps_since_todo = 0
         state.steps_since_compact = 99
+        state.url_fail_streak = 0
         last_tin = 0    # prompt_tokens of the last request — compaction signal
         overflow_retries = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as http:
-            for _ in range(MAX_STEPS):
+            for step in range(MAX_STEPS):
                 while state.paused and not state.stop:
                     await asyncio.sleep(0.4)
                 if state.stop:
@@ -3997,40 +4306,53 @@ async def agent_loop(conv_id: str, task_text: str,
                         await compact_context(http, conv_id, messages)
 
                 # Checklist nudges on long tasks: bootstrap one when the run
-                # is deep with none, or poke a stale one back into view.
-                # Applied onto the last tool result so it lands in the same
-                # request.
+                # is deep with none, or poke a stale one back into view. The
+                # note alone got answered in prose ("Del 1… Del 2…") and
+                # ignored six times over in one run, so the next request
+                # also pins the reply to update_todos — the checklist gets
+                # made, not merely suggested.
+                force: str | None = None
                 state.steps_since_todo += 1
                 threshold = (TODO_REMIND_STEPS if state.todos
                              else TODO_NUDGE_STEPS)
-                if (state.steps_since_todo >= threshold
-                        and messages
-                        and messages[-1].get("role") == "tool"):
+                if state.steps_since_todo >= threshold and messages:
                     state.steps_since_todo = 0
                     if state.todos:
                         note = (
                             f"your checklist hasn't changed in "
-                            f"{TODO_REMIND_STEPS} steps — mark progress via "
-                            "update_todos")
+                            f"{TODO_REMIND_STEPS} steps — post the updated "
+                            "list now with update_todos (full list, exactly "
+                            "one item in_progress), then carry on.")
                     elif state.plan_shared:
                         note = (
                             f"{TODO_NUDGE_STEPS} steps in and no checklist — "
-                            "if the task has multiple phases left, track it "
-                            "with update_todos")
+                            "post it now with update_todos (full step list, "
+                            "one item in_progress), then carry on.")
                     else:
                         note = (
-                            f"{TODO_NUDGE_STEPS} steps in and no plan — if "
-                            "the task has multiple phases left, post "
-                            "share_plan and track it with update_todos")
-                    messages[-1]["content"] = _note(
-                        messages[-1]["content"], note)
+                            f"{TODO_NUDGE_STEPS} steps in and no plan — this "
+                            "task has outgrown a quick action. Post your "
+                            "checklist now with update_todos (full step "
+                            "list, one item in_progress); if more than one "
+                            "phase is left, share_plan a short plan too.")
+                    _inject_note(messages, note)
+                    force = "update_todos"
+
+                # Step-cap countdown: one heads-up to switch from exploring
+                # to delivering, then task_complete pinned on the last step
+                # so a capped run still ends with a summary to the user.
+                remaining = MAX_STEPS - step
+                if WRAP_UP_STEPS > 0 and remaining in (WRAP_UP_STEPS, 1):
+                    _inject_note(messages, wrap_up_note(remaining))
+                    if remaining == 1:
+                        force = "task_complete"
 
                 prune_images(messages)
                 prune_tool_results(messages)
                 if cache_friendly():
                     apply_cache_control(messages)
                 try:
-                    r = await llm_request(http, messages)
+                    r = await llm_request_forcing(http, messages, force)
                 except httpx.HTTPError as e:
                     body = getattr(e.response, "text", "") if hasattr(e, "response") else ""
                     # Context-window overflow: compact and retry rather than
@@ -4125,11 +4447,8 @@ async def agent_loop(conv_id: str, task_text: str,
                     # A call that already earned a STUCK note is a proven
                     # dead-end — refuse to run it again so the model is
                     # forced to change approach instead of ignoring the note.
-                    sig = (name + " " + json.dumps(args, sort_keys=True,
-                                                   default=str)
-                           if name not in ("ask_user", "task_complete")
-                           else "")
-                    if sig and sig in blocked_sigs:
+                    sig = stall.signature(name, args)
+                    if sig and sig in stall.blocked:
                         result, finished = (
                             "BLOCKED: this exact call was already repeated "
                             "with no progress and is disabled for the rest "
@@ -4140,35 +4459,20 @@ async def agent_loop(conv_id: str, task_text: str,
                         acted_on_screen = acted_on_screen \
                             or name in SCREEN_TOOLS
 
-                    # Stall detector: identical tool+args seen several times
-                    # in the recent window — catches loops that interleave
-                    # other actions between repeats (a strictly-consecutive
-                    # counter resets the moment the model does anything else).
+                    # Stall detector: exact repeats within the recent window
+                    # and longer cycles of previously-seen actions — see
+                    # StallDetector. A spent rescue escalates the model or
+                    # checks in with the user once the run has had enough.
                     if sig:
-                        recent_sigs.append(sig)
-                        seen = sum(1 for s in recent_sigs if s == sig)
-                        if seen == 3:
-                            result = _note(result,
-                                "WARNING: you've done this exact action 3 "
-                                f"times in your last {len(recent_sigs)} "
-                                "steps with no progress — switch tactics now.")
-                        elif seen >= 5:
-                            result = _note(result, _unstick_note(
-                                f"you've repeated this exact action {seen} "
-                                "times with no progress"))
-                            recent_sigs.clear()
-                            blocked_sigs.add(sig)
-                            stuck_rescues += 1
-                            if (stuck_rescues >= ESCALATION_RESCUES
-                                    and await maybe_escalate(
-                                        messages, conv_id,
-                                        "kept repeating a dead-end action")):
-                                stuck_rescues = 0
-                            elif stuck_rescues >= (3 if ESCALATION_MODEL else 2):
-                                stuck_rescues = 0
-                                answer = await ask_user(STUCK_ASK_USER)
-                                result = _note(result,
-                                               f"[user replied]: {answer}")
+                        note, stuck = stall.observe(name, sig)
+                        if note:
+                            result = _note(result, note)
+                        if stuck:
+                            note = await spend_rescue(
+                                stall, messages, conv_id,
+                                "kept repeating dead-end actions")
+                            if note:
+                                result = _note(result, note)
 
                     messages.append({
                         "role": "tool",
@@ -4222,21 +4526,19 @@ async def agent_loop(conv_id: str, task_text: str,
                                     f"last {unchanged_streak} actions — they "
                                     "are having no effect"))
                             unchanged_streak = 0
-                            stuck_rescues += 1
-                            if (stuck_rescues >= ESCALATION_RESCUES
-                                    and await maybe_escalate(
-                                        messages, conv_id,
-                                        "actions had no visible effect")):
-                                stuck_rescues = 0
-                            elif stuck_rescues >= (3 if ESCALATION_MODEL else 2):
-                                stuck_rescues = 0
-                                answer = await ask_user(STUCK_ASK_USER)
-                                target["content"] = _note(
-                                    target["content"],
-                                    f"[user replied]: {answer}")
+                            stall.rescues += 1
+                            note = await spend_rescue(
+                                stall, messages, conv_id,
+                                "actions had no visible effect")
+                            if note:
+                                target["content"] = _note(target["content"],
+                                                          note)
+                    # A repainted screen resets the no-effect streak only —
+                    # not the rescue count: a cycle of dead ends changes the
+                    # screen every step and is exactly what the count exists
+                    # to escalate on.
                     elif tool_result_images_ok():
                         unchanged_streak = 0
-                        stuck_rescues = 0
                         content = target["content"]
                         if isinstance(content, str):
                             target["content"] = [
@@ -4248,7 +4550,6 @@ async def agent_loop(conv_id: str, task_text: str,
                         # turn ended on the screenshot tool) — don't double up.
                     else:
                         unchanged_streak = 0
-                        stuck_rescues = 0
                 # Providers that can't read images inside tool results get
                 # this turn's frames — the auto-shot plus any tool-returned
                 # images (screenshot/crop) — as a user message instead.
