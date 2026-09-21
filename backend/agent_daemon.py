@@ -70,6 +70,10 @@ CONFIG_GLOBALS = {
     "AGENT_COMPACT_INPUT_CHARS": "COMPACT_INPUT_MAX_CHARS",
     "AGENT_CYCLE_WINDOW": "CYCLE_WINDOW",
     "AGENT_WRAP_UP_STEPS": "WRAP_UP_STEPS",
+    "AGENT_VERIFY_MAX_REJECTS": "VERIFY_MAX_REJECTS",
+    "AGENT_VERIFY_MIN_CALLS": "VERIFY_MIN_CALLS",
+    "AGENT_VERIFY_INPUT_CHARS": "VERIFY_INPUT_CHARS",
+    "AGENT_VERIFY_RESULT_CHARS": "VERIFY_RESULT_CHARS",
     "SCREENSHOT_AUTO_PIXELS": "SHOT_AUTO_PIXELS",
     "GUT_UNO_PORT": "UNO_PORT",
 }
@@ -77,6 +81,7 @@ CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "DEFAULT_MODEL", "ESCALATION_MODEL", "ESCALATION_RESCUES",
     "SUBAGENT_MODEL", "SUBAGENT_MAX_STEPS", "SUBAGENT_MAX_CONCURRENT",
     "COMPACT_MODEL", "JANITOR_MODEL", "SCROLL_MAX_CLICKS",
+    "AGENT_VERIFY", "VERIFY_MODEL",
     "AGENT_MAX_USD", "TOOL_RESULT_HISTORY", "TOOL_RESULT_STUB_CHARS",
     "SCREENSHOT_MAX_EDGE", "SCREENSHOT_MAX_PIXELS", "SCREENSHOT_HISTORY",
     "TODO_REMIND_STEPS", "TODO_NUDGE_STEPS", "TODO_MAX_ITEMS",
@@ -181,6 +186,25 @@ TOOL_RESULT_STUB_CHARS = int(os.environ.get("TOOL_RESULT_STUB_CHARS", "300"))
 # cleanup pass (must be vision-capable). Empty = use the run's model.
 COMPACT_MODEL = os.environ.get("COMPACT_MODEL", "")
 JANITOR_MODEL = os.environ.get("JANITOR_MODEL", "")
+# Wrap-up verification: before task_complete is accepted, a checker call
+# audits the summary against a ledger of the run's actual tool calls —
+# facts, URLs and "I sent the file" claims no tool result backs get bounced
+# back as a critique instead of reaching the user. VERIFY_MODEL empty =
+# COMPACT_MODEL or the run's model; AGENT_VERIFY=off disables the check.
+AGENT_VERIFY = os.environ.get("AGENT_VERIFY", "on").lower() not in (
+    "off", "0", "false", "no")
+VERIFY_MODEL = os.environ.get("VERIFY_MODEL", "")
+# Rejections one run tolerates before the wrap-up is accepted anyway with
+# the caveats attached to it — a checker that can never be satisfied must
+# not loop the run forever.
+VERIFY_MAX_REJECTS = int(os.environ.get("AGENT_VERIFY_MAX_REJECTS", "2"))
+# Runs with fewer completed tool calls skip the audit — a two-step task has
+# nothing worth cross-checking and the call would be pure latency.
+VERIFY_MIN_CALLS = int(os.environ.get("AGENT_VERIFY_MIN_CALLS", "4"))
+# Ledger budget: head + tail of the call list are kept, the middle drops —
+# the claims under review gather at both ends (early research, late writes).
+VERIFY_INPUT_CHARS = int(os.environ.get("AGENT_VERIFY_INPUT_CHARS", "120000"))
+VERIFY_RESULT_CHARS = int(os.environ.get("AGENT_VERIFY_RESULT_CHARS", "400"))
 # Long-horizon support. When a request's prompt_tokens exceed
 # AGENT_COMPACT_RATIO of the model's context window (max_input_tokens from
 # LiteLLM's /model/info; AGENT_CONTEXT_LIMIT is the fallback when it reports
@@ -427,7 +451,8 @@ Planning — match the effort to the task:
   — it posts to the user as a card, no approval needed, keep working)
   and `steps` (your checklist).
   Pass the full `steps` list every call, keep exactly one item
-  in_progress, mark steps done as you go. When in doubt, post the plan
+  in_progress, mark steps done as you go — task_complete bounces a
+  stale list back, so it ends the run truthful. When in doubt, post the plan
   and checklist — they cost little and the user watches both live. If
   the scope changes, call plan again with a new summary and list.
 - On very long runs your older context gets compacted into a handoff
@@ -595,6 +620,12 @@ class AgentState:
         self.todos: list[dict] = []
         self.plan_shared = False
         self.steps_since_todo = 0
+        # Completion gate: task_complete bounces once while checklist items
+        # are unfinished (todo_nudge_done); the reconcile flag pins the
+        # bounced call's successor to plan so the list gets a real final
+        # update, not just a note it can ignore.
+        self.todo_nudge_done = False
+        self.todo_reconcile = False
         self.steps_since_compact = 99
         self.ctx_limit: dict[str, int] = {}  # model -> max_input_tokens
         self.no_tool_choice: set[str] = set()  # models that 400 on tool_choice
@@ -607,6 +638,11 @@ class AgentState:
         self.delivered: dict[str, float] = {}
         self.sent_files: dict[str, float] = {}
         self.output_nudge_done = False
+        # Wrap-up verification: rejections spent this run, and the last
+        # critique — appended to the done text when the reject cap forces
+        # acceptance, cleared when a summary passes clean.
+        self.verify_rejects = 0
+        self.verify_caveat: str | None = None
 
     @property
     def running(self) -> bool:
@@ -2268,8 +2304,9 @@ TOOLS = [
                        "and kept across context compaction: pass the full "
                        "list every time with exactly one item in_progress "
                        "and mark steps done as you go. Multi-phase tasks: "
-                       "call this before you start acting. Quick one-off "
-                       "actions: skip it.",
+                       "call this before you start acting. task_complete "
+                       "bounces an unfinished checklist — keep it truthful. "
+                       "Quick one-off actions: skip it.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string",
                         "description": "concise plan for the user — first "
@@ -2547,7 +2584,9 @@ TOOLS = [
         "description": "End the task. `summary` is sent to the user as your "
                        "wrap-up message — cover what was done, where results "
                        "live, and anything they should check. send_file any "
-                       "files the user needs first.",
+                       "files the user needs first. Unfinished checklist "
+                       "items or unsent files bounce the call — reconcile "
+                       "and retry.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
@@ -3005,6 +3044,20 @@ async def execute_tool(name: str, args: dict,
             if summary:
                 result = "plan shared with the user; " + result
         elif name == "task_complete":
+            undone = ([i for i in state.todos if i.get("status") != "done"]
+                      if agent is None else [])
+            if undone and not state.todo_nudge_done:
+                state.todo_nudge_done = True
+                state.todo_reconcile = True
+                listing = "\n".join(f"- {i['content']}"
+                                    for i in undone[:10])
+                return (f"checklist still lists {len(undone)} unfinished "
+                        f"item(s):\n{listing}\nPost the final list now with "
+                        "plan (full `steps` — mark done what's done, keep "
+                        "or drop the rest honestly), then finish any real "
+                        "remaining work and call task_complete again. To "
+                        "end with the list as-is, call plan unchanged "
+                        "first."), False
             unsent = unsent_outputs() if agent is None else []
             if unsent and not state.output_nudge_done:
                 state.output_nudge_done = True
@@ -3591,6 +3644,149 @@ def is_context_overflow(e: httpx.HTTPError) -> bool:
     if resp is None or resp.status_code not in (400, 413):
         return False
     return bool(_OVERFLOW_RE.search(resp.text or ""))
+
+
+# ── Wrap-up verification ───────────────────────────────────────────────────
+# The summary is the only thing the user reads, and nothing checked it
+# against what the tools actually did — a confident fabrication sailed
+# straight through. Before task_complete is accepted, one cheap text-only
+# call audits the claim against a ledger of the run's calls; unsupported
+# claims bounce back as a critique the model must fix (or explicitly
+# dispute) and resubmit.
+
+VERIFY_PROMPT = """You audit an autonomous desktop agent's wrap-up message against the log of what its tools actually did and returned. Be strict about facts, generous about style.
+
+The wrap-up PASSES when:
+- every fact stated as certain (numbers, prices, dates, names, URLs, quotes, file contents) appears in the tool log, and
+- every claimed deliverable matches a send_file call or a file the log shows being created, and
+- claimed actions match calls that ran without an error result.
+
+Claims the agent itself flags as unverified, estimated or approximate are fine — flagged doubt is honest. Fail ONLY for material claims stated as fact that the log doesn't support or directly contradicts — never over omissions, tone, or hedged language.
+
+Ledger lines ending "… [truncated]" had their tails cut for length — a claim needing the cut part counts as unsupported.
+
+Reply with exactly one line:
+PASS
+or
+FAIL
+- <unsupported claim> — what the log shows instead (or "nothing in the log supports this")
+- … one short bullet per problem."""
+
+
+def run_ledger(messages: list) -> list[str]:
+    """One line per completed tool call: name(args…) → result head. The
+    evidence the checker audits the wrap-up against — built mechanically,
+    so unlike a self-written summary it can't confabulate."""
+    pending: dict = {}
+    entries: list[str] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                pending[tc.get("id")] = (
+                    fn.get("name", "?"),
+                    str(fn.get("arguments") or "")[:160])
+        elif role == "tool":
+            name, argstr = pending.pop(msg.get("tool_call_id"), ("?", ""))
+            res = msg.get("content")
+            if isinstance(res, list):
+                res = " ".join(str(b.get("text", "")) for b in res
+                               if b.get("type") == "text")
+            res = " ".join(str(res or "").split())
+            entries.append(
+                f"{name}({argstr}) → {res[:VERIFY_RESULT_CHARS]}")
+    return entries
+
+
+def _ledger_window(entries: list[str]) -> str:
+    """Fit the ledger under VERIFY_INPUT_CHARS — keep the run's start and
+    the recent tail, drop the middle."""
+    if sum(len(e) + 1 for e in entries) <= VERIFY_INPUT_CHARS:
+        return "\n".join(entries)
+    half = VERIFY_INPUT_CHARS // 2
+    head, tail, size = [], [], 0
+    for e in entries:
+        if size + len(e) + 1 > half:
+            break
+        head.append(e)
+        size += len(e) + 1
+    rest = entries[len(head):]
+    size = 0
+    for e in reversed(rest):
+        if size + len(e) + 1 > half:
+            break
+        tail.append(e)
+        size += len(e) + 1
+    tail.reverse()
+    omitted = len(rest) - len(tail)
+    mid = [f"[… {omitted} calls omitted …]"] if omitted > 0 else []
+    return "\n".join(head + mid + tail)
+
+
+async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
+                         summary: str, messages: list) -> str | None:
+    """Audit the wrap-up against the run ledger. Returns the critique the
+    model sees as task_complete's tool result, or None to let the
+    completion through — also the fail-open path: a checker that can't
+    reach its model must never wedge a run."""
+    if not AGENT_VERIFY:
+        return None
+    entries = run_ledger(messages)
+    if len(entries) < VERIFY_MIN_CALLS:
+        return None
+    if state.verify_rejects >= VERIFY_MAX_REJECTS:
+        return None  # cap spent — the stored caveat rides the done text
+    # Real user turns are block lists; daemon nudges are plain strings.
+    user_texts = []
+    for m in messages:
+        c = m.get("content")
+        if m.get("role") == "user" and isinstance(c, list):
+            t = " ".join(str(b.get("text", "")) for b in c
+                         if b.get("type") == "text").strip()
+            if t:
+                user_texts.append(t[:1500])
+    users = "\n---\n".join(user_texts)
+    if len(users) > 6000:
+        users = (users[:2500] + "\n[… earlier messages trimmed …]\n"
+                 + users[-3500:])
+    unsent = [str(p) for p in unsent_outputs()]
+    prompt = (
+        "USER MESSAGES (oldest→newest):\n" + (users or "(none)") + "\n\n"
+        "CHECKLIST STATE:\n" + (render_todos(state.todos) or "(none)")
+        + "\n\n"
+        "send_file DELIVERED: " + (", ".join(sorted(state.sent_files))
+                                   or "(none)") + "\n"
+        "files changed this run, NOT delivered: "
+        + (", ".join(unsent[:15]) or "(none)") + "\n\n"
+        "WRAP-UP UNDER REVIEW:\n" + summary + "\n\n"
+        "TOOL LEDGER (oldest→newest):\n" + _ledger_window(entries))
+    try:
+        r = await llm_request(
+            http,
+            [{"role": "system", "content": VERIFY_PROMPT},
+             {"role": "user", "content": prompt}],
+            model=VERIFY_MODEL or COMPACT_MODEL or None, tools=[])
+    except Exception as e:
+        print(f"[gut] verifier call failed, accepting wrap-up: {e}")
+        return None
+    usd, tin, tout = track_cost(r)
+    if conv_id and (usd or tin or tout):
+        conv_add_usage(conv_id, usd, tin, tout)
+    await push_cost()
+    verdict = message_text(r.json()["choices"][0]["message"]).lstrip()
+    if verdict[:4].upper() != "FAIL":
+        state.verify_caveat = None
+        return None
+    state.verify_rejects += 1
+    critique = re.sub(r"^FAIL\w*\s*[:\-]?\s*", "", verdict).strip() or \
+        "claims not supported by the tool log"
+    state.verify_caveat = critique[:1500]
+    return ("VERIFICATION FAILED — the wrap-up states things the tool log "
+            "doesn't back up:\n" + critique[:4000] +
+            "\nFix the flagged claims — re-check them with tools or mark "
+            "them unverified — then call task_complete again. If a flagged "
+            "claim IS in the log, say where in the new summary.")
 
 
 # ── Subagents ─────────────────────────────────────────────────────────────
@@ -4287,6 +4483,10 @@ async def agent_loop(conv_id: str, task_text: str,
     state.run_start = time.time()
     state.sent_files = {}
     state.output_nudge_done = False
+    state.todo_nudge_done = False
+    state.todo_reconcile = False
+    state.verify_rejects = 0
+    state.verify_caveat = None
     state.escalated = False
     run_usd0 = state.session_usd  # session spend baseline for AGENT_MAX_USD
     # One try wraps setup AND the step loop: a crash anywhere in the run is
@@ -4380,29 +4580,44 @@ async def agent_loop(conv_id: str, task_text: str,
                 # made, not merely suggested.
                 force: str | None = None
                 state.steps_since_todo += 1
+                undone = [i for i in state.todos
+                          if i.get("status") != "done"]
                 threshold = (TODO_REMIND_STEPS if state.todos
                              else TODO_NUDGE_STEPS)
                 if state.steps_since_todo >= threshold and messages:
                     state.steps_since_todo = 0
-                    if state.todos:
+                    note = None
+                    if undone:
                         note = (
                             f"your checklist hasn't changed in "
                             f"{TODO_REMIND_STEPS} steps — post the updated "
                             "list now with plan (full `steps` list, exactly "
                             "one item in_progress), then carry on.")
-                    elif state.plan_shared:
-                        note = (
-                            f"{TODO_NUDGE_STEPS} steps in and no checklist — "
-                            "post it now with plan (full `steps` list, "
-                            "one item in_progress), then carry on.")
-                    else:
-                        note = (
-                            f"{TODO_NUDGE_STEPS} steps in and no plan — this "
-                            "task has outgrown a quick action. Call plan now "
-                            "with `summary` (a short plan for the user) and "
-                            "`steps` (full checklist, one item in_progress), "
-                            "then carry on.")
-                    _inject_note(messages, note)
+                    elif not state.todos:
+                        if state.plan_shared:
+                            note = (
+                                f"{TODO_NUDGE_STEPS} steps in and no "
+                                "checklist — post it now with plan (full "
+                                "`steps` list, one item in_progress), then "
+                                "carry on.")
+                        else:
+                            note = (
+                                f"{TODO_NUDGE_STEPS} steps in and no plan — "
+                                "this task has outgrown a quick action. "
+                                "Call plan now with `summary` (a short plan "
+                                "for the user) and `steps` (full checklist, "
+                                "one item in_progress), then carry on.")
+                    # All items done: the list is already truthful — don't
+                    # spend a pinned call re-posting it.
+                    if note:
+                        _inject_note(messages, note)
+                        force = "plan"
+
+                # A bounced task_complete owes the checklist one update —
+                # pin the next reply to plan so ending a run always passes
+                # through a final reconcile, not just a suggestion.
+                if state.todo_reconcile:
+                    state.todo_reconcile = False
                     force = "plan"
 
                 # Step-cap countdown: one heads-up to switch from exploring
@@ -4412,6 +4627,10 @@ async def agent_loop(conv_id: str, task_text: str,
                 if WRAP_UP_STEPS > 0 and remaining in (WRAP_UP_STEPS, 1):
                     _inject_note(messages, wrap_up_note(remaining))
                     if remaining == 1:
+                        # The last call must land — completion nudges it can
+                        # no longer act on must not bounce it.
+                        state.output_nudge_done = True
+                        state.todo_nudge_done = True
                         force = "task_complete"
 
                 prune_images(messages)
@@ -4555,10 +4774,29 @@ async def agent_loop(conv_id: str, task_text: str,
                          if b.get("type") == "text"), "")
                     await broadcast({"type": "action_result", "tool": name,
                                      "result": preview.strip()[:500]})
+                    if finished and name == "task_complete":
+                        critique = await verify_wrap_up(
+                            http, conv_id, str(result), messages)
+                        if critique is not None:
+                            result, finished = critique, False
+                            # The just-appended tool result holds the
+                            # rejected summary — swap it for the critique
+                            # or the model thinks it completed.
+                            messages[-1]["content"] = critique
+                            await broadcast({"type": "agent_msg",
+                                             "text": critique[:600]})
                     if finished:
                         done = True
+                        text = str(result)
+                        if state.verify_caveat:
+                            # Cap the summary so the caveat can't be
+                            # truncated away below — it's the part the
+                            # user most needs to see.
+                            text = (text[:6300] + "\n\n⚠ Checker flagged "
+                                    "claims it couldn't verify in the "
+                                    "tool log:\n" + state.verify_caveat)
                         await broadcast({"type": "done",
-                                         "text": str(result)[:8000]})
+                                         "text": text[:8000]})
                         break
 
                 # One fresh screenshot per turn on the last tool result —

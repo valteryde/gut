@@ -198,6 +198,15 @@ reports it via `GET /api/version`.
   frames can be downscaled via `SCREENSHOT_AUTO_PIXELS`, and `AGENT_MAX_USD`
   caps a single run's spend. Compaction and the cleanup janitor can run on
   cheaper models (`COMPACT_MODEL`, `JANITOR_MODEL`).
+- **Wrap-up check.** Before a `task_complete` summary reaches the user, a
+  checker call (`VERIFY_MODEL`, or `COMPACT_MODEL`/the run's model when
+  unset) audits it against a ledger of the run's actual tool calls —
+  facts, URLs and "I sent the file" claims with no tool result behind them
+  bounce back as a critique the agent must fix or explicitly mark
+  unverified. After `AGENT_VERIFY_MAX_REJECTS` bounces the wrap-up is
+  accepted with the checker's caveats appended; runs shorter than
+  `AGENT_VERIFY_MIN_CALLS` tool calls skip the audit, and
+  `AGENT_VERIFY=off` disables it.
 - **Cost tiering.** Run a cheap `DEFAULT_MODEL` with a premium
   `ESCALATION_MODEL`: a run that gets stuck (`ESCALATION_RESCUES` unstick
   attempts, default 2) or hits provider-side request failures switches
