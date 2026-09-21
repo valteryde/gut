@@ -613,6 +613,8 @@ body[data-agent="running"] #activityLine:not(:empty) {
   .msg.typing .dots::after,
   .msg.typing[data-phase="running"] .typing-text,
   .msg.typing[data-phase="running"] .typing-text.swap,
+  .msg.plan .body,
+  .msg.plan .body.arrive,
   body[data-agent="running"] #activityLine:not(:empty) { animation: none; }
 }
 
@@ -647,15 +649,142 @@ body.verbose .verbose-only { display: grid; }
 }
 .msg.thought .body { font-style: italic; color: var(--text-3); }
 
-/* plan card — the agent's share_plan, kept in the transcript */
+/* plan card — the agent's share_plan, kept in the transcript. A posted
+   artifact: the label column folds away so it spans the full width, an
+   eyebrow header inside carries "PLAN", the summary renders as markdown,
+   and the border is a slow mint↔clay gradient drift. `.arrive` — set only
+   for live events — plays the landing ceremony once. */
+.msg.plan { grid-template-columns: minmax(0, 1fr); }
+.msg.plan .who {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
 .msg.plan .body {
-  padding: 8px 12px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  overflow: hidden;
+  white-space: normal;
+  font-size: 13.5px;
+  background:
+    linear-gradient(var(--surface), var(--surface)) padding-box,
+    linear-gradient(120deg,
+      var(--mint-line), var(--mint), var(--clay-line), var(--mint-line))
+    border-box;
+  background-size: 100% 100%, 320% 100%;
+  animation: aura-flow 7s linear infinite;
+}
+@keyframes aura-flow {
+  to { background-position: 0 0, 320% 0; }
+}
+.msg.plan .body.arrive {
+  animation: aura-flow 7s linear infinite,
+    plan-in 0.4s cubic-bezier(0.2, 0.8, 0.3, 1),
+    glowpop 1.1s ease-out;
+}
+/* a plan re-shared updates the card in place — the ring replays */
+.msg.plan .body.updated {
+  animation: aura-flow 7s linear infinite,
+    glowpop 1.1s ease-out;
+}
+@keyframes plan-in {
+  from { opacity: 0; transform: translateY(8px); }
+}
+@keyframes glowpop {
+  from { box-shadow: 0 0 0 0 rgba(94, 227, 189, 0.55); }
+  to { box-shadow: 0 0 0 14px rgba(94, 227, 189, 0); }
+}
+.msg.plan .phead {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.msg.plan .pico { display: inline-flex; color: var(--mint-ink); }
+.msg.plan .pico svg { width: 13px; height: 13px; }
+.msg.plan .plab {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mint-ink);
+}
+.msg.plan .pmeta {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.msg.plan .pbody { padding: 4px 14px 12px; }
+
+/* rendered plan markdown — quiet paper styling: mono-eyebrow table
+   heads, hairline rules, tabular-nums totals, tint-free code chips */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 5px 0; }
+.md ul, .md ol { margin: 5px 0; padding-left: 18px; }
+.md li { margin: 1px 0; }
+.md li::marker { color: var(--text-3); }
+.md strong { font-weight: 600; }
+.md h1, .md h2, .md h3, .md h4 {
+  margin: 10px 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.md code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: var(--surface-3);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.md pre {
+  margin: 6px 0;
+  padding: 7px 10px;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-left: 2px solid var(--mint);
-  border-radius: var(--radius-card);
-  font-size: 13.5px;
+  border-radius: var(--radius);
+  overflow-x: auto;
 }
+.md pre code { background: none; padding: 0; font-size: 11.5px; }
+.md a { color: var(--mint-ink); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 8px 0; }
+.md blockquote {
+  margin: 6px 0;
+  padding: 1px 0 1px 10px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--text-2);
+}
+.md table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 7px 0 8px;
+  font-size: 12.5px;
+}
+.md th {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  text-align: left;
+  padding: 0 12px 4px 0;
+  border-bottom: 1px solid var(--line-strong);
+}
+.md td { padding: 3px 12px 3px 0; border-bottom: 1px solid var(--line); }
+.md th.num, .md td.num {
+  text-align: right;
+  padding-right: 0;
+  font-variant-numeric: tabular-nums;
+}
+.md tr.tot td { border-bottom: 0; font-weight: 600; padding-top: 5px; }
 
 /* helper card — a spawn_agent's lifecycle in one card: the delegated task
    while it works, its report when done. Agent-side: no label column. */

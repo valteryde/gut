@@ -275,6 +275,8 @@ let lastSeq = 0;                 // highest seq rendered in the transcript
 const queuedSeqs = new Map();    // "conv:seq" -> mode, mirrors the daemon
 const queuedEls = new Map();     // "conv:seq" -> badge element
 const helperCards = new Map();   // helper name -> lifecycle card refs
+let planBody = null;             // the live plan card's body — plan
+                                 // updates rewrite it instead of reposting
 const qkey = (conv, seq) => `${conv}:${seq}`;
 let convFetchId = null;          // conversation currently being refetched
 let pendingLive = [];            // live events arrived during a refetch
@@ -436,6 +438,133 @@ const svgIcon = (inner) =>
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
   inner + '</svg>';
+
+// ── tiny markdown subset for the plan card ────────────────────────────
+// plan.summary arrives as markdown; we render a safe subset — headings,
+// lists, tables, fenced code, quotes, hr — plus inline **bold**,
+// *italic*, `code` and [links]. The source is escaped before anything is
+// parsed, so agent text can never inject markup.
+const mdEsc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function mdInline(s) {
+  let t = mdEsc(s);
+  const codes = [];
+  // stash code spans first so `*` or `_` inside them never parses
+  t = t.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(c);
+    return `\x00${codes.length - 1}\x00`;
+  });
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, href) =>
+    /^(https?:|mailto:)/i.test(href)
+      ? `<a href="${href}" target="_blank" rel="noopener">${txt}</a>`
+      : txt);
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+       .replace(/(^|\W)\*([^*\n]+)\*/g, '$1<em>$2</em>')
+       .replace(/(^|\W)_([^_\n]+)_/g, '$1<em>$2</em>');
+  return t.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[i]}</code>`);
+}
+
+const MD_NUMISH = /^[-–—]?\s*[\d.,]+(?:\s*[a-zA-Z%$€£/]+)?$/;
+
+function mdRender(src) {
+  const lines = String(src || '').replace(/\r/g, '').split('\n');
+  const out = [];
+  let i = 0;
+  let para = [];
+  const flushPara = () => {
+    if (para.length) {
+      out.push(`<p>${para.map(mdInline).join('<br>')}</p>`);
+      para = [];
+    }
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    const trim = line.trim();
+    if (/^```/.test(trim)) {
+      flushPara();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim()))
+        buf.push(lines[i++]);
+      i++;
+      out.push(`<pre><code>${mdEsc(buf.join('\n'))}</code></pre>`);
+      continue;
+    }
+    // table: a | header | row immediately followed by a --- separator row
+    if (trim.startsWith('|') && i + 1 < lines.length &&
+        /^\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) &&
+        lines[i + 1].includes('-')) {
+      flushPara();
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith('|'))
+        rows.push(lines[i++].trim());
+      const cells = (r) =>
+        r.replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+      const head = cells(rows[0]);
+      const bodyRows = rows.slice(2);
+      // a column right-aligns when every data cell looks like a number
+      const numCol = head.map((_, c) => bodyRows.length > 0 &&
+        bodyRows.every((r) => {
+          const v = (cells(r)[c] || '').replace(/\*\*/g, '');
+          return v === '' || /^[-–—]+$/.test(v) || MD_NUMISH.test(v);
+        }));
+      const tag = (t2, c) =>
+        `<${t2}${numCol[c] ? ' class="num"' : ''}>`;
+      out.push('<table><tr>' +
+        head.map((h, c) => `${tag('th', c)}${mdInline(h)}</th>`).join('') +
+        '</tr>' +
+        bodyRows.map((r) => '<tr>' + head.map((_, c) =>
+          `${tag('td', c)}${mdInline(cells(r)[c] || '')}</td>`).join('') +
+          '</tr>').join('') +
+        '</table>');
+      continue;
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)/);
+    if (h) {
+      flushPara();
+      out.push(`<h${h[1].length}>${mdInline(h[2])}</h${h[1].length}>`);
+      i++;
+      continue;
+    }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushPara();
+      out.push('<hr>');
+      i++;
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line)) {
+      flushPara();
+      const ordered = /^\s*\d+[.)]\s+/.test(line);
+      const re = ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/;
+      const items = [];
+      while (i < lines.length && re.test(lines[i]))
+        items.push(lines[i++].replace(re, ''));
+      const t2 = ordered ? 'ol' : 'ul';
+      out.push(`<${t2}>` +
+        items.map((it) => `<li>${mdInline(it)}</li>`).join('') +
+        `</${t2}>`);
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)) {
+      flushPara();
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i]))
+        buf.push(lines[i++].replace(/^\s*>\s?/, ''));
+      out.push(`<blockquote>${buf.map(mdInline).join('<br>')}</blockquote>`);
+      continue;
+    }
+    if (trim === '') {
+      flushPara();
+      i++;
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flushPara();
+  return out.join('');
+}
 
 const FILE_PAGE = '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 ' +
   '0 0 2-2V8z"/><path d="M14 2v6h6"/>';
@@ -845,6 +974,7 @@ const TOOL_ICON = {
 function renderEvent(m, live) {
   switch (m.type) {
     case 'user':
+      planBody = null;  // a new task starts a new plan card
       addUserMsg(m);
       break;
     case 'agent_msg':
@@ -885,9 +1015,42 @@ function renderEvent(m, live) {
     case 'cleanup':
       addVerbose('thought', m.text || '');
       break;
-    case 'plan':
-      addMsg('plan', m.text, `${agentName} · plan`);
+    case 'plan': {
+      // A posted artifact that updates in place — a later `plan` call
+      // rewrites the existing card (and replays the ring) instead of
+      // reposting the whole plan as another message. `.arrive` plays the
+      // landing ceremony — live events only, replayed history appears
+      // already settled.
+      const text = (m.text || '').trim();
+      if (planBody && planBody.isConnected) {
+        const pb = planBody.querySelector('.pbody');
+        if (pb) { pb.innerHTML = mdRender(text); pb.hidden = !text; }
+        const meta = planBody.querySelector('.pmeta');
+        if (meta) meta.textContent = 'updated';
+        if (live) {
+          planBody.classList.remove('updated');
+          void planBody.offsetWidth;
+          planBody.classList.add('updated');
+        }
+        break;
+      }
+      const { body } = entry('plan', agentName);
+      const head = document.createElement('div');
+      head.className = 'phead';
+      head.innerHTML = `<span class="pico">${svgIcon(TICONS.plan)}</span>` +
+        '<span class="plab">Plan</span>' +
+        '<span class="pmeta">shared to chat</span>';
+      body.appendChild(head);
+      if (text) {
+        const pb = document.createElement('div');
+        pb.className = 'pbody md';
+        pb.innerHTML = mdRender(text);
+        body.appendChild(pb);
+      }
+      planBody = body;
+      if (live) body.classList.add('arrive');
       break;
+    }
     case 'compact':
       entry('compact').body.textContent = m.text || 'context compacted';
       break;
@@ -1236,6 +1399,7 @@ function clearTranscript(title) {
   lastEntryKey = null;
   lastSeq = 0;
   helperCards.clear();
+  planBody = null;
   convModel = null;
   awaitingAnswer = false;
   liveStatus = '';

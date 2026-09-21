@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gut — inline chat mockups</title>
+<link rel="stylesheet" href="../client/styles.css">
+<style>
+  /* ── mock scaffolding (not part of the proposals) ─────────── */
+  body { padding: 30px 34px 70px; }
+  h1 { margin: 0 0 4px; font-size: 26px; font-weight: 300; letter-spacing: -0.015em; }
+  .lede { margin: 0 0 6px; color: var(--text-2); max-width: 84ch; }
+  .keys {
+    margin: 0 0 34px; color: var(--text-3); font-size: 12px;
+    display: flex; align-items: center; gap: 18px;
+  }
+  .keys .vtog { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .mock-grid { display: flex; flex-wrap: wrap; gap: 44px 40px; align-items: flex-start; }
+  .mock { width: 480px; flex: none; }
+  .mock > h2 { margin: 0 0 3px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .mock > h2 .tag {
+    margin-left: 7px; padding: 1px 8px; vertical-align: 2px;
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--mint-ink); background: var(--mint-soft);
+    border: 1px solid var(--mint-line); border-radius: 99px;
+  }
+  .mock > h2 .tag.dim { color: var(--text-3); background: var(--surface-2); border-color: var(--line); }
+  .mock > .notes { margin: 0 0 14px; color: var(--text-3); font-size: 12.5px; line-height: 1.5; }
+
+  /* fake chat pane, same width feel as the real one */
+  .pane {
+    width: 480px; height: 620px;
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    overflow: hidden;
+    position: relative;
+  }
+  .mockbar {
+    flex: none; display: flex; align-items: center; gap: 10px;
+    min-height: 50px; padding: 10px 14px 10px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .mockbar .t { font-weight: 500; font-size: 15px; letter-spacing: -0.01em; }
+  .mockbar .s {
+    font-family: var(--mono); font-size: 11.5px; color: var(--text-3);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .mockmsgs {
+    flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px;
+    scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent;
+  }
+
+  /* inert copy of the shipped composer (variant A from composer.html) */
+  .mockform { flex: none; padding: 12px 14px 14px; border-top: 1px solid var(--line); }
+  .mockform textarea {
+    border: 0; background: transparent; height: auto; width: 100%;
+    padding: 11px 12px 4px; line-height: 20px;
+    min-height: 40px; max-height: 160px; resize: none; overflow-y: auto;
+    font: inherit; color: inherit;
+  }
+  .mockform textarea:focus { outline: none; box-shadow: none; }
+
+  /* ══ VARIANT A — timeline rail ═════════════════════════════
+     Every entry hangs on a mint spine down the left edge. Nodes mark
+     the kind of beat; structured entries are raised white cards with
+     an eyebrow header inside instead of a label column outside. */
+  .v-rail .mockmsgs { position: relative; }
+  .v-rail .mockmsgs::before {
+    content: ""; position: absolute; top: 16px; bottom: 16px; left: 21px;
+    width: 1px; background: var(--mint-line);
+  }
+  .v-rail .msg {
+    grid-template-columns: minmax(0, 1fr);
+    position: relative; padding-left: 26px;
+  }
+  .v-rail .msg .who { display: none; }
+  .v-rail .msg::before {
+    content: ""; position: absolute; left: 0; top: 10px;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--surface); border: 1.5px solid var(--line-strong);
+  }
+  .v-rail .msg.user { padding-left: 0; }
+  .v-rail .msg.user::before,
+  .v-rail .msg.compact::before { display: none; }
+  .v-rail .msg.agent::before, .v-rail .msg.file::before {
+    background: var(--mint); border-color: var(--mint);
+  }
+  .v-rail .msg.plan::before, .v-rail .msg.helper::before {
+    background: var(--mint-ink); border-color: var(--mint-ink); border-radius: 2px;
+  }
+  .v-rail .msg.question::before { background: var(--clay); border-color: var(--clay); }
+  .v-rail .msg.error::before { background: var(--bad); border-color: var(--bad); }
+  .v-rail .msg.verbose-only { padding-left: 26px; }
+  .v-rail .msg.verbose-only::before {
+    width: 5px; height: 5px; top: 11px; left: 1px;
+  }
+  .v-rail .msg.typing::before {
+    background: var(--mint); border-color: var(--mint-ink);
+    animation: nodepulse 1.8s ease-out infinite;
+  }
+  @keyframes nodepulse {
+    0% { box-shadow: 0 0 0 0 rgba(94, 227, 189, 0.55); }
+    100% { box-shadow: 0 0 0 7px rgba(94, 227, 189, 0); }
+  }
+
+  /* structured entries float as cards on the rail */
+  .v-rail .msg.plan .body, .v-rail .msg.helper .body,
+  .v-rail .msg.question .body, .v-rail .fcard {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: 0 1px 2px rgba(30, 29, 26, 0.06), 0 6px 18px rgba(30, 29, 26, 0.05);
+  }
+  .v-rail .msg.plan .body, .v-rail .msg.helper .body,
+  .v-rail .msg.question .body { padding: 0; white-space: normal; }
+  .v-rail .msg.question {
+    margin-left: 0; margin-right: 0;
+    padding: 2px 0 2px 26px;
+    border-left: 0; background: none;
+  }
+  .v-rail .msg.question .body {
+    background: var(--clay-soft); border-color: var(--clay-line);
+  }
+  .v-rail .khead {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 10px; border-bottom: 1px solid var(--line);
+  }
+  .v-rail .kico { display: inline-flex; color: var(--mint-ink); }
+  .v-rail .kico svg { width: 13px; height: 13px; }
+  .v-rail .klab {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--mint-ink);
+  }
+  .v-rail .kmeta {
+    margin-left: auto;
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+  }
+  .v-rail .kbody { padding: 8px 12px 10px; font-size: 13.5px; white-space: pre-wrap; }
+  .v-rail .msg.question .khead { border-bottom-color: var(--clay-line); }
+  .v-rail .msg.question .kico, .v-rail .msg.question .klab { color: var(--clay-ink); }
+
+  /* helper card reuses its real head row as the card header */
+  .v-rail .helper-head { padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  .v-rail .helper-task { margin: 0; padding: 8px 12px 2px; }
+  .v-rail .helper-report {
+    margin: 6px 12px 0; padding: 8px 0 10px;
+    border-top: 1px dashed var(--line);
+  }
+
+  .v-rail .msg.error { display: flex; gap: 12px; align-items: baseline; }
+  .v-rail .msg.error .who { display: block; }
+  .v-rail .msg.error .body {
+    font-family: var(--mono); font-size: 12px; color: var(--bad);
+  }
+
+  .v-rail .msg.user .body { border-radius: 10px; box-shadow: 0 1px 2px rgba(156, 74, 41, 0.08); }
+  .v-rail .msg.compact { padding-left: 26px; }
+  .v-rail .msg.typing .body {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 99px; padding: 5px 12px; width: fit-content;
+    box-shadow: 0 1px 2px rgba(30, 29, 26, 0.06);
+  }
+
+  /* ══ VARIANT B — bubbles ═══════════════════════════════════
+     A true chat shape: agent beats in paper-grey left bubbles, you in
+     clay on the right, a small stamped sender line over each beat.
+     Cards keep their meaning but wear tinted headers and pill status. */
+  .v-bub .msg { grid-template-columns: minmax(0, 1fr); }
+  .v-bub .msg .who {
+    position: static; width: auto; height: auto;
+    clip-path: none; overflow: visible;
+    display: flex; align-items: center; gap: 7px;
+    margin: 0 0 3px 4px; color: var(--text-3);
+  }
+  /* the two brand dots as a mini mark on every agent stamp */
+  .v-bub .msg .who::before {
+    content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--mint); box-shadow: 5px 0 0 0 var(--clay);
+    margin-right: 5px;
+  }
+  .v-bub .msg.helper .who, .v-bub .msg.compact .who { display: none; }
+  .v-bub .msg.user { flex-direction: column; align-items: flex-end; }
+  .v-bub .msg.user .who {
+    margin: 0 4px 3px 0; color: var(--clay-ink); flex-direction: row-reverse;
+  }
+  .v-bub .msg.user .who::before { background: var(--clay); box-shadow: none; margin-right: 0; margin-left: 5px; }
+  .v-bub .msg.question .who { color: var(--clay-ink); }
+  .v-bub .msg.question .who::before { background: var(--clay); box-shadow: none; }
+  .v-bub .msg.question .who::after { content: "· needs you"; }
+  .v-bub .msg.error { display: block; }
+  .v-bub .msg.error .who::before { background: var(--bad); box-shadow: none; }
+
+  .v-bub .msg.agent .body {
+    background: var(--surface-2);
+    border-radius: 14px 14px 14px 5px;
+    padding: 7px 12px; width: fit-content; max-width: 88%;
+  }
+  .v-bub .msg.user .body { border-radius: 14px 14px 5px 14px; padding: 7px 13px; }
+
+  .v-bub .msg.plan .body {
+    background: var(--surface); border: 1px solid var(--mint-line);
+    border-left: 1px solid var(--mint-line); border-radius: 14px 14px 14px 5px;
+    padding: 0; overflow: hidden; white-space: normal;
+    width: fit-content; min-width: min(300px, 100%); max-width: 92%;
+  }
+  .v-bub .msg.plan .khead {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 12px; background: var(--mint-soft); color: var(--mint-ink);
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .v-bub .msg.plan .khead svg { width: 13px; height: 13px; }
+  .v-bub .msg.plan .kmeta { margin-left: auto; font-weight: 500; color: var(--mint-ink); opacity: 0.7; }
+  .v-bub .msg.plan .kbody { padding: 8px 12px 10px; font-size: 13.5px; white-space: pre-wrap; }
+
+  .v-bub .msg.helper .body {
+    background: var(--surface); border: 1px solid var(--line);
+    border-left: 1px solid var(--line); border-radius: 14px 14px 14px 5px;
+    padding: 0; overflow: hidden;
+    width: fit-content; min-width: min(300px, 100%); max-width: 92%;
+  }
+  .v-bub .helper-head { padding: 6px 12px; background: var(--mint-soft); }
+  .v-bub .helper-status {
+    background: var(--surface); border: 1px solid var(--mint-line);
+    border-radius: 99px; padding: 0 8px; font-size: 10px;
+  }
+  .v-bub .helper-task { margin: 0; padding: 8px 12px 2px; }
+  .v-bub .helper-report { margin: 0; padding: 4px 12px 10px; }
+
+  .v-bub .msg.question {
+    margin-left: 0; margin-right: 0; padding: 2px 0;
+    border-left: 0; background: none;
+  }
+  .v-bub .msg.question .body {
+    background: var(--clay-soft); border: 1px solid var(--clay-line);
+    border-radius: 14px 14px 14px 5px;
+    padding: 8px 12px; width: fit-content; max-width: 88%;
+    box-shadow: 0 1px 3px rgba(156, 74, 41, 0.10);
+  }
+  .v-bub .msg.question .kfoot {
+    margin-top: 7px; font-family: var(--mono); font-size: 10px;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--clay-ink);
+    opacity: 0.75;
+  }
+
+  .v-bub .msg.error .body {
+    background: var(--bad-bg); border: 1px solid var(--bad-line);
+    border-radius: 14px 14px 14px 5px;
+    padding: 6px 11px; width: fit-content; max-width: 88%;
+    font-size: 13px;
+  }
+  .v-bub .msg.file .body {
+    background: var(--surface-2); border-radius: 14px 14px 14px 5px;
+    padding: 8px 8px 8px; width: fit-content; max-width: 92%;
+  }
+  .v-bub .msg.file .file-note { margin: 0 4px 7px; }
+  .v-bub .fcard { background: var(--surface); }
+
+  .v-bub .msg.compact { justify-content: center; }
+  .v-bub .msg.compact .body {
+    flex: none; margin: 2px auto;
+    background: var(--surface-3); border-radius: 99px;
+    padding: 3px 12px; width: fit-content;
+  }
+  .v-bub .msg.compact .body::before,
+  .v-bub .msg.compact .body::after { display: none; }
+
+  .v-bub .msg.typing .body {
+    background: var(--surface-2); border-radius: 14px 14px 14px 5px;
+    padding: 8px 12px; width: fit-content;
+  }
+  .v-bub .msg.verbose-only { padding-left: 14px; }
+
+  /* ══ VARIANT C — ledger ════════════════════════════════════
+     Boxes removed: every beat is a ruled mono eyebrow over plain text.
+     The only surviving cards are deliveries (things you click). The
+     question keeps its full-bleed clay band — bands, not boxes. */
+  .v-led .msg { grid-template-columns: minmax(0, 1fr); }
+  .v-led .msg:not(.cont):not(:first-child) { margin-top: 18px; }
+  .v-led .msg .who {
+    position: static; width: auto; height: auto;
+    clip-path: none; overflow: visible;
+    display: flex; align-items: center; gap: 9px;
+    margin-bottom: 4px; color: var(--text-3);
+  }
+  .v-led .msg .who::before {
+    content: ""; flex: none; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--mint);
+  }
+  .v-led .msg .who::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+  .v-led .msg .who:empty, .v-led .msg.helper .who,
+  .v-led .msg.typing .who, .v-led .msg.compact .who { display: none; }
+
+  .v-led .msg.user { display: block; }
+  .v-led .msg.user .who { color: var(--clay-ink); }
+  .v-led .msg.user .who::before { background: var(--clay); }
+  .v-led .msg.user .who::after { border-top-color: var(--clay-line); }
+  .v-led .msg.user .body {
+    max-width: none; background: none; border: 0; border-radius: 0;
+    padding: 1px 0 1px 10px; border-left: 2px solid var(--clay);
+  }
+
+  .v-led .msg.plan .who { color: var(--mint-ink); }
+  .v-led .msg.plan .who::after { border-top-color: var(--mint-line); }
+  .v-led .msg.plan .body {
+    background: none; border: 0; border-radius: 0;
+    padding: 1px 0 0; font-size: 14px;
+  }
+
+  .v-led .msg.helper .body {
+    background: none; border: 0; border-radius: 0; padding: 0;
+  }
+  .v-led .helper-head { display: flex; align-items: center; gap: 7px; }
+  .v-led .helper-status {
+    flex: 1; margin-left: 0; display: flex; align-items: center; gap: 9px;
+  }
+  .v-led .helper-status::before { content: ""; flex: 1; border-top: 1px solid var(--line); }
+  .v-led .helper-task { margin-left: 21px; }
+  .v-led .helper-report { margin-left: 21px; }
+
+  .v-led .msg.question .who { color: var(--clay-ink); margin-bottom: 2px; }
+  .v-led .msg.question .who::before { background: var(--clay); }
+  .v-led .msg.question .who::after { border-top-color: var(--clay-line); }
+
+  .v-led .msg.error { display: block; }
+</style>
+</head>
+<body>
+
+<h1>Inline chat — mockups</h1>
+<p class="lede">Four takes on the transcript itself, all running the same scripted
+  beat: your message, a reply, a plan, a helper card, a compaction, a delivered
+  file, a recovered error, a question and the live status row. Panes scroll.</p>
+<p class="keys">
+  <label class="vtog"><input type="checkbox" id="vtog"> verbose log</label>
+  <span>· shows how each style handles the working stream (thoughts + tool calls)</span>
+</p>
+
+<div class="mock-grid">
+
+  <!-- ── baseline ─────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>Current <span class="tag dim">baseline</span></h2>
+    <p class="notes">What ships today: a 76px label column, plain agent text, a
+      clay bubble for you, and left-bordered cards for plan / helper. The
+      question is a full-bleed clay band; compaction is a hairline divider.</p>
+    <div class="pane" data-variant="now">
+      <div class="mockbar"><span class="t">Budget for the 220-person dinner</span><span class="s">GPT · working · 1:42</span></div>
+      <div class="mockmsgs"></div>
+    </div>
+  </section>
+
+  <!-- ── variant A ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>A — Timeline <span class="tag">proposal</span></h2>
+    <p class="notes">A mint spine down the left edge turns the transcript into one
+      continuous timeline: filled dots for messages, squares for cards, clay for
+      questions, red for errors, a pulsing node on the live row. Structured
+      entries become raised white cards with an eyebrow header inside — the
+      label column is gone, so text gets the full width. Most structure of the
+      four; the rail also gives verbose mode a natural dotted-marker stream.</p>
+    <div class="pane v-rail" data-variant="rail">
+      <div class="mockbar"><span class="t">Budget for the 220-person dinner</span><span class="s">GPT · working · 1:42</span></div>
+      <div class="mockmsgs"></div>
+    </div>
+  </section>
+
+  <!-- ── variant B ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>B — Bubbles <span class="tag">proposal</span></h2>
+    <p class="notes">The familiar chat shape: agent beats in paper-grey bubbles on
+      the left, yours in clay on the right, a stamped sender line with the two
+      brand dots over each beat. Plan and helper wear mint header strips with
+      pill status; the question is a clay bubble with a "waiting" footnote;
+      compaction shrinks to a centered chip; the live row is a real typing
+      bubble. Friendliest, but the most conventional — and bubbles cost
+      horizontal space.</p>
+    <div class="pane v-bub" data-variant="bub">
+      <div class="mockbar"><span class="t">Budget for the 220-person dinner</span><span class="s">GPT · working · 1:42</span></div>
+      <div class="mockmsgs"></div>
+    </div>
+  </section>
+
+  <!-- ── variant C ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>C — Ledger <span class="tag">proposal</span></h2>
+    <p class="notes">The opposite move — unbox everything. Each beat is a ruled
+      mono eyebrow ("GPT · plan ──────") over plain text; your messages are
+      clay-tick quotes; the helper collapses to a named, ruled block; the only
+      card left is the file delivery, because it's the one thing you click.
+      The question keeps its full-bleed clay band. Quietest and most
+      paper-native; risk is lower scannability when beats pile up.</p>
+    <div class="pane v-led" data-variant="led">
+      <div class="mockbar"><span class="t">Budget for the 220-person dinner</span><span class="s">GPT · working · 1:42</span></div>
+      <div class="mockmsgs"></div>
+    </div>
+  </section>
+
+</div>
+
+<p class="keys" style="margin-top:44px">Markup note: baseline uses today's DOM
+  verbatim. A adds a header row inside card bodies, B adds sender stamps plus a
+  status pill, C needs no new elements at all — it's purely a stylesheet for the
+  existing tree.</p>
+
+<script>
+const svgIcon = (inner) =>
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  inner + '</svg>';
+
+const ICONS = {
+  plan:   '<path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+  chat:   '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.5 0-3-.4-4.2-1L3 21l2-5.3A8.5 8.5 0 1 1 21 11.5z"/>',
+  helper: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/>',
+  term:   '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6.5 9l3 3-3 3M12 15h5.5"/>',
+  sheet:  '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M3 15h18M10 4v16"/>',
+  clip:   '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  up:     '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  down:   '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>',
+  screen: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M9 20h6M12 16v4"/>',
+};
+
+// the scripted beat every pane renders — same events, different clothes
+const EVENTS = [
+  { t: 'user',
+    text: "Make a budget for the 220-person dinner — pulled pork burgers, coleslaw and oven potatoes — and send me the spreadsheet" },
+  { t: 'agent',
+    text: "On it — I'll price the pork, slaw and potatoes, then export a CSV you can download." },
+  { t: 'plan',
+    text: "Budget til 220 personer med pulled pork burger, coleslaw og hjemmelavede ovnkartofler er lavet. Inkluderer mængder, priser pr. enhed og totalpris, samt et CSV-regneark til download." },
+  { t: 'verbose', kind: 'thought',
+    text: "42 kr/kg undercuts both other quotes — double-checking the bun count before posting" },
+  { t: 'verbose', kind: 'action',
+    text: '▶ run_command {"command": "python3 budget.py --export csv"}' },
+  { t: 'helper', name: 'researcher',
+    task: "Compare pork-shoulder prices across three suppliers",
+    status: "done · 14 steps · $0.0213",
+    report: "Nørrebro Slagteren is cheapest at 42 kr/kg for a 200 kg order — full notes in the report." },
+  { t: 'compact', text: "context compacted · 41 earlier events" },
+  { t: 'file', note: "Here is the spreadsheet:", name: "budget-220.csv", sub: "CSV · 18 KB" },
+  { t: 'error', text: "rate limit on the price API — retried after 30s and continued" },
+  { t: 'question',
+    text: "Pork at 42 kr/kg lands the total at 8,940 kr — inside your 9,000 kr cap. Lock in Nørrebro and send the order?" },
+  { t: 'typing', text: 'running "python3 budget.py"', time: "1:42" },
+];
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+
+// same skeleton as the real entry(): .msg.<cls> > .who + .body
+function entry(cls, who) {
+  const div = el('div', `msg ${cls}`);
+  div.append(el('span', 'who', who), el('div', 'body'));
+  return div;
+}
+
+// card header used by rail + bubbles inside plan/question bodies
+function khead(icon, label, meta) {
+  const h = el('div', 'khead');
+  h.innerHTML = `<span class="kico">${svgIcon(icon)}</span>` +
+    `<span class="klab"></span>` +
+    (meta ? `<span class="kmeta">${meta}</span>` : '');
+  h.querySelector('.klab').textContent = label;
+  return h;
+}
+
+function render(e, v) {
+  switch (e.t) {
+    case 'user': {
+      const d = entry('user', 'You');
+      d.querySelector('.body').textContent = e.text;
+      return d;
+    }
+    case 'agent': {
+      const d = entry('agent', 'GPT');
+      d.querySelector('.body').textContent = e.text;
+      return d;
+    }
+    case 'plan': {
+      const d = entry('plan', 'GPT · plan');
+      const body = d.querySelector('.body');
+      if (v === 'rail' || v === 'bub') {
+        body.append(khead(ICONS.plan, 'Plan', 'shared to chat'), el('div', 'kbody', e.text));
+      } else body.textContent = e.text;
+      return d;
+    }
+    case 'helper': {
+      const d = entry('helper', e.name);
+      d.dataset.state = 'done';
+      d.querySelector('.body').innerHTML =
+        `<div class="helper-head"><span class="helper-icon">${svgIcon(ICONS.helper)}</span>` +
+        `<span class="helper-name"></span><span class="helper-status"></span></div>` +
+        `<div class="helper-task"></div><div class="helper-report"></div>`;
+      d.querySelector('.helper-name').textContent = e.name;
+      d.querySelector('.helper-status').textContent = e.status;
+      d.querySelector('.helper-task').textContent = e.task;
+      d.querySelector('.helper-report').textContent = e.report;
+      return d;
+    }
+    case 'verbose': {
+      const d = entry(`${e.kind} verbose-only`, '');
+      d.querySelector('.body').textContent = e.text;
+      return d;
+    }
+    case 'compact': {
+      const d = entry('compact', '');
+      d.querySelector('.body').textContent = e.text;
+      return d;
+    }
+    case 'file': {
+      const d = entry('file', 'GPT');
+      const body = d.querySelector('.body');
+      body.append(el('p', 'file-note', e.note));
+      const card = el('div', 'fcard k-sheet');
+      card.innerHTML =
+        `<span class="ftile">${svgIcon(ICONS.sheet)}</span>` +
+        `<span class="fmeta"><span class="fname"></span><span class="fsub"></span></span>` +
+        `<span class="facts"><button type="button" class="fbtn">${svgIcon(ICONS.down)}<span>Download</span></button></span>`;
+      card.querySelector('.fname').textContent = e.name;
+      card.querySelector('.fsub').textContent = e.sub;
+      body.append(card);
+      return d;
+    }
+    case 'error': {
+      const d = entry('error', 'Error');
+      d.querySelector('.body').textContent = e.text;
+      return d;
+    }
+    case 'question': {
+      const d = entry('question', v === 'led' ? 'GPT · needs you' : 'GPT');
+      const body = d.querySelector('.body');
+      if (v === 'rail') {
+        body.append(khead(ICONS.chat, 'Needs you'), el('div', 'kbody', e.text));
+      } else {
+        body.append(e.text);
+        if (v === 'bub') body.append(el('div', 'kfoot', 'waiting for your reply'));
+      }
+      return d;
+    }
+    case 'typing': {
+      const d = entry('agent typing', 'GPT');
+      d.dataset.phase = 'running';
+      d.dataset.kind = 'action';
+      const body = d.querySelector('.body');
+      body.innerHTML =
+        `<span class="dots"></span><span class="ticon">${svgIcon(ICONS.term)}</span>` +
+        `<span class="typing-text"></span><span class="ttime"></span>`;
+      body.querySelector('.typing-text').textContent = e.text;
+      body.querySelector('.ttime').textContent = e.time;
+      return d;
+    }
+  }
+}
+
+const COMPOSER = `<form class="mockform" autocomplete="off">
+  <div class="composer-card">
+    <textarea rows="1" placeholder="Describe a task…"></textarea>
+    <div class="composer-bar">
+      <button type="button" class="ibtn" title="Attach files — or drop them anywhere on the chat">${svgIcon(ICONS.clip)}</button>
+      <label class="chip" title="Device"><svg class="ph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS.screen}</svg><select><option>Local docker</option></select></label>
+      <label class="chip grow" title="Model"><svg class="ph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS.helper}</svg><select><option>gpt-5-codex</option></select></label>
+      <span class="model-info">top pick for desktop control · vision ✓</span>
+      <button type="submit" class="sendbtn" title="Send">${svgIcon(ICONS.up)}</button>
+    </div>
+  </div>
+</form>`;
+
+document.querySelectorAll('.pane').forEach((pane) => {
+  const v = pane.dataset.variant;
+  const msgs = pane.querySelector('.mockmsgs');
+  for (const e of EVENTS) msgs.appendChild(render(e, v));
+  pane.insertAdjacentHTML('beforeend', COMPOSER);
+  pane.querySelector('form').addEventListener('submit', (ev) => ev.preventDefault());
+  if (location.search.includes('scrolled')) msgs.scrollTop = msgs.scrollHeight;
+  if (location.search.includes('tall')) {
+    pane.style.height = 'auto';
+    msgs.style.overflow = 'visible';
+  }
+});
+
+const vtog = document.getElementById('vtog');
+vtog.addEventListener('change', () => {
+  document.body.classList.toggle('verbose', vtog.checked);
+});
+if (location.search.includes('verbose')) {
+  vtog.checked = true;
+  document.body.classList.add('verbose');
+}
+</script>
+</body>
+</html>
