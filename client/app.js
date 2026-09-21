@@ -274,6 +274,7 @@ let lastSeq = 0;                 // highest seq rendered in the transcript
 // transcript event carries `queued`, and the badge clears on `dequeue`.
 const queuedSeqs = new Map();    // "conv:seq" -> mode, mirrors the daemon
 const queuedEls = new Map();     // "conv:seq" -> badge element
+const helperCards = new Map();   // helper name -> lifecycle card refs
 const qkey = (conv, seq) => `${conv}:${seq}`;
 let convFetchId = null;          // conversation currently being refetched
 let pendingLive = [];            // live events arrived during a refetch
@@ -378,6 +379,44 @@ function addMsg(cls, text, who = '') {
 // the verbose toggle is on.
 function addVerbose(cls, text) {
   entry(`${cls} verbose-only`).body.textContent = text;
+}
+
+// A spawn_agent's lifecycle as one in-place card: the spawn shows the
+// delegated task, the finish event lands the report on the same card.
+// Keyed by helper name so parallel helpers keep one card each; replaying
+// history rebuilds the same states from the stored running/done events.
+function helperCard(m) {
+  let c = helperCards.get(m.name);
+  if (!c) {
+    const { div, body } = entry('helper', m.name);
+    const head = document.createElement('div');
+    head.className = 'helper-head';
+    const icon = document.createElement('span');
+    icon.className = 'helper-icon';
+    icon.innerHTML = svgIcon(TICONS.helper);
+    const name = document.createElement('span');
+    name.className = 'helper-name';
+    name.textContent = m.name;
+    const status = document.createElement('span');
+    status.className = 'helper-status';
+    head.append(icon, name, status);
+    const task = document.createElement('div');
+    task.className = 'helper-task';
+    const report = document.createElement('div');
+    report.className = 'helper-report';
+    body.append(head, task, report);
+    c = { div, status, task, report };
+    helperCards.set(m.name, c);
+  }
+  c.div.dataset.state = m.state;
+  if (m.task) c.task.textContent = m.task;
+  if (m.state === 'running') c.report.textContent = '';  // reused name, new run
+  if (m.result) c.report.textContent = String(m.result).trim();
+  const bits = [m.state === 'running' ? 'working' : m.state];
+  if (m.state === 'running' && m.model) bits.push(m.model);
+  if (m.steps != null) bits.push(`${m.steps} steps`);
+  if (m.usd) bits.push(`$${Number(m.usd).toFixed(4)}`);
+  c.status.textContent = bits.join(' · ');
 }
 
 function b64ToBlobUrl(b64, mime) {
@@ -839,8 +878,7 @@ function renderEvent(m, live) {
       addVerbose('action', `✓ ${m.agent ? m.agent + '·' : ''}${m.tool}: ${(m.result || '').trim()}`);
       break;
     case 'subagent':
-      addVerbose('action', `◈ ${m.name} ${m.state}` +
-        (m.result ? ` — ${String(m.result).trim()}` : ''));
+      helperCard(m);
       if (live) setLiveStatus(`helper ${m.name} ${m.state}`,
         'action', 'helper');
       break;
@@ -1197,6 +1235,7 @@ function clearTranscript(title) {
   messagesEl.innerHTML = '';
   lastEntryKey = null;
   lastSeq = 0;
+  helperCards.clear();
   convModel = null;
   awaitingAnswer = false;
   liveStatus = '';

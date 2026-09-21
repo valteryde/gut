@@ -657,6 +657,50 @@ body.verbose .verbose-only { display: grid; }
   font-size: 13.5px;
 }
 
+/* helper card — a spawn_agent's lifecycle in one card: the delegated task
+   while it works, its report when done. Agent-side: no label column. */
+.msg.helper { grid-template-columns: minmax(0, 1fr); }
+.msg.helper .who {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.msg.helper .body {
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--mint);
+  border-radius: var(--radius-card);
+  font-size: 13.5px;
+}
+.helper-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--mint-ink);
+}
+.helper-icon { display: flex; }
+.helper-icon svg { width: 14px; height: 14px; }
+.helper-name { font-weight: 600; }
+.helper-status {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+.helper-task { margin-top: 4px; color: var(--text-2); }
+.helper-report { margin-top: 6px; }
+.helper-report:empty { display: none; }
+.msg.helper[data-state="done"] .body { border-left-color: var(--mint-line); }
+.msg.helper[data-state="stopped"] .body { border-left-color: var(--clay); }
+.msg.helper[data-state="stopped"] .helper-head,
+.msg.helper[data-state="stopped"] .helper-status { color: var(--clay-ink); }
+.msg.helper[data-state="error"] .body { border-left-color: var(--bad); }
+.msg.helper[data-state="error"] .helper-head,
+.msg.helper[data-state="error"] .helper-status { color: var(--bad); }
+
 /* compaction divider — marks where older history was summarized away */
 .msg.compact {
   display: flex;

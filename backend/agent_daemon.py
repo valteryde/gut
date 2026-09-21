@@ -522,8 +522,13 @@ Delegating — spawn_agent runs a helper agent in the background:
   no way to reach the user — anything needing eyes, clicks or logins is yours.
 - Its final report arrives as a message mid-run; collect_agent(name) blocks
   until it (or any helper) reports. Share artifacts through files under {home}.
-- Good use: "research these 5 companies" → spawn several and keep working.
-  At most {subcap} helpers run at once.
+- Delegate aggressively. The moment a task has two or more independent
+  research targets, sources to cross-check, or file/data jobs that need no
+  screen, spawn one helper per target and keep the desktop work yourself —
+  "research these 5 companies" means five helpers, not five of your own
+  steps. Doing everything serially yourself is the slow path: if a subtask
+  can run headless while you act, it should be a helper. At most {subcap}
+  helpers run at once.
 """
 
 SUBAGENT_PROMPT = """You are '{name}', a background helper spawned by Gut on a Linux desktop.
@@ -1186,6 +1191,20 @@ async def broadcast(msg: dict) -> None:
         state.clients.discard(ws)
 
 
+async def broadcast_conv(msg: dict, conv_id: str | None) -> None:
+    """Record a transcript event into a specific conversation, then send.
+    Helper events belong to the conversation that spawned the helper — not
+    whatever run (if any) is active when they fire — so they bypass
+    record_event's state.conversation_id tagging."""
+    if (conv_id and msg.get("type") in TRANSCRIPT_TYPES
+            and "seq" not in msg):
+        seq = conv_append_event(conv_id, msg)
+        if seq is not None:
+            msg["conversation_id"] = conv_id
+            msg["seq"] = seq
+    await broadcast(msg)
+
+
 async def push_status() -> None:
     await broadcast({"type": "status", "state": state.phase,
                      "model": state.model,
@@ -1363,16 +1382,21 @@ def type_text(text: str) -> str:
     return f"typed {len(text)} chars"
 
 
-def run_command(command: str, headless: bool = False) -> str:
+def run_command(command: str, headless: bool = False,
+                helper: str = "") -> str:
     # Redirect via a real file, not pipes: a backgrounded child (`foo &`)
     # inherits stdout/stderr, and communicate() would block on pipe EOF until
     # that child exits — a false "still running" timeout for every GUI launch.
     env = None
     if headless:
         # Subagent shell: no display, so GUI launches fail fast instead of
-        # silently hijacking the screen the main agent is using.
+        # silently hijacking the screen the main agent is using. GUT_HELPER
+        # tags the whole process tree so the end-of-run sweep doesn't kill
+        # a still-working helper's processes (see _helper_claimed).
         env = {k: v for k, v in os.environ.items()
                if k not in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY")}
+        if helper:
+            env["GUT_HELPER"] = helper
     fd, out_path = tempfile.mkstemp(prefix="gut-cmd-", suffix=".out")
     try:
         with os.fdopen(fd, "w") as f:
@@ -2359,6 +2383,29 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {
+        "name": "spawn_agent",
+        "description": "Spawn a background helper agent on a self-contained "
+                       "headless subtask — web research, file and data work. "
+                       "It gets web_search, fetch_url, run_command and "
+                       "send_file (no screen, no browser, no user contact) "
+                       "and reports back as a message when done. You keep "
+                       "working meanwhile; collect_agent waits for a report.",
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string",
+                     "description": "complete instructions — the helper sees "
+                                    "only this, not your conversation"},
+            "name": {"type": "string",
+                     "description": "short label, e.g. 'visa-research'"},
+            "model": {"type": "string",
+                      "description": "override model (default: yours)"}},
+            "required": ["task"]}}},
+    {"type": "function", "function": {
+        "name": "collect_agent",
+        "description": "Wait for a spawned helper to finish and return its "
+                       "report. With no name, waits for the next one done.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}}}},
+    {"type": "function", "function": {
         "name": "open_url",
         "description": "Open a URL in Chrome (launches it if needed) in your "
                        "current tab, replacing the page there; returns the "
@@ -2525,29 +2572,6 @@ TOOLS = [
                        "'ctrl+c', 'alt+tab', 'f5', 'tab tab tab'.",
         "parameters": {"type": "object", "properties": {
             "keys": {"type": "string"}}, "required": ["keys"]}}},
-    {"type": "function", "function": {
-        "name": "spawn_agent",
-        "description": "Spawn a background helper agent on a self-contained "
-                       "headless subtask — web research, file and data work. "
-                       "It gets web_search, fetch_url, run_command and "
-                       "send_file (no screen, no browser, no user contact) "
-                       "and reports back as a message when done. You keep "
-                       "working meanwhile; collect_agent waits for a report.",
-        "parameters": {"type": "object", "properties": {
-            "task": {"type": "string",
-                     "description": "complete instructions — the helper sees "
-                                    "only this, not your conversation"},
-            "name": {"type": "string",
-                     "description": "short label, e.g. 'visa-research'"},
-            "model": {"type": "string",
-                      "description": "override model (default: yours)"}},
-            "required": ["task"]}}},
-    {"type": "function", "function": {
-        "name": "collect_agent",
-        "description": "Wait for a spawned helper to finish and return its "
-                       "report. With no name, waits for the next one done.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}}}}},
     {"type": "function", "function": {
         "name": "send_message",
         "description": "Send a chat message to the user. Like a teammate: "
@@ -2753,7 +2777,8 @@ def event_files(saved: list[dict]) -> list[dict]:
             for f in saved]
 
 
-async def send_file(path_str: str, note: str = "") -> str:
+async def send_file(path_str: str, note: str = "",
+                    conv: str | None = None) -> str:
     p = _resolve_path(path_str or "")
     if isinstance(p, str):
         return p
@@ -2762,10 +2787,11 @@ async def send_file(path_str: str, note: str = "") -> str:
         return (f"file is {size / 1e6:.1f} MB — over the "
                 f"{SEND_FILE_MAX_BYTES // int(1e6)} MB send limit; compress it "
                 "or share a smaller artifact")
-    await broadcast({
+    await broadcast_conv({
         "type": "file", "name": p.name, "size": size,
         "mime": mimetypes.guess_type(p.name)[0] or "application/octet-stream",
-        "note": note, "data": base64.b64encode(p.read_bytes()).decode()})
+        "note": note, "data": base64.b64encode(p.read_bytes()).decode()},
+        conv)
     state.sent_files[str(p)] = p.stat().st_mtime
     return f"sent {p.name} ({size} bytes) to the user"
 
@@ -2967,7 +2993,7 @@ async def execute_tool(name: str, args: dict,
             # matters now that helper agents share it with the main loop.
             result = await asyncio.to_thread(
                 run_command, str(args.get("command", "")),
-                agent is not None)
+                agent is not None, agent or "")
         elif name == "web_search":
             result = await web_search(str(args.get("query", "")),
                                       int(args.get("max_results") or 8),
@@ -3017,8 +3043,10 @@ async def execute_tool(name: str, args: dict,
             await broadcast({"type": "agent_msg", "text": text})
             result = "message sent to the user"
         elif name == "send_file":
+            hconv = (state.subagents.get(agent) or {}).get("conv") \
+                if agent else None
             result = await send_file(str(args.get("path", "")),
-                                     str(args.get("note", "")))
+                                     str(args.get("note", "")), conv=hconv)
         elif name == "send_image":
             result = await send_image(args.get("path"),
                                       str(args.get("caption", "")))
@@ -3883,8 +3911,9 @@ async def subagent_loop(name: str, task_text: str, model: str,
             home=HOME_DIR, name=name)},
         {"role": "user", "content": task_text}]
     status, result = "done", "(ended without a report)"
-    await broadcast({"type": "subagent", "name": name, "state": "running",
-                     "model": model, "task": task_text[:300]})
+    await broadcast_conv({"type": "subagent", "name": name,
+                          "state": "running", "model": model,
+                          "task": task_text[:300]}, conv_id)
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(300, connect=30)) as http:
@@ -3913,12 +3942,12 @@ async def subagent_loop(name: str, task_text: str, model: str,
                 messages.append(assistant_to_dict(msg))
                 think = reasoning_text(msg)
                 if think:
-                    await broadcast({"type": "thinking", "text": think,
-                                     "agent": name})
+                    await broadcast_conv({"type": "thinking", "text": think,
+                                          "agent": name}, conv_id)
                 reply = message_text(msg)
                 if reply:
-                    await broadcast({"type": "thought", "text": reply,
-                                     "agent": name})
+                    await broadcast_conv({"type": "thought", "text": reply,
+                                          "agent": name}, conv_id)
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
                     # A plain reply IS the report — no idle nudges here.
@@ -3934,8 +3963,9 @@ async def subagent_loop(name: str, task_text: str, model: str,
                         targs = json.loads(fn.get("arguments") or "{}")
                     except json.JSONDecodeError:
                         targs = {}
-                    await broadcast({"type": "action", "tool": tname,
-                                     "args": targs, "agent": name})
+                    await broadcast_conv({"type": "action", "tool": tname,
+                                          "args": targs, "agent": name},
+                                         conv_id)
                     res, fin = await execute_tool(tname, targs, agent=name)
                     messages.append({"role": "tool",
                                      "tool_call_id": tc.get("id"),
@@ -3943,9 +3973,10 @@ async def subagent_loop(name: str, task_text: str, model: str,
                     prev = res if isinstance(res, str) else next(
                         (b.get("text", "") for b in res
                          if b.get("type") == "text"), "")
-                    await broadcast({"type": "action_result", "tool": tname,
-                                     "result": prev.strip()[:500],
-                                     "agent": name})
+                    await broadcast_conv({"type": "action_result",
+                                          "tool": tname,
+                                          "result": prev.strip()[:500],
+                                          "agent": name}, conv_id)
                     if fin:  # task_complete — the summary is the report
                         result = res if isinstance(res, str) else prev
                         finished = True
@@ -3963,8 +3994,22 @@ async def subagent_loop(name: str, task_text: str, model: str,
     # Even a stopped helper's report is queued — if the run was stopped the
     # drained-on-resume message tells the parent the helper died with it.
     state.subagent_inbox.append(entry)
-    await broadcast({"type": "subagent", "name": name, "state": status,
-                     "result": str(result)[:600], "usd": entry["usd"]})
+    await broadcast_conv({"type": "subagent", "name": name, "state": status,
+                          "result": str(result)[:600], "usd": entry["usd"],
+                          "steps": entry["steps"], "model": model}, conv_id)
+    if conv_id and not (state.running and state.conversation_id == conv_id):
+        # The helper's conversation isn't running — the inbox copy won't
+        # drain into a live context and dies with the daemon. Append the
+        # report to the stored context so the next run sees it even across
+        # a restart (a rare duplicate beats a lost report).
+        try:
+            msgs = conv_load_context(conv_id)
+            if msgs is not None:
+                msgs.append({"role": "user",
+                             "content": subagent_report(name, entry)})
+                conv_save_context(conv_id, msgs)
+        except Exception as e:
+            print(f"[gut] helper report persist failed: {e}")
 
 
 def drain_subagent_inbox(conv_id: str, messages: list) -> None:
@@ -4141,6 +4186,23 @@ def _proc_protected(pid: int) -> bool:
     return any(s in cl for s in PROTECTED_CMDLINES)
 
 
+def _helper_claimed(pid: int) -> bool:
+    """True while pid is tagged GUT_HELPER=<name> (set on helper run_command
+    shells, inherited by their children) and that helper is still running —
+    the sweep must not kill a live helper's processes out from under it.
+    Once the helper reports, its leftovers become fair game again."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    for kv in env.split(b"\0"):
+        k, _, v = kv.partition(b"=")
+        if k == b"GUT_HELPER":
+            e = state.subagents.get(v.decode("utf-8", "replace"))
+            return bool(e and e.get("status") == "running")
+    return False
+
+
 def _window_owners() -> dict[str, int]:
     """window-id -> owner pid via `wmctrl -lp` (0 when unresolvable)."""
     try:
@@ -4201,7 +4263,8 @@ def sweep_desktop(baseline: dict) -> dict:
     def new_procs() -> list[int]:
         return [int(p) for p, s in _snapshot_procs().items()
                 if old_pids.get(p) != s and p != me
-                and not _proc_protected(int(p))]
+                and not _proc_protected(int(p))
+                and not _helper_claimed(int(p))]
 
     for pid in new_procs():
         try:
