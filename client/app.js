@@ -257,6 +257,8 @@ let awaitingAnswer = false;
 let takenOver = false;
 let agentPhase = 'idle';
 let lastEntryKey = null;
+let liveStatus = '';   // freshest thing the agent is doing or thinking
+let liveKind = '';     // 'thought' | 'action' — styles the typing text
 
 // ── conversation state ──────────────────────────────────────────────────
 let conversations = [];          // metas for the active device
@@ -295,13 +297,25 @@ typingText.className = 'typing-text';
 typingBody.append(typingDots, typingText);
 typingEl.append(typingWho, typingBody);
 
+// Ephemeral — never a transcript entry. The freshest activity/thought rides
+// the typing row where the reply will land and echoes in the header's
+// activity line; it's cleared when the run goes idle.
+function setLiveStatus(text, kind) {
+  liveStatus = text;
+  liveKind = kind || '';
+  activityEl.textContent = text;
+  updateTyping();
+}
+
 function updateTyping() {
   const here = activeConvId && agentPhase !== 'idle' &&
     (!runningConvId || runningConvId === activeConvId);
   if (!here) { typingEl.remove(); return; }
   typingWho.textContent = agentName;
   typingEl.dataset.phase = agentPhase;
-  typingText.textContent = STATE_LABEL[agentPhase] || '';
+  typingEl.dataset.kind = liveKind;
+  typingText.textContent = STATE_LABEL[agentPhase] || liveStatus ||
+    (agentPhase === 'running' ? 'working…' : '');
   if (typingEl.parentNode !== messagesEl) messagesEl.appendChild(typingEl);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -655,6 +669,66 @@ function addImageMsg(m) {
   }
 }
 
+// Human-readable one-liner for a tool call — lands in the activity line and
+// the typing row. Args are clipped to a short hint where they help; typed
+// text is never echoed (it can carry secrets).
+const clip = (s, n = 48) => {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+};
+const hostOf = (u) => {
+  try { return new URL(String(u)).hostname.replace(/^www\./, ''); }
+  catch (_) { return ''; }
+};
+const fileBase = (p) => String(p || '').split('/').pop() || 'a file';
+
+const TOOL_STATUS = {
+  screenshot:       () => 'looking at the screen',
+  wait:             (a) => a.seconds ? `waiting ${a.seconds}s` : 'waiting',
+  left_click:       () => 'clicking',
+  middle_click:     () => 'middle-clicking',
+  right_click:      () => 'right-clicking',
+  double_click:     () => 'double-clicking',
+  mouse_move:       () => 'moving the pointer',
+  scroll:           (a) => `scrolling ${a.direction || ''}`.trim(),
+  type_text:        () => 'typing',
+  key:              (a) => a.keys ? `pressing ${clip(a.keys, 20)}`
+                                  : 'pressing keys',
+  run_command:      (a) => a.command ? `running “${clip(a.command, 40)}”`
+                                     : 'running a command',
+  web_search:       (a) => a.query ? `searching the web — “${clip(a.query, 40)}”`
+                                   : 'searching the web',
+  fetch_url:        (a) => `reading ${hostOf(a.url) || 'a page'}`,
+  browser_navigate: (a) => `opening ${hostOf(a.url) || 'a page'}`,
+  open_url:         (a) => `opening ${hostOf(a.url) || 'a page'}`,
+  browser_dom:      () => 'scanning the page',
+  browser_text:     () => 'reading the page',
+  browser_click:    () => 'clicking in the page',
+  browser_type:     () => 'typing in the page',
+  browser_eval:     () => 'running a script in the page',
+  list_windows:     () => 'listing windows',
+  focus_window:     (a) => `focusing ${clip(a.match, 30) || 'a window'}`,
+  desktop_tree:     () => 'reading the window',
+  desktop_act:      () => 'using the interface',
+  desktop_click:    () => 'clicking',
+  desktop_type:     () => 'typing',
+  office_eval:      () => 'editing the document',
+  send_message:     () => 'writing you a note',
+  send_file:        (a) => `sending ${clip(fileBase(a.path), 30)}`,
+  send_image:       () => 'sending an image',
+  ask_user:         () => 'asking you',
+  spawn_agent:      (a) => `delegating to ${clip(a.name, 20) || 'a helper'}`,
+  collect_agent:    () => 'collecting a helper report',
+  share_plan:       () => 'posting a plan',
+  update_todos:     () => 'updating the checklist',
+  task_complete:    () => 'wrapping up',
+};
+
+function toolStatus(m) {
+  const f = TOOL_STATUS[m.tool];
+  return f ? f(m.args || {}) : `using ${m.tool}`;
+}
+
 // One renderer for live events and stored history alike. `live` adds the
 // ephemeral side effects (activity line, pending-question state).
 function renderEvent(m, live) {
@@ -677,10 +751,15 @@ function renderEvent(m, live) {
       break;
     case 'thought':
       addVerbose('thought', `${m.agent ? m.agent + ' · ' : ''}${(m.text || '').trim()}`);
+      // The agent's inner voice, live in the status line — a thought reads
+      // like "checking the totals…", an action like "clicking".
+      if (live) setLiveStatus(
+        `${m.agent ? m.agent + ' · ' : ''}${clip(m.text, 140)}`, 'thought');
       break;
     case 'action':
       addVerbose('action', `▶ ${m.agent ? m.agent + '·' : ''}${m.tool} ${JSON.stringify(m.args)}`);
-      if (live) activityEl.textContent = `${m.agent || agentName} · ▶ ${m.tool}`;
+      if (live) setLiveStatus(
+        `${m.agent ? m.agent + ' · ' : ''}${toolStatus(m)}`, 'action');
       break;
     case 'action_result':
       addVerbose('action', `✓ ${m.agent ? m.agent + '·' : ''}${m.tool}: ${(m.result || '').trim()}`);
@@ -688,7 +767,7 @@ function renderEvent(m, live) {
     case 'subagent':
       addVerbose('action', `◈ ${m.name} ${m.state}` +
         (m.result ? ` — ${String(m.result).trim()}` : ''));
-      if (live) activityEl.textContent = `${agentName} · helper ${m.name} ${m.state}`;
+      if (live) setLiveStatus(`helper ${m.name} ${m.state}`, 'action');
       break;
     case 'cleanup':
       addVerbose('thought', m.text || '');
@@ -727,7 +806,7 @@ function setAgentState(s) {
   document.body.dataset.agent = s;
   stopBtn.hidden = !(s === 'running' || s === 'waiting_user' || s === 'paused');
   steerBtn.hidden = s === 'idle';
-  if (s === 'idle') activityEl.textContent = '';
+  if (s === 'idle') { activityEl.textContent = ''; liveStatus = ''; liveKind = ''; }
   syncPlaceholder();
   updateTyping();
 }
@@ -1032,6 +1111,8 @@ function clearTranscript(title) {
   lastSeq = 0;
   convModel = null;
   awaitingAnswer = false;
+  liveStatus = '';
+  liveKind = '';
   syncPlaceholder();
   convTitleEl.textContent = title || 'New conversation';
   renderTodoCard([]);
@@ -1061,7 +1142,7 @@ async function openConversation(id) {
     const last = c.events[c.events.length - 1];
     if (c.meta.running) {
       if (!runningConvId) runningConvId = id;
-      activityEl.textContent = `${agentName} · working`;
+      setLiveStatus('working…');
       // A question still waiting on a reply restores the pending state.
       if (last && last.type === 'question' && agentPhase === 'waiting_user') {
         awaitingAnswer = true;
@@ -1218,6 +1299,15 @@ function connectChat() {
         // conversation already carries the latest list during a refetch.
         if (m.conversation_id === activeConvId && convFetchId !== activeConvId) {
           renderTodoCard(m.items);
+        }
+        break;
+      case 'thinking':
+        // Model reasoning, broadcast live and never persisted — the
+        // freshest bit of "what it's thinking" rides the typing row.
+        if (runningConvId && runningConvId === activeConvId) {
+          setLiveStatus(
+            `${m.agent ? m.agent + ' · ' : ''}${clip(m.text, 140)}`,
+            'thought');
         }
         break;
       case 'cost':

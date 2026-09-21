@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Device config: non-secret settings live in config.json on the data volume
+# (written by POST /api/config). File values override env defaults — the
+# same precedence pushed provider keys get — so only the boot-time knobs
+# this script consumes are read here.
+GUT_CFG="${GUT_DATA_DIR:-$HOME/.gut}/config.json"
+if [ -f "$GUT_CFG" ]; then
+  eval "$(python3 - "$GUT_CFG" <<'PYEOF'
+import json, re, shlex, sys
+BOOT_KEYS = {"RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE",
+             "LITELLM_URL", "GUT_NOVNC_TLS_PORT", "GUT_HTTP_PORT",
+             "GUT_UVICORN_PORT"}
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for k, v in (cfg.items() if isinstance(cfg, dict) else []):
+    k, v = str(k), str(v)
+    if k in BOOT_KEYS and v:
+        print(f"export {k}={shlex.quote(v)}")
+PYEOF
+)"
+fi
+
 DISPLAY_NUM="${DISPLAY:-:0}"
 RESOLUTION="${RESOLUTION:-1920x1080}"
 LITELLM_URL="${LITELLM_URL:-http://litellm:4000}"

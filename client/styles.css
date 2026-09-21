@@ -532,7 +532,15 @@ main {
 }
 /* non-running phases swap the dots for a text label */
 .msg.typing:not([data-phase="running"]) .dots { display: none; }
-.typing-text { color: var(--text-3); }
+/* live status: a single clipped line — thoughts render italic, actions plain */
+.typing-text {
+  color: var(--text-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg.typing[data-kind="thought"] .typing-text { font-style: italic; }
 .msg.typing[data-phase="waiting_user"] .typing-text,
 .msg.typing[data-phase="paused"] .typing-text { color: var(--clay-ink); }
 .typing-text:empty { display: none; }

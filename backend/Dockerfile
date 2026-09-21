@@ -51,7 +51,8 @@ RUN useradd -m -s /bin/bash -u 1000 agent && \
           "/home/agent/.config/google-chrome/EULA Accepted" \
           "/home/agent/.config/chromium/EULA Accepted" && \
     echo 'agent ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
-    chown -R agent:agent /home/agent
+    chown -R agent:agent /home/agent && \
+    chown -R agent:agent /opt/venv  # built as root above; agent pip-installs into it
 
 # Chromium can't build its sandbox under Docker's default seccomp profile
 # (no unprivileged user namespaces, no setuid helper) — the container is the
@@ -94,8 +95,11 @@ COPY backend/uno_eval.py /opt/gut/uno_eval.py
 COPY backend/wallpaper.png /opt/gut/wallpaper.png
 COPY backend/device_wallpaper.py /opt/gut/device_wallpaper.py
 # soffice/libreoffice launchers get shadowed by a wrapper in /usr/local/bin
-# (ahead of /usr/bin in PATH) that injects the UNO listener — office_eval
-# can then drive the live document no matter how LO was started.
+# (ahead of /usr/bin in PATH) that injects the UNO listener into GUI
+# launches — office_eval can then drive the live document no matter how LO
+# was started. Batch conversions (--convert-to) get a private throwaway
+# profile and no listener instead, so they can't corrupt output by
+# colliding with the running GUI instance.
 COPY packaging/gut-office /usr/local/bin/soffice
 RUN ln -f /usr/local/bin/soffice /usr/local/bin/libreoffice && \
     chmod 755 /usr/local/bin/soffice && \

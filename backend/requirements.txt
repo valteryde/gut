@@ -5,3 +5,8 @@ pyautogui==0.9.54
 python-xlib==0.33
 pillow==11.*
 websockets>=12,<16
+# Agent task tooling, not daemon deps — the system prompt recommends these
+# for producing documents, so bundle them instead of making the agent
+# pip-install at runtime.
+openpyxl==3.1.*
+python-docx==1.*

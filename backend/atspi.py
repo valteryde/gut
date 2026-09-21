@@ -13,12 +13,16 @@ Commands:
   bounds <path>            print "x y w h cx cy" screen bounds
   settext <path> <text>    replace an editable text node's contents
   focus <path>             grab keyboard focus
+  at <x> <y>               JSON report: deepest element containing the screen
+                           point, plus the nearest actionable element — used
+                           to narrate and snap pixel clicks
 
 A <path> is "app-name|i0,i1,..." — child indexes from the application root,
 emitted by `tree`. Paths go stale when the UI changes; re-dump on failure.
 """
 
 import json
+import math
 import sys
 
 try:
@@ -240,6 +244,94 @@ def cmd_focus(path):
           f"{node.getRoleName()} \"{(node.name or '')[:40]}\"")
 
 
+# Containers you click *through*, not *at* — never snap targets, and clicks
+# landing on them are treated as dead space by the caller.
+_CONTAINER_ROLES = {"frame", "window", "dialog", "filler", "viewport",
+                    "scroll pane", "layered pane", "panel", "root pane",
+                    "application", "desktop frame", "tool bar", "menu bar",
+                    "status bar", "menu", "separator", "split pane",
+                    "section", "grouping"}
+
+# How far from the aim point a snap candidate may sit. Clicks that miss by
+# more than this aren't "near misses" — the model aimed at something else.
+_SEARCH_RADIUS = 300
+
+
+def cmd_at(x, y):
+    hit = [None]   # (area, node, path) — smallest SHOWING node at the point
+    near = [None]  # (dist, node, path) — closest actionable node
+    count = [0]
+
+    def scan(node, path, depth):
+        if count[0] >= 800 or depth > MAX_DEPTH:
+            return
+        try:
+            if not _state(node, "STATE_SHOWING"):
+                return
+            nx, ny, nw, nh = _extents(node)
+        except Exception:
+            return
+        count[0] += 1
+        inside = False
+        if nw and nh:
+            # Subtrees whose bounds are nowhere near the point can hold
+            # neither the hit nor a plausible snap candidate — prune them.
+            if not (nx - _SEARCH_RADIUS <= x <= nx + nw + _SEARCH_RADIUS
+                    and ny - _SEARCH_RADIUS <= y <= ny + nh + _SEARCH_RADIUS):
+                return
+            inside = nx <= x < nx + nw and ny <= y < ny + nh
+        if inside and (hit[0] is None or nw * nh < hit[0][0]):
+            hit[0] = (nw * nh, node, path)
+        try:
+            role = (node.getRoleName() or "").lower()
+        except Exception:
+            role = ""
+        if (_actions(node) and role not in _CONTAINER_ROLES
+                and nw and nh):
+            dx = max(nx - x, 0, x - (nx + nw))
+            dy = max(ny - y, 0, y - (ny + nh))
+            dist = math.hypot(dx, dy)
+            if near[0] is None or dist < near[0][0]:
+                near[0] = (dist, node, path)
+        for i in range(node.childCount):
+            try:
+                scan(node.getChildAtIndex(i), f"{path},{i}", depth + 1)
+            except Exception:
+                continue
+
+    for a in _apps():
+        aname = _app_name(a)
+        if aname in ("", "at-spi2-registryd"):
+            continue
+        for i in range(a.childCount):
+            try:
+                scan(a.getChildAtIndex(i), f"{aname}|{i}", 1)
+            except Exception:
+                continue
+
+    def describe(ent):
+        if ent is None:
+            return None
+        _, node, path = ent
+        try:
+            role = node.getRoleName()
+        except Exception:
+            role = "?"
+        try:
+            name = (node.name or "").strip().replace("\n", " ")
+        except Exception:
+            name = ""
+        return {"path": path, "role": role, "name": name[:60],
+                "actions": _actions(node),
+                "editable": _state(node, "STATE_EDITABLE"),
+                "bounds": list(_extents(node))}
+
+    out = {"hit": describe(hit[0]), "near": describe(near[0])}
+    if out["near"] is not None:
+        out["near"]["dist"] = round(near[0][0], 1)
+    print(json.dumps(out))
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "apps":
@@ -254,5 +346,7 @@ if __name__ == "__main__":
         cmd_settext(sys.argv[2], sys.argv[3])
     elif cmd == "focus" and len(sys.argv) > 2:
         cmd_focus(sys.argv[2])
+    elif cmd == "at" and len(sys.argv) > 3:
+        cmd_at(int(sys.argv[2]), int(sys.argv[3]))
     else:
         sys.exit(__doc__.strip())

@@ -50,6 +50,85 @@ try:
 except ImportError:  # running as a package (uvicorn backend.agent_daemon)
     tcpmux = None
 
+# ── Device config store ──────────────────────────────────────────────────
+# Non-secret settings live in config.json on the data volume, managed from
+# the app via POST /api/config — .env is only for bootstrap secrets (master
+# key, db password, device password). File values override env defaults, the
+# same way pushed provider keys win over env keys. Only whitelisted names
+# are honoured, and env vars listed here keep working as boot defaults.
+CONFIG_FILE = (Path(os.environ.get("GUT_DATA_DIR") or Path.home() / ".gut")
+               / "config.json")
+# env name -> module global it maps to (same name when absent). Keys in
+# CONFIG_RESTART also persist but only take effect at the next boot —
+# they feed start.sh (Xvfb size, DPI, ports), not this process.
+CONFIG_GLOBALS = {
+    "AGENT_MAX_STEPS": "MAX_STEPS",
+    "AGENT_IDLE_REPLY_LIMIT": "IDLE_REPLY_LIMIT",
+    "AGENT_COMPACT_RATIO": "COMPACT_RATIO",
+    "AGENT_CONTEXT_LIMIT": "COMPACT_CONTEXT_LIMIT",
+    "AGENT_COMPACT_KEEP": "COMPACT_KEEP",
+    "AGENT_COMPACT_INPUT_CHARS": "COMPACT_INPUT_MAX_CHARS",
+    "SCREENSHOT_AUTO_PIXELS": "SHOT_AUTO_PIXELS",
+    "GUT_UNO_PORT": "UNO_PORT",
+}
+CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
+    "DEFAULT_MODEL", "ESCALATION_MODEL", "ESCALATION_RESCUES",
+    "SUBAGENT_MODEL", "SUBAGENT_MAX_STEPS", "SUBAGENT_MAX_CONCURRENT",
+    "COMPACT_MODEL", "JANITOR_MODEL",
+    "AGENT_MAX_USD", "TOOL_RESULT_HISTORY", "TOOL_RESULT_STUB_CHARS",
+    "SCREENSHOT_MAX_EDGE", "SCREENSHOT_MAX_PIXELS", "SCREENSHOT_HISTORY",
+    "TODO_REMIND_STEPS", "TODO_NUDGE_STEPS", "TODO_MAX_ITEMS",
+    "ACTION_SETTLE_SECS", "INTER_ACTION_DELAY",
+    "CLICK_A11Y", "CLICK_SNAP_PX", "NORMALIZED_COORD_MODELS",
+    "LLM_MAX_RETRIES", "ASK_USER_TIMEOUT", "COMMAND_TIMEOUT",
+    "SEND_FILE_MAX_BYTES", "ATTACH_TOTAL_MAX_BYTES",
+    "GUT_CLEANUP", "JANITOR_MAX_STEPS", "OPENSERP_URL",
+    # Boot-time settings — persisted here, applied by start.sh next boot.
+    "RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE", "CDP_PORT",
+})
+CONFIG_RESTART = frozenset({
+    "RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE", "CDP_PORT",
+    "GUT_UNO_PORT",
+})
+
+
+def load_config_file() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        return {str(k): str(v) for k, v in data.items()
+                if str(k) in CONFIG_KEYS and str(v) != ""}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def store_config_file(cfg: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg))
+    tmp.chmod(0o600)
+    tmp.replace(CONFIG_FILE)
+
+
+# Values the env held before config.json was layered on, so a key removed
+# from the file falls back to the deploy default instead of going blank.
+_ENV_ORIG = {k: os.environ.get(k) for k in CONFIG_KEYS}
+for _k, _v in load_config_file().items():
+    os.environ[_k] = _v
+
+
+def _coerce_like(old, raw: str):
+    """Convert a config string to the type of the existing global."""
+    if isinstance(old, bool):
+        return str(raw).strip().lower() not in ("off", "0", "false", "no")
+    if isinstance(old, int):
+        return int(float(raw))
+    if isinstance(old, float):
+        return float(raw)
+    if isinstance(old, list):
+        return [p for p in str(raw).lower().split(",") if p]
+    return str(raw)
+
+
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://localhost:4000").rstrip("/")
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5")
@@ -68,6 +147,25 @@ COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "60"))
 SUBAGENT_MAX_STEPS = int(os.environ.get("SUBAGENT_MAX_STEPS", "40"))
 SUBAGENT_MAX_CONCURRENT = int(os.environ.get("SUBAGENT_MAX_CONCURRENT", "4"))
 SUBAGENT_MODEL = os.environ.get("SUBAGENT_MODEL", "")
+# Stronger model a struggling run escalates to — pair a cheap DEFAULT_MODEL
+# with a premium ESCALATION_MODEL so easy work stays cheap and only
+# demonstrably-stuck runs pay premium rates. Empty = never escalate.
+ESCALATION_MODEL = os.environ.get("ESCALATION_MODEL", "")
+# Unstick rescues the run gets on the starting model before switching.
+ESCALATION_RESCUES = int(os.environ.get("ESCALATION_RESCUES", "2"))
+# Per-run dollar ceiling — bounds the worst case of a runaway loop. The run
+# stops with an error once its spend passes this; 0 = no cap.
+AGENT_MAX_USD = float(os.environ.get("AGENT_MAX_USD", "0"))
+# Tool outputs older than the newest TOOL_RESULT_HISTORY results shrink to
+# TOOL_RESULT_STUB_CHARS chars — stale DOM dumps and page text are the
+# biggest payloads in history and every request re-bills them.
+TOOL_RESULT_HISTORY = int(os.environ.get("TOOL_RESULT_HISTORY", "8"))
+TOOL_RESULT_STUB_CHARS = int(os.environ.get("TOOL_RESULT_STUB_CHARS", "300"))
+# Auxiliary loops on cheaper models: COMPACT_MODEL summarizes history
+# (text-only — any cheap chat model works), JANITOR_MODEL runs the post-run
+# cleanup pass (must be vision-capable). Empty = use the run's model.
+COMPACT_MODEL = os.environ.get("COMPACT_MODEL", "")
+JANITOR_MODEL = os.environ.get("JANITOR_MODEL", "")
 # Long-horizon support. When a request's prompt_tokens exceed
 # AGENT_COMPACT_RATIO of the model's context window (max_input_tokens from
 # LiteLLM's /model/info; AGENT_CONTEXT_LIMIT is the fallback when it reports
@@ -87,6 +185,27 @@ TODO_MAX_ITEMS = int(os.environ.get("TODO_MAX_ITEMS", "30"))
 SCREENSHOT_MAX_EDGE = int(os.environ.get("SCREENSHOT_MAX_EDGE", "1568"))
 SCREENSHOT_MAX_PIXELS = int(os.environ.get("SCREENSHOT_MAX_PIXELS", "1000000"))
 SCREENSHOT_HISTORY = int(os.environ.get("SCREENSHOT_HISTORY", "3"))
+# Cap auto-attached frames lower than SCREENSHOT_MAX_PIXELS — routine "did
+# it change?" looks don't need full detail; the screenshot tool still
+# returns full-res on demand. 0 = same cap as manual screenshots.
+SHOT_AUTO_PIXELS = int(os.environ.get("SCREENSHOT_AUTO_PIXELS", "0"))
+# Screen actions take effect before the UI finishes repainting — without a
+# pause the post-action screenshot can capture the pre-action frame, which
+# reads as "the click did nothing" and invites a blind re-click into
+# whatever has since appeared. ACTION_SETTLE_SECS is how long we poll for a
+# changed frame before declaring the screen unchanged; INTER_ACTION_DELAY
+# is the minimum gap between consecutive screen-mutating calls in one batch
+# (they were planned against the same frame).
+ACTION_SETTLE_SECS = float(os.environ.get("ACTION_SETTLE_SECS", "1.5"))
+INTER_ACTION_DELAY = float(os.environ.get("INTER_ACTION_DELAY", "0.35"))
+# Pixel-click assist via AT-SPI: every aimed point gets looked up in the
+# a11y tree so the tool result can say what was actually hit, and a point
+# that lands on dead space within CLICK_SNAP_PX of an actionable element
+# snaps to that element's center. CLICK_A11Y=off disables both (clicks then
+# go exactly where aimed with no annotation).
+CLICK_A11Y = os.environ.get("CLICK_A11Y", "on").lower() not in (
+    "off", "0", "false", "no")
+CLICK_SNAP_PX = int(os.environ.get("CLICK_SNAP_PX", "24"))
 # VLMs that emit coordinates on a normalized 0-1000 grid rather than
 # screenshot pixels — Qwen3-VL standardised on this (its ViT rescales
 # inputs internally, so its pixel space is unknowable from our side) and
@@ -228,8 +347,9 @@ Environment:
   `desktop`, `load(path)`, `file_url`, `uno`; set `result` to return a
   value. For producing documents from scratch, prefer writing the file
   directly (python-docx, openpyxl, pandoc, or `soffice --headless
-  -env:UserInstallation=file:///tmp/lo-headless --convert-to pdf out.docx`)
-  and only open the GUI to eyeball the result.
+  --convert-to pdf out.docx` — the soffice wrapper gives batch runs their
+  own profile, so this is safe while the GUI is open) and only open the
+  GUI to eyeball the result.
 - desktop_tree is the native-app equivalent of browser_dom: it dumps the
   focused window's accessibility tree as numbered #refs with role, name,
   actions and bounds. Act on them with desktop_act (press/activate/select
@@ -245,10 +365,12 @@ Environment:
   The text log of your actions stays; call screenshot for a fresh look.
 
 Talking to the user — act like a teammate, not a live feed:
-- The user only sees what you deliberately send via the send_* tools,
-  ask_user and task_complete. Your plain text replies and tool calls go to a
-  verbose log the user can open, but normally doesn't watch — never rely on
-  them to reach the user.
+- Chat messages reach the user only via the send_* tools, ask_user and
+  task_complete — never rely on anything else to reach them.
+- The text you write alongside tool calls flashes in the user's status
+  line as you work (and lands in a verbose log they can open): a short
+  "comparing the quotes…" keeps them oriented. A few words now and then —
+  it's an ephemeral status, not a message.
 - send_message: a short chat update. Use sparingly — a milestone on a long
   task, a blocker, a finding worth flagging. Silence is fine while work is
   straightforward; do not narrate steps.
@@ -275,9 +397,9 @@ Planning — match the effort to the task:
   share_plan once with a concise plan (it posts to the user as a card — no
   approval needed, keep working), then update_todos with the step list.
   Pass the full list every call, keep exactly one item in_progress, mark
-  steps done as you go. When in doubt, make the checklist — it costs little
-  and the user watches it live. If the scope changes, share_plan again and
-  rewrite the list.
+  steps done as you go. When in doubt, share the plan and make the
+  checklist — they cost little and the user watches both live. If the
+  scope changes, share_plan again and rewrite the list.
 - On very long runs your older context gets compacted into a handoff
   summary — the checklist always survives it. Anything else worth keeping
   (paths, URLs, decisions, findings) belongs in the todo text or in files
@@ -300,6 +422,10 @@ Guidelines:
   browser_* tools, a different app entirely) and try the most promising
   untried one. Never keep repeating the same click, and never give up —
   there is almost always another way forward.
+- Click results tell you what element actually sits under the point — read
+  them. "isn't clickable there" or "nothing at that point" means your aim
+  was off or the target isn't a widget; re-aim or switch to desktop_tree
+  #refs instead of clicking the same spot again.
 - type_text and key go to whatever window has focus — if keystrokes aren't
   landing, click the target field first (or use browser_type on web pages).
 - Never click tel:/mailto: links; they're blocked and just pop a dead-end OS
@@ -349,6 +475,11 @@ COORD_PROMPT_PIXEL = ("Tool coordinates refer to pixels in the screenshot "
 COORD_PROMPT_NORM = ("Tool coordinates use a normalized 0-1000 grid over the "
                      "screenshot — [500, 500] is the center of the screen, "
                      "[0, 0] the top-left corner.")
+# Gemini's spatial convention is [y, x] on the 0-1000 grid — telling it to
+# emit [x, y] makes it fight its training, so ask for [y, x] explicitly.
+COORD_PROMPT_NORM_YX = ("Tool coordinates use a normalized 0-1000 grid over "
+                        "the screenshot in [y, x] order — [500, 500] is the "
+                        "center of the screen, [0, 0] the top-left corner.")
 
 
 class AgentState:
@@ -377,6 +508,7 @@ class AgentState:
         self.tokens_in = 0
         self.tokens_out = 0
         self.models_synced = False  # provider keys pushed into LiteLLM
+        self.escalated = False  # run already switched to ESCALATION_MODEL
         # Background helpers: name -> {task, desc, conv, status, result,
         # model, usd, steps, delivered}. Finished entries queue on
         # subagent_inbox for injection into their conversation's context.
@@ -392,6 +524,7 @@ class AgentState:
         # <cid>.todos.json) and the long-horizon bookkeeping for reminders
         # and compaction.
         self.todos: list[dict] = []
+        self.plan_shared = False
         self.steps_since_todo = 0
         self.steps_since_compact = 99
         self.ctx_limit: dict[str, int] = {}  # model -> max_input_tokens
@@ -754,11 +887,14 @@ PROVIDER_MODELS = {
     ],
     "OPENAI_API_KEY": [
         ("gpt-5", "openai/gpt-5"),
+        ("gpt-5-mini", "openai/gpt-5-mini"),
+        ("gpt-4.1-mini", "openai/gpt-4.1-mini"),
         ("gpt-4o", "openai/gpt-4o"),
     ],
     "GEMINI_API_KEY": [
         ("gemini-2.5-pro", "gemini/gemini-2.5-pro"),
         ("gemini-2.5-flash", "gemini/gemini-2.5-flash"),
+        ("gemini-2.5-flash-lite", "gemini/gemini-2.5-flash-lite"),
     ],
     "DEEPSEEK_API_KEY": [
         ("deepseek-chat", "deepseek/deepseek-chat"),
@@ -767,8 +903,16 @@ PROVIDER_MODELS = {
         ("openrouter/claude-sonnet-4.5",
          "openrouter/anthropic/claude-sonnet-4.5"),
         ("openrouter/gpt-5", "openrouter/openai/gpt-5"),
+        ("openrouter/gpt-4.1-mini", "openrouter/openai/gpt-4.1-mini"),
         ("openrouter/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"),
+        ("openrouter/gemini-2.5-flash", "openrouter/google/gemini-2.5-flash"),
+        ("openrouter/gemini-2.5-flash-lite",
+         "openrouter/google/gemini-2.5-flash-lite"),
         ("openrouter/qwen3-vl", "openrouter/qwen/qwen3-vl-235b-a22b-instruct"),
+        ("openrouter/qwen3-vl-30b",
+         "openrouter/qwen/qwen3-vl-30b-a3b-instruct"),
+        # Text-only — cheap SUBAGENT_MODEL, not for driving the desktop.
+        ("openrouter/deepseek-v3.2", "openrouter/deepseek/deepseek-v3.2"),
     ],
 }
 PROVIDER_KEYS = tuple(PROVIDER_MODELS)
@@ -942,12 +1086,13 @@ async def push_status() -> None:
 
 # ── Desktop control ──────────────────────────────────────────────────────────
 
-def capture_frame(region: tuple[int, int, int, int] | None = None
-                  ) -> tuple[str, str]:
+def capture_frame(region: tuple[int, int, int, int] | None = None,
+                  max_pixels: int | None = None) -> tuple[str, str]:
     """Return (base64 JPEG, content hash) of the current screen. `region` is
     a real-pixel (left, upper, right, lower) crop for zoomed detail reads —
     it may be upscaled for legibility and does NOT move the coordinate
-    bookkeeping (clicks keep mapping through the last full frame)."""
+    bookkeeping (clicks keep mapping through the last full frame).
+    `max_pixels` overrides the pixel cap for cheaper low-res auto frames."""
     subprocess.run(["scrot", "-o", str(SHOT_PATH)], check=True)
     img = Image.open(SHOT_PATH).convert("RGB")
     if region:
@@ -961,9 +1106,10 @@ def capture_frame(region: tuple[int, int, int, int] | None = None
     # rescaled space — clicks land off-target. Stay under both limits. Full
     # frames are never enlarged; crops exist to be read, so upscaling a small
     # region is the point (bounded by the same caps).
+    pixels = max_pixels or SCREENSHOT_MAX_PIXELS
     scale = min(
         SCREENSHOT_MAX_EDGE / max(img.size),
-        (SCREENSHOT_MAX_PIXELS / (img.width * img.height)) ** 0.5,
+        (pixels / (img.width * img.height)) ** 0.5,
     )
     scale = min(scale, 8.0) if region else min(scale, 1.0)
     if abs(scale - 1.0) > 1e-3:
@@ -981,8 +1127,12 @@ def capture_frame(region: tuple[int, int, int, int] | None = None
 def screenshot_block(force: bool = False) -> dict | None:
     """Fresh screenshot block, or None if the frame is byte-identical to the
     last one sent (dedup — no point re-billing the model for a static screen).
-    """
-    b64, h = capture_frame()
+
+    Non-forced (auto-attached) frames honor SCREENSHOT_AUTO_PIXELS — a
+    cheaper, lower-res look for routine change checks; force=True keeps the
+    full cap for explicit screenshot calls and run starts."""
+    b64, h = capture_frame(
+        max_pixels=None if force else (SHOT_AUTO_PIXELS or None))
     if not force and h == state.frame_hash:
         return None
     state.frame_hash = h
@@ -998,11 +1148,38 @@ def coords_normalized() -> bool:
     return any(p in m for p in NORMALIZED_COORD_MODELS)
 
 
+def coord_prompt_for(model: str) -> str:
+    """The coordinate-convention blurb baked into the system prompt for a
+    given model."""
+    m = model.lower()
+    if not any(p in m for p in NORMALIZED_COORD_MODELS):
+        return COORD_PROMPT_PIXEL
+    return COORD_PROMPT_NORM_YX if "gemini" in m else COORD_PROMPT_NORM
+
+
+def swap_coord_prompt(messages: list, old_model: str) -> None:
+    """Rewrite the coordinate convention in the stored system prompt after a
+    mid-run model switch — a pixel model escalated from a normalized-grid
+    model (or vice versa) would otherwise aim clicks in the wrong space."""
+    want, old = coord_prompt_for(state.model), coord_prompt_for(old_model)
+    if want == old or not messages:
+        return
+    content = messages[0].get("content")
+    if isinstance(content, str):
+        messages[0]["content"] = content.replace(old, want)
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b.get("text"), str) and old in b["text"]:
+                b["text"] = b["text"].replace(old, want)
+                break
+
+
 def to_real_xy(coord) -> tuple[int, int]:
     x, y = float(coord[0]), float(coord[1])
     if coords_normalized():
-        # gemini-*-computer-use emits [y, x]; everything else is [x, y].
-        if "computer-use" in state.model.lower():
+        # All Gemini variants emit [y, x] on the 0-1000 grid (Google's
+        # spatial convention), not just the computer-use model.
+        if "gemini" in state.model.lower():
             x, y = y, x
         w, h = state.shot_size
         x, y = x * w / 1000, y * h / 1000
@@ -1200,6 +1377,83 @@ def desktop_click(ref) -> str:
         return f"ref {ref} has no on-screen bounds — try desktop_act"
     pyautogui.click(cx, cy)
     return f"clicked ref {ref} at {cx},{cy}"
+
+
+# Roles where the exact pixel matters (cursor placement, drawing, web
+# content) or that are plain containers — clicking them is either
+# deliberate dead-space clicking or a near miss we may snap away from.
+# Snap is only allowed when the hit role is a NEUTRAL container (or
+# nothing was hit at all), so a click inside a document/text/canvas never
+# gets hijacked to a nearby widget.
+_SNAP_NEUTRAL_ROLES = {
+    "", "panel", "filler", "viewport", "layered pane", "scroll pane",
+    "frame", "window", "dialog", "section", "grouping", "unknown",
+    "application", "root pane", "tool bar", "menu bar", "status bar",
+    "menu", "separator", "split pane", "desktop frame",
+}
+
+
+def _a11y_at(x: int, y: int) -> dict | None:
+    """Element report at real screen point (x, y); None when AT-SPI is
+    unreachable — clicks must still work when the a11y bus is down."""
+    if not CLICK_A11Y:
+        return None
+    out = _sys_py(ATSPI_HELPER, "at", str(x), str(y), timeout=15)
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def _a11y_desc(n: dict) -> str:
+    name = (n.get("name") or "").strip()
+    role = n.get("role") or "element"
+    return f'{role} "{name[:40]}"' if name else role
+
+
+def _snap_target(hit: dict | None, near: dict | None) -> dict | None:
+    """The nearby element to snap a missed click to — only for near misses
+    onto dead space, never for clicks inside content where position matters
+    and never onto giant container-level widgets."""
+    if not near or near.get("dist", 1e9) > CLICK_SNAP_PX:
+        return None
+    b = near.get("bounds") or [0, 0, 0, 0]
+    if not (b[2] and b[3]) or max(b[2], b[3]) > 600:
+        return None
+    if hit is not None \
+            and (hit.get("role") or "").lower() not in _SNAP_NEUTRAL_ROLES:
+        return None
+    return near
+
+
+def _click_at(args, button: str = "left", double: bool = False) -> str:
+    """Pixel click with a11y grounding: reports what sits under the aim
+    point, and snaps to a nearby actionable element when the aim landed on
+    dead space just beside it."""
+    x, y, pos = _pos(args)
+    tx, ty, note = x, y, ""
+    info = _a11y_at(x, y)
+    if info is not None:
+        hit, near = info.get("hit"), info.get("near")
+        if hit and (hit.get("actions") or hit.get("editable")):
+            note = f" — on {_a11y_desc(hit)}"
+        elif (snap := _snap_target(hit, near)) is not None:
+            bx, by, bw, bh = snap["bounds"]
+            tx, ty = bx + bw // 2, by + bh // 2
+            aim = _a11y_desc(hit) if hit else "empty space"
+            note = f" — aimed at {aim}; snapped to {_a11y_desc(snap)}"
+        elif hit:
+            note = (f" — {_a11y_desc(hit)} isn't clickable there; if that "
+                    "was a miss, desktop_tree gives actionable #refs")
+        else:
+            note = " — nothing at that point"
+    if double:
+        pyautogui.doubleClick(tx, ty)
+        return f"double-clicked {pos}{note}"
+    pyautogui.click(tx, ty, button=button)
+    verb = {"left": "left-clicked", "right": "right-clicked",
+            "middle": "middle-clicked"}[button]
+    return f"{verb} {pos}{note}"
 
 
 def desktop_type(ref, text: str) -> str:
@@ -2311,20 +2565,20 @@ async def execute_tool(name: str, args: dict,
                 slept += step
             result = f"waited {slept:.1f}s"
         elif name == "left_click":
-            x, y, pos = _pos(args); pyautogui.click(x, y)
-            result = f"left-clicked {pos}"
+            result = await asyncio.to_thread(_click_at, args)
         elif name == "right_click":
-            x, y, pos = _pos(args); pyautogui.click(x, y, button="right")
-            result = f"right-clicked {pos}"
+            result = await asyncio.to_thread(_click_at, args, "right")
         elif name == "middle_click":
-            x, y, pos = _pos(args); pyautogui.click(x, y, button="middle")
-            result = f"middle-clicked {pos}"
+            result = await asyncio.to_thread(_click_at, args, "middle")
         elif name == "double_click":
-            x, y, pos = _pos(args); pyautogui.doubleClick(x, y)
-            result = f"double-clicked {pos}"
+            result = await asyncio.to_thread(_click_at, args, "left", True)
         elif name == "mouse_move":
-            x, y, pos = _pos(args); pyautogui.moveTo(x, y)
-            result = f"moved to {pos}"
+            x, y, pos = _pos(args)
+            info = await asyncio.to_thread(_a11y_at, x, y)
+            pyautogui.moveTo(x, y)
+            note = (f" — over {_a11y_desc(info['hit'])}"
+                    if info and info.get("hit") else "")
+            result = f"moved to {pos}{note}"
         elif name == "scroll":
             if args.get("coordinate"):
                 x, y, _ = _pos(args); pyautogui.moveTo(x, y)
@@ -2418,6 +2672,7 @@ async def execute_tool(name: str, args: dict,
             plan = str(args.get("plan", "")).strip()
             if not plan:
                 return "empty plan — nothing shared", False
+            state.plan_shared = True
             await broadcast({"type": "plan", "text": plan})
             result = ("plan shared with the user — now execute it; keep "
                       "progress current via update_todos")
@@ -2453,7 +2708,38 @@ def assistant_to_dict(msg: dict) -> dict:
     return out
 
 
-def prune_images(messages: list, keep: int = SCREENSHOT_HISTORY) -> None:
+def message_text(msg: dict) -> str:
+    """Visible reply text — a plain string, or text blocks joined."""
+    t = msg.get("content") or ""
+    if not isinstance(t, str):
+        t = " ".join(str(b.get("text", "")) for b in t
+                     if isinstance(b, dict))
+    return t.strip()
+
+
+def reasoning_text(msg: dict) -> str:
+    """Thinking produced outside the reply — LiteLLM's normalized
+    reasoning_content, or thinking blocks inside content. Broadcast live and
+    never persisted; keep the tail, where the freshest reasoning sits."""
+    t = msg.get("reasoning_content")
+    if isinstance(t, list):
+        t = " ".join(str(b.get("text", "")) for b in t
+                     if isinstance(b, dict))
+    if not isinstance(t, str) or not t.strip():
+        t = " ".join(str(b.get("thinking", ""))
+                     for b in (msg.get("thinking_blocks") or [])
+                     if isinstance(b, dict))
+    if not t.strip():
+        c = msg.get("content")
+        if isinstance(c, list):
+            t = " ".join(str(b.get("thinking", "")) for b in c
+                         if isinstance(b, dict)
+                         and b.get("type") == "thinking")
+    t = t.strip()
+    return t[-800:] if len(t) > 800 else t
+
+
+def prune_images(messages: list, keep: int | None = None) -> None:
     """Replace all but the newest `keep` screenshots with text placeholders.
 
     Without this the transcript carries every frame ever taken and each
@@ -2462,6 +2748,8 @@ def prune_images(messages: list, keep: int = SCREENSHOT_HISTORY) -> None:
     log stays intact, so the narrative is preserved; the model can call
     screenshot anytime for a fresh look.
     """
+    if keep is None:
+        keep = SCREENSHOT_HISTORY
     seen = 0
     for msg in reversed(messages):
         content = msg.get("content")
@@ -2475,6 +2763,38 @@ def prune_images(messages: list, keep: int = SCREENSHOT_HISTORY) -> None:
                 block.clear()
                 block.update({"type": "text",
                               "text": "[earlier image omitted]"})
+
+
+def prune_tool_results(messages: list, keep: int | None = None) -> None:
+    """Truncate tool results older than the newest `keep` to a stub.
+
+    browser_dom / fetch_url / desktop_tree / run_command outputs are the
+    largest payloads in the transcript (up to ~12k chars each) and go stale
+    within a step or two, yet every request re-bills them. The head of each
+    result survives (usually enough to recall what it was); the model can
+    re-run the tool if it needs the full text again.
+    """
+    if keep is None:
+        keep = TOOL_RESULT_HISTORY
+    seen = 0
+    for msg in reversed(messages):
+        if msg.get("role") != "tool":
+            continue
+        seen += 1
+        if seen <= keep:
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if len(content) > TOOL_RESULT_STUB_CHARS:
+                msg["content"] = (content[:TOOL_RESULT_STUB_CHARS]
+                                  + "… [truncated — re-run the tool for "
+                                    "the full output]")
+        elif isinstance(content, list):
+            for b in content:
+                if (b.get("type") == "text"
+                        and len(b.get("text", "")) > TOOL_RESULT_STUB_CHARS):
+                    b["text"] = (b["text"][:TOOL_RESULT_STUB_CHARS]
+                                 + "… [truncated]")
 
 
 def cache_friendly(model: str | None = None) -> bool:
@@ -2507,6 +2827,38 @@ def apply_cache_control(messages: list) -> None:
                             "cache_control": {"type": "ephemeral"}}]
     elif isinstance(content, list) and content:
         content[-1]["cache_control"] = {"type": "ephemeral"}
+
+
+async def maybe_escalate(messages: list, conv_id: str | None,
+                         reason: str) -> bool:
+    """Switch the run to ESCALATION_MODEL once — the cheap model is stuck or
+    erroring. Persists the choice on the conversation so a resume doesn't
+    drop back to the model that was failing. Returns True if it switched."""
+    if (not ESCALATION_MODEL or state.model == ESCALATION_MODEL
+            or getattr(state, "escalated", False)):
+        return False
+    # Don't escalate into a deployment LiteLLM doesn't have — a typo'd or
+    # unkeyed target would just fail the same way.
+    try:
+        deployed = {m.get("model_name") for m in await litellm_deployments()}
+        if ESCALATION_MODEL not in deployed:
+            print(f"[gut] escalation target {ESCALATION_MODEL} not deployed")
+            return False
+    except httpx.HTTPError:
+        pass  # couldn't check — try anyway
+    old = state.model
+    state.model = ESCALATION_MODEL
+    state.escalated = True
+    swap_coord_prompt(messages, old)
+    if conv_id:
+        try:
+            conv_set_model(conv_id, ESCALATION_MODEL)
+        except ValueError:
+            pass
+    await broadcast({"type": "agent_msg",
+                     "text": f"(escalating to {ESCALATION_MODEL} — {reason})"})
+    await push_status()
+    return True
 
 
 def _note(content, text: str):
@@ -2673,7 +3025,7 @@ async def compact_context(http: httpx.AsyncClient, conv_id: str,
     try:
         r = await llm_request(
             http, view + [{"role": "user", "content": COMPACT_PROMPT}],
-            tools=[])
+            model=COMPACT_MODEL or None, tools=[])
     except Exception as e:
         await broadcast({"type": "error",
                          "text": f"context compaction failed: {e}"})
@@ -2849,11 +3201,11 @@ async def subagent_loop(name: str, task_text: str, model: str,
 
                 msg = r.json()["choices"][0]["message"]
                 messages.append(assistant_to_dict(msg))
-                reply = msg.get("content") or ""
-                if not isinstance(reply, str):
-                    reply = " ".join(str(b.get("text", "")) for b in reply
-                                     if isinstance(b, dict))
-                reply = reply.strip()
+                think = reasoning_text(msg)
+                if think:
+                    await broadcast({"type": "thinking", "text": think,
+                                     "agent": name})
+                reply = message_text(msg)
                 if reply:
                     await broadcast({"type": "thought", "text": reply,
                                      "agent": name})
@@ -3273,6 +3625,12 @@ task_complete with a one-line summary of what you closed.
 async def janitor_pass(conv_id: str) -> str:
     """Bounded post-sweep tidy with a fresh context — its chatter never
     touches the conversation's model context."""
+    # JANITOR_MODEL runs cleanup on a cheaper vision model: swap state.model
+    # for the pass so cache_friendly() and the coordinate convention match
+    # the model actually answering. cleanup_after_run restores it.
+    prev_model = state.model
+    if JANITOR_MODEL:
+        state.model = JANITOR_MODEL
     try:
         res = "%dx%d" % tuple(pyautogui.size())
     except Exception:
@@ -3301,6 +3659,7 @@ async def janitor_pass(conv_id: str) -> str:
                     apply_cache_control(messages)
                 try:
                     r = await llm_request(http, messages,
+                                          model=JANITOR_MODEL or None,
                                           tools=JANITOR_TOOLS)
                 except httpx.HTTPError as e:
                     return f"model request failed: {e}"
@@ -3380,7 +3739,11 @@ async def cleanup_after_run(conv_id: str, baseline: dict | None,
             await broadcast({"type": "status", "state": "cleanup",
                              "model": state.model,
                              "conversation_id": conv_id})
+            # janitor_pass swaps state.model to JANITOR_MODEL for the pass;
+            # restore whatever the conversation was using.
+            prev_model = state.model
             report = await janitor_pass(conv_id)
+            state.model = prev_model
             if baseline:
                 await asyncio.to_thread(sweep_desktop, baseline)
         revived = await asyncio.to_thread(heal_desktop)
@@ -3406,6 +3769,8 @@ async def agent_loop(conv_id: str, task_text: str,
     state.run_start = time.time()
     state.sent_files = {}
     state.output_nudge_done = False
+    state.escalated = False
+    run_usd0 = state.session_usd  # session spend baseline for AGENT_MAX_USD
     # One try wraps setup AND the step loop: a crash anywhere in the run is
     # reported by the except below, then the finally cleans up and drops
     # status to idle. A failed task must never just go quiet — or sit on
@@ -3430,8 +3795,7 @@ async def agent_loop(conv_id: str, task_text: str,
             res = "%dx%d" % tuple(pyautogui.size())
         except Exception:
             res = RESOLUTION
-        coords = COORD_PROMPT_NORM if coords_normalized() \
-            else COORD_PROMPT_PIXEL
+        coords = coord_prompt_for(state.model)
         messages = conv_load_context(conv_id) or [
             {"role": "system", "content": SYSTEM_PROMPT.format(
                 res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
@@ -3451,6 +3815,7 @@ async def agent_loop(conv_id: str, task_text: str,
             deque(maxlen=10), 0, 0
         idle_replies = 0
         state.todos = conv_load_todos(conv_id)
+        state.plan_shared = False
         state.steps_since_todo = 0
         state.steps_since_compact = 99
         last_tin = 0    # prompt_tokens of the last request — compaction signal
@@ -3494,17 +3859,26 @@ async def agent_loop(conv_id: str, task_text: str,
                         and messages
                         and messages[-1].get("role") == "tool"):
                     state.steps_since_todo = 0
-                    note = (
-                        f"your checklist hasn't changed in "
-                        f"{TODO_REMIND_STEPS} steps — mark progress via "
-                        "update_todos") if state.todos else (
-                        f"{TODO_NUDGE_STEPS} steps in and no checklist — if "
-                        "the task has multiple phases left, track it with "
-                        "update_todos")
+                    if state.todos:
+                        note = (
+                            f"your checklist hasn't changed in "
+                            f"{TODO_REMIND_STEPS} steps — mark progress via "
+                            "update_todos")
+                    elif state.plan_shared:
+                        note = (
+                            f"{TODO_NUDGE_STEPS} steps in and no checklist — "
+                            "if the task has multiple phases left, track it "
+                            "with update_todos")
+                    else:
+                        note = (
+                            f"{TODO_NUDGE_STEPS} steps in and no plan — if "
+                            "the task has multiple phases left, post "
+                            "share_plan and track it with update_todos")
                     messages[-1]["content"] = _note(
                         messages[-1]["content"], note)
 
                 prune_images(messages)
+                prune_tool_results(messages)
                 if cache_friendly():
                     apply_cache_control(messages)
                 try:
@@ -3520,6 +3894,15 @@ async def agent_loop(conv_id: str, task_text: str,
                                                       messages)):
                         overflow_retries += 1
                         continue
+                    # Provider-side rejection (bad images, decommissioned
+                    # deployment, …) — escalate rather than kill the run.
+                    # Transport errors skip this: a down proxy fails the
+                    # same whatever the model.
+                    if (isinstance(e, httpx.HTTPStatusError)
+                            and await maybe_escalate(
+                                messages, conv_id,
+                                f"{state.model} request failed")):
+                        continue
                     await broadcast({"type": "error",
                                      "text": f"LiteLLM request failed: {e} {body[:300]}"})
                     break
@@ -3529,22 +3912,27 @@ async def agent_loop(conv_id: str, task_text: str,
                 if usd or tin or tout:
                     conv_add_usage(conv_id, usd, tin, tout)
                 await push_cost()
+                if (AGENT_MAX_USD
+                        and state.session_usd - run_usd0 >= AGENT_MAX_USD):
+                    await broadcast({"type": "error", "text":
+                        f"run hit the ${AGENT_MAX_USD:.2f} spend cap "
+                        f"(this run: ${state.session_usd - run_usd0:.4f}); "
+                        "stopping"})
+                    break
 
                 msg = r.json()["choices"][0]["message"]
                 messages.append(assistant_to_dict(msg))
-                reply_text = ""
-                if msg.get("content"):
-                    # Model narration goes to the verbose log, not the chat —
-                    # the user only hears what the agent deliberately sends.
-                    reply_text = msg["content"]
-                    if not isinstance(reply_text, str):
-                        reply_text = " ".join(
-                            str(b.get("text", "")) for b in reply_text
-                            if isinstance(b, dict))
-                    reply_text = reply_text.strip()
-                    if reply_text:
-                        await broadcast({"type": "thought",
-                                         "text": reply_text})
+                # Reasoning rides an ephemeral channel — the client flashes
+                # it in the status line; it never lands in the transcript.
+                think = reasoning_text(msg)
+                if think:
+                    await broadcast({"type": "thinking", "text": think})
+                # Model narration goes to the verbose log, not the chat —
+                # the user only hears what the agent deliberately sends.
+                reply_text = message_text(msg)
+                if reply_text:
+                    await broadcast({"type": "thought",
+                                     "text": reply_text})
 
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
@@ -3580,6 +3968,11 @@ async def agent_loop(conv_id: str, task_text: str,
                         args = json.loads(fn.get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
+                    # Back-to-back screen actions in one batch were planned
+                    # against the same frame — let the last one's effect
+                    # render before the next click lands.
+                    if acted_on_screen and name in SCREEN_TOOLS:
+                        await asyncio.sleep(INTER_ACTION_DELAY)
                     await broadcast({"type": "action", "tool": name, "args": args})
                     result, finished = await execute_tool(name, args)
                     acted_on_screen = acted_on_screen or name in SCREEN_TOOLS
@@ -3604,7 +3997,12 @@ async def agent_loop(conv_id: str, task_text: str,
                                 "times with no progress"))
                             recent_sigs.clear()
                             stuck_rescues += 1
-                            if stuck_rescues >= 3:
+                            if (stuck_rescues >= ESCALATION_RESCUES
+                                    and await maybe_escalate(
+                                        messages, conv_id,
+                                        "kept repeating a dead-end action")):
+                                stuck_rescues = 0
+                            elif stuck_rescues >= 3:
                                 stuck_rescues = 0
                                 answer = await ask_user(STUCK_ASK_USER)
                                 result = _note(result,
@@ -3630,6 +4028,20 @@ async def agent_loop(conv_id: str, task_text: str,
                 # skipped when the frame is byte-identical to the last sent.
                 if acted_on_screen and not done and not state.stop:
                     shot = screenshot_block()
+                    # An unchanged frame right after an action usually means
+                    # the app hasn't repainted yet rather than that nothing
+                    # happened — poll for a changed frame before telling the
+                    # model the screen is unchanged (otherwise it re-clicks
+                    # into a UI that has since moved on).
+                    if shot is None and ACTION_SETTLE_SECS > 0:
+                        deadline = (asyncio.get_running_loop().time()
+                                    + ACTION_SETTLE_SECS)
+                        while shot is None and not state.stop:
+                            left = deadline - asyncio.get_running_loop().time()
+                            if left <= 0:
+                                break
+                            await asyncio.sleep(min(0.3, left))
+                            shot = await asyncio.to_thread(screenshot_block)
                     target = messages[-1]
                     if shot is None:
                         unchanged_streak += 1
@@ -3648,7 +4060,12 @@ async def agent_loop(conv_id: str, task_text: str,
                                     "are having no effect"))
                             unchanged_streak = 0
                             stuck_rescues += 1
-                            if stuck_rescues >= 3:
+                            if (stuck_rescues >= ESCALATION_RESCUES
+                                    and await maybe_escalate(
+                                        messages, conv_id,
+                                        "actions had no visible effect")):
+                                stuck_rescues = 0
+                            elif stuck_rescues >= 3:
                                 stuck_rescues = 0
                                 answer = await ask_user(STUCK_ASK_USER)
                                 target["content"] = _note(
@@ -4211,6 +4628,73 @@ async def api_keys_set(body: dict = Body(...)):
                 "error": f"saved on device but LiteLLM rejected it "
                          f"(retrying): {e}"}
     return {"keys": _keys_state(), "applied": True}
+
+
+def _config_effective() -> dict:
+    """Live value of every whitelisted knob — the module global when one
+    exists, else the raw env/file string."""
+    out = {}
+    for k in sorted(CONFIG_KEYS):
+        g = globals().get(CONFIG_GLOBALS.get(k, k))
+        out[k] = g if g is not None else os.environ.get(k, "")
+    return out
+
+
+@app.get("/api/config")
+async def api_config():
+    """Non-secret device config: what's stored in config.json (the managed
+    store) and the live effective values. Never returns secrets — only the
+    whitelisted CONFIG_KEYS can exist here."""
+    return {"config": load_config_file(), "effective": _config_effective(),
+            "restart_required": sorted(CONFIG_RESTART)}
+
+
+@app.post("/api/config")
+async def api_config_set(body: dict = Body(...)):
+    """Upsert config pushed from the app; an empty value removes the key.
+    Values hot-apply to the module globals where possible; keys in
+    CONFIG_RESTART persist to the file but only take effect at next boot
+    (they're consumed by start.sh)."""
+    updates = body.get("config")
+    if not isinstance(updates, dict):
+        raise HTTPException(400, 'expected {"config": {NAME: value}}')
+    bad = sorted(k for k in updates if k not in CONFIG_KEYS)
+    if bad:
+        raise HTTPException(400, "unknown config keys: " + ", ".join(bad))
+    saved = load_config_file()
+    applied, restart = [], []
+    for k, v in updates.items():
+        v = str(v or "").strip()
+        if v:
+            saved[k] = v
+            os.environ[k] = v
+        else:
+            saved.pop(k, None)
+            orig = _ENV_ORIG.get(k)
+            if orig is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = orig
+        gname = CONFIG_GLOBALS.get(k, k)
+        if k in CONFIG_RESTART or gname not in globals():
+            restart.append(k)
+            continue
+        try:
+            # On removal, re-coerce the restored env value — if neither file
+            # nor env holds one, non-string globals can't express the code
+            # default and stay as-is until the next boot.
+            globals()[gname] = _coerce_like(
+                globals()[gname], v or os.environ.get(k, ""))
+            applied.append(k)
+            # DEFAULT_MODEL seeds state.model at boot — apply it there too
+            # or the push would only matter after a restart.
+            if k == "DEFAULT_MODEL" and v:
+                state.model = v
+        except (ValueError, TypeError):
+            restart.append(k)
+    store_config_file(saved)
+    return {"config": saved, "effective": _config_effective(),
+            "applied": applied, "restart_required": restart}
 
 
 @app.get("/api/device")

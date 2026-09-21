@@ -1,16 +1,56 @@
 #!/bin/sh
 # gut office launcher — installed as /usr/local/bin/{soffice,libreoffice}
 # so it shadows /usr/bin for every launch path (shell PATH, .desktop Exec).
-# It injects the UNO listener the agent's office_eval tool drives the live
+#
+# GUI launches get the UNO listener the agent's office_eval drives the live
 # document through. When LibreOffice is already running the flags forward
 # to that instance; a duplicate --accept is harmless.
+#
+# One-shot batch modes (--convert-to, --cat, --print-to-file, ...) get
+# NEITHER the listener NOR the shared profile:
+#  - an inherited --accept makes the throwaway process fight the live
+#    instance for the UNO port and can keep it running as a listener —
+#    run_command's timeout then kills it mid-write (truncated, corrupt
+#    output) or it steals the port office_eval connects to.
+#  - sharing the GUI profile makes a second soffice silently delegate to
+#    the running instance instead of converting: exit 0, no output (or an
+#    async write the caller reads half-finished). A private
+#    UserInstallation per batch run avoids the delegation entirely.
+name="$(basename "$0")"
+real=
+for r in "/usr/bin/$name" "/bin/$name" "/usr/lib/libreoffice/program/soffice"; do
+  if [ -x "$r" ] && [ "$r" != "$0" ]; then real="$r"; break; fi
+done
+if [ -z "$real" ]; then
+  echo "gut-office: no real $name found (is libreoffice installed?)" >&2
+  exit 127
+fi
+
+batch=0 have_profile=0
+for arg in "$@"; do
+  case "$arg" in
+    --convert-to|--convert-to=*|--cat|--print-to-file|--terminate_after_init|\
+--uninstall|--version|-version|--help|-h|-\?)
+      batch=1 ;;
+    -env:UserInstallation=*|--env:UserInstallation=*)
+      have_profile=1 ;;
+  esac
+done
+
+if [ "$batch" = 1 ]; then
+  if [ "$have_profile" = 0 ]; then
+    prof="$(mktemp -d /tmp/gut-lo-batch.XXXXXX)" || exit 1
+    # No exec: the temp profile has to be removed after soffice exits.
+    "$real" "-env:UserInstallation=file://$prof" "$@"
+    rc=$?
+    rm -rf "$prof"
+    exit "$rc"
+  fi
+  exec "$real" "$@"
+fi
+
 case " $* " in
   *" --accept"*) ;;
   *) set -- "--accept=socket,host=127.0.0.1,port=${GUT_UNO_PORT:-2002};urp;" "$@" ;;
 esac
-name="$(basename "$0")"
-for real in "/usr/bin/$name" "/bin/$name" "/usr/lib/libreoffice/program/soffice"; do
-  [ -x "$real" ] && [ "$real" != "$0" ] && exec "$real" "$@"
-done
-echo "gut-office: no real $name found (is libreoffice installed?)" >&2
-exit 127
+exec "$real" "$@"

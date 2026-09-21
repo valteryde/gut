@@ -66,8 +66,9 @@ The installer prints the address and a generated password:
 Then add the machine as a device in the app (host = its IP, password = the
 printed one) and paste at least one provider key in Settings → Provider
 keys — keys upload to and are stored on the server, so nothing needs
-editing on the host and no services restart. Keys can alternatively be set
-in `/etc/gut/gut-bot.env` (`sudo systemctl restart gut-bot` to apply).
+editing on the host and no services restart. Non-secret settings (model,
+cost caps, screenshot limits…) live in `config.json` next to the keys and
+are managed the same way via `POST /api/config`.
 Re-print credentials anytime with `gut-bot info`; manage with
 `gut-bot status|logs|restart`.
 The app shows the backend's version on its device row and can push a
@@ -78,13 +79,14 @@ the services).
 
 ```bash
 cp .env.example .env
-# edit .env: set LITELLM_MASTER_KEY (must start with sk-) and at least one
-# provider key, e.g. ANTHROPIC_API_KEY
+# edit .env — only the three secrets live there: LITELLM_MASTER_KEY
+# (must start with sk-), POSTGRES_PASSWORD, GUT_PASSWORD
 docker compose up --build
 ```
 
-Then run the app against it: `cd electron && npm install && npm start`, and
-point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
+Then run the app against it: `cd electron && npm install && npm start`,
+point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`, and paste a
+provider key in Settings → Provider keys.
 
 ---
 
@@ -116,7 +118,7 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 │   ├── debian/                 # control, postinst (secrets + postgres + services), prerm/postrm
 │   ├── systemd/                # gut-bot.service, gut-litellm.service, gut-openserp.service
 │   ├── openserp-browser        # Chrome launcher for OpenSERP (no-sandbox only, non-snap)
-│   ├── gut-office              # soffice/libreoffice wrapper — injects the UNO listener
+│   ├── gut-office              # soffice/libreoffice wrapper — UNO listener on GUI launches, isolated profile for batch converts
 │   ├── gut-bot                 # CLI: info/status/logs/restart/version
 │   └── chromium-gut.conf       # /etc/chromium.d flags (CDP, no-sandbox, scale)
 └── .github/workflows/
@@ -162,9 +164,30 @@ reports it via `GET /api/version`.
   (older ones become text placeholders), one screenshot is attached per turn
   and skipped when the frame is unchanged, Anthropic-style prompt caching is
   enabled for `claude`/`anthropic` models, and repeated/no-op actions trigger
-  warnings then a user check-in instead of silently burning steps.
+  warnings then a user check-in instead of silently burning steps. Stale
+  tool results — DOM dumps, page text, command output — are truncated to
+  `TOOL_RESULT_STUB_CHARS` once older than the newest `TOOL_RESULT_HISTORY`
+  results (the largest recurring re-bill in a long run), auto-attached
+  frames can be downscaled via `SCREENSHOT_AUTO_PIXELS`, and `AGENT_MAX_USD`
+  caps a single run's spend. Compaction and the cleanup janitor can run on
+  cheaper models (`COMPACT_MODEL`, `JANITOR_MODEL`).
+- **Cost tiering.** Run a cheap `DEFAULT_MODEL` with a premium
+  `ESCALATION_MODEL`: a run that gets stuck (`ESCALATION_RESCUES` unstick
+  attempts, default 2) or hits provider-side request failures switches
+  mid-run to the stronger model — including the coordinate convention baked
+  into its system prompt — and the conversation keeps it on resume.
 - **UI scale.** `UI_SCALE` (default 1.25) raises Xft DPI and Chrome's device
-  scale factor so downscaled screenshots stay legible.
+  scale factor so downscaled screenshots stay legible. Bigger widgets are
+  also easier click targets — the model's aim error is in screenshot pixels,
+  so 1.25–1.5 noticeably improves pixel-click reliability.
+- **Click grounding & settle.** Pixel clicks are looked up in the AT-SPI
+  tree (`CLICK_A11Y`, default on): the tool result names the element under
+  the point, and a click that lands on dead space within `CLICK_SNAP_PX`
+  (default 24) of an actionable widget snaps to its center. After screen
+  actions the daemon polls up to `ACTION_SETTLE_SECS` (default 1.5) for a
+  repainted frame before reporting the screen unchanged, and batched screen
+  actions are spaced by `INTER_ACTION_DELAY` — so a fast screenshot can't
+  trick the model into re-clicking a UI that just hadn't rendered yet.
 - **Conversations & devices.** The app keeps a device list (name, host,
   password) in `localStorage` — add backends in Settings. Each device stores
   its own conversations under `$HOME/.gut/conversations/` on the
@@ -186,15 +209,27 @@ reports it via `GET /api/version`.
   (`store_model_in_db`), so they apply live with no restarts and survive
   reboots. Keys set in the backend's own env (`.env` / `gut-bot.env`) still
   work — the daemon registers them the same way at boot — and a pushed key
-  overrides an env key for that provider. The app's own local stack is the
-  exception: its keys go into the stack's `.env` on this machine.
+  overrides an env key for that provider. The app's own local stack works
+  the same way: pasted keys are pushed to the local daemon's
+  `provider_keys.json` — its generated `.env` only ever holds bootstrap
+  secrets.
 - **Local key store.** Keys you paste are also remembered by the app itself
-  (localStorage, next to the device passwords), and the Electron app folds
-  the local stack's `.env` keys in too — so a key used on one backend can
-  be pushed to another without re-pasting. The "Saved on this computer"
+  (localStorage, next to the device passwords) — so a key used on one
+  backend can be pushed to another without re-pasting. The "Saved on this computer"
   bar in Settings → Provider keys lists what's stored: push all to the
   selected device, push one via a card's "Use saved key", or forget one.
   Remote daemons never return key values, so only the app holds a copy.
+- **Device config.** Non-secret settings — model tiering, cost caps,
+  screenshot/step limits, cleanup behavior, click tuning — live in
+  `config.json` on the data volume, not in `.env`. Read them with
+  `GET /api/config` and change them with
+  `POST /api/config {"config": {"AGENT_MAX_USD": "0.5"}}`; most apply live,
+  the few that feed `start.sh` (`RESOLUTION`, `UI_SCALE`, `DEVICE_NAME`,
+  ports) persist and apply on the next container start. A value in
+  `config.json` overrides the same-named env var, so env remains a
+  deploy-time default and `.env` only ever needs the bootstrap secrets
+  (`LITELLM_MASTER_KEY`, `POSTGRES_PASSWORD`, `GUT_PASSWORD`). The full
+  knob list is the reference block in `.env.example`.
 - **Architecture**: the Docker image ships Google Chrome on amd64 and Debian's
   `chromium` on arm64; gut-bot depends on `chromium | google-chrome-stable`
   and self-provisions a working browser where `chromium` is only a snap stub

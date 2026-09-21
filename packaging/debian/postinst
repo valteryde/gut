@@ -20,7 +20,12 @@ case "$1" in
       MASTER="sk-$(rand 48)"
       HOST="$(hostname)"
       cat > /etc/gut/gut-bot.env <<EOF
-# gut-bot environment — generated at install time.
+# gut-bot environment — generated at install time. BOOTSTRAP SECRETS ONLY:
+# provider keys and runtime config live on the device — the app pushes keys
+# to /api/keys (stored in /var/lib/gut/.gut/provider_keys.json) and settings
+# to /api/config (/var/lib/gut/.gut/config.json), no restart needed. Env
+# vars set here still work as boot-time overrides.
+#
 # One password protects the desktop stream AND the agent API — it is what
 # you type into the Gut app's device settings.
 VNC_PASSWORD=${PASS}
@@ -29,25 +34,6 @@ GUT_API_TOKEN=${PASS}
 LITELLM_MASTER_KEY=${MASTER}
 POSTGRES_PASSWORD=${PGPASS}
 DATABASE_URL=postgresql://litellm:${PGPASS}@127.0.0.1:5432/litellm
-
-RESOLUTION=1024x768
-UI_SCALE=1.0
-DEVICE_NAME=${HOST}
-# The agent's web_search backend — gut-openserp.service runs a bundled
-# OpenSERP instance on localhost. Override to use your own; empty =
-# DuckDuckGo HTML fallback (unreliable — engines bot-block it).
-OPENSERP_URL=http://127.0.0.1:7070
-# WALLPAPER_HUE=    # 0-360: pin the desktop wallpaper color (default: derived from DEVICE_NAME)
-# DEFAULT_MODEL=openrouter/claude-sonnet-4.5
-
-# Provider keys (BYOK) — optional. They can also be pushed from the app's
-# Settings → Provider keys (stored under /var/lib/gut/.gut and applied
-# without a restart). Keys set here need: systemctl restart gut-bot
-ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
-GEMINI_API_KEY=
-DEEPSEEK_API_KEY=
-OPENROUTER_API_KEY=
 EOF
       chown root:gut /etc/gut/gut-bot.env
       chmod 640 /etc/gut/gut-bot.env
@@ -58,6 +44,18 @@ EOF
     grep -q '^OPENSERP_URL=' /etc/gut/gut-bot.env \
       || echo 'OPENSERP_URL=http://127.0.0.1:7070' >> /etc/gut/gut-bot.env
     . /etc/gut/gut-bot.env
+    # Seed the device config once — the daemon and start.sh read non-secret
+    # settings from it (POST /api/config manages them afterwards). Values are
+    # lifted from the env file so an upgrade keeps whatever the install
+    # already had; config.json would otherwise override it with defaults.
+    if [ ! -f /var/lib/gut/.gut/config.json ]; then
+      mkdir -p /var/lib/gut/.gut
+      cat > /var/lib/gut/.gut/config.json <<EOF
+{"RESOLUTION": "${RESOLUTION:-1024x768}", "UI_SCALE": "${UI_SCALE:-1.0}", "DEVICE_NAME": "${DEVICE_NAME:-$(hostname)}", "OPENSERP_URL": "${OPENSERP_URL:-http://127.0.0.1:7070}"}
+EOF
+      chown gut:gut /var/lib/gut/.gut/config.json
+      chmod 600 /var/lib/gut/.gut/config.json
+    fi
 
     # Python venv — built on the target so it always matches the local
     # interpreter. Rebuilt whenever missing or created for a different
@@ -78,6 +76,11 @@ EOF
            "'/opt/gut/venv/bin/pip install -r /opt/gut/requirements.txt" \
            "-r /opt/gut/litellm-requirements.txt' with network access" >&2
     fi
+    # The venv (and pip's upgrades above) are written as root, but the
+    # daemon — and the agent's run_command shell — run as gut. Hand it over
+    # so the agent's own `pip install` works; gut already has NOPASSWD
+    # sudo, so no privilege boundary is lost.
+    chown -R gut:gut /opt/gut/venv
 
     # Postgres role/db for LiteLLM spend tracking (idempotent). Skipped with
     # a warning when postgres can't be reached (e.g. installing in a chroot).
@@ -199,7 +202,7 @@ PYEOF
 
   Add this machine in the app, then paste model provider keys in
   Settings → Provider keys — they upload to and are stored on this
-  host. (Or set them in /etc/gut/gut-bot.env + systemctl restart gut-bot.)
+  host under /var/lib/gut/.gut (no restart needed).
   Re-print this panel with: gut-bot info
 
 EOF
