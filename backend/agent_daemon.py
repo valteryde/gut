@@ -401,15 +401,32 @@ Environment:
   directly (python-docx, openpyxl, pandoc, or `soffice --headless
   --convert-to pdf out.docx` — the soffice wrapper gives batch runs their
   own profile, so this is safe while the GUI is open) and only open the
-  GUI to eyeball the result.
+  GUI to eyeball the result. Build the whole file from one script so the
+  numbers have a single source —
+      python3 - <<'EOF'
+      import openpyxl
+      wb = openpyxl.Workbook(); ws = wb.active
+      ws.append(["Item", "Qty", "Price"]); ws.append(["Pork", 44, 88])
+      wb.save("budget.xlsx")
+      EOF
+  then verify the artifact before send_file: reload it, ls the path, or
+  print a check total — never deliver a file you haven't confirmed exists
+  and opens.
 - desktop_tree is the native-app equivalent of browser_dom: it dumps the
   focused window's accessibility tree as numbered #refs with role, name,
   actions and bounds. Act on them with desktop_act (press/activate/select
   by ref), desktop_type (set text directly) or desktop_click (pixel-click
   the ref's bounds). Always prefer these over guessing pixel coordinates;
   re-run desktop_tree after the UI changes — refs go stale.
-- run_command gives you a bash shell (cwd {home}, DISPLAY already set).
-  Launch GUI apps in the background so the command returns, e.g. `google-chrome &`.
+- run_command gives you a bash shell (cwd {home}, DISPLAY already set) —
+  and Python 3 with pip: openpyxl, python-docx and pillow are
+  preinstalled, `pip install` covers the rest. This is your main tool for
+  math, parsing, data and producing files — compute and generate in code,
+  never by hand: a script is one source of truth where hand-typed numbers
+  and file contents drift. An ImportError means install the package or
+  pick an installed one — never a reason to abandon code for a GUI or
+  echo workaround. Launch GUI apps in the background so the command
+  returns, e.g. `google-chrome &`.
 - {home}/scratch is wiped when the task ends — use it for temp and
   intermediate files. Keep anything needed later elsewhere in {home}.
 - {coords}
@@ -2378,8 +2395,11 @@ TOOLS = [
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "run_command",
-        "description": f"Run a bash command in the desktop session (cwd {HOME_DIR}). "
-                       "Append '&' when launching GUI apps so it returns immediately.",
+        "description": f"Run a bash command in the desktop session (cwd {HOME_DIR}) — "
+                       "your main tool for compute, files and data. Python 3 "
+                       "is available with openpyxl, python-docx and pillow "
+                       "preinstalled, plus pip for anything missing. Append "
+                       "'&' when launching GUI apps so it returns immediately.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {
@@ -2628,14 +2648,17 @@ CONTEXT_TOOLS = {
     "desktop_act": lambda: state.tree_seen,
     "desktop_click": lambda: state.tree_seen,
     "desktop_type": lambda: state.tree_seen,
-    "office_eval": lambda: office_running(),
+    "office_eval": lambda: OFFICE_AVAILABLE,
     "collect_agent": lambda: bool(state.subagents),
 }
 
 
-def office_running() -> bool:
-    return subprocess.run(["pgrep", "-f", "soffice"], capture_output=True,
-                          check=False).returncode == 0
+# office_eval drives LibreOffice through UNO and starts soffice itself when
+# it isn't running (uno_eval.py) — its precondition is "installed", not
+# "running". Gating on a live process hid the no-GUI document tool until
+# the agent had already opened LibreOffice by hand.
+OFFICE_AVAILABLE = bool(shutil.which("soffice")) or \
+    os.path.exists("/usr/local/bin/soffice")
 
 
 def tools_for_run(messages: list) -> list:
@@ -3686,7 +3709,7 @@ VERIFY_PROMPT = """You audit an autonomous desktop agent's wrap-up message again
 
 The wrap-up PASSES when:
 - every fact stated as certain (numbers, prices, dates, names, URLs, quotes, file contents) appears in the tool log, and
-- every claimed deliverable matches a send_file call or a file the log shows being created, and
+- every claimed deliverable matches a send_file call or a file the log shows being created — in the form asked for: a spreadsheet request delivered as CSV, a document that only exists as chat text, or a file the log shows failing to build counts as a mismatch, and
 - claimed actions match calls that ran without an error result.
 
 Claims the agent itself flags as unverified, estimated or approximate are fine — flagged doubt is honest. Fail ONLY for material claims stated as fact that the log doesn't support or directly contradicts — never over omissions, tone, or hedged language.
