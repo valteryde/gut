@@ -34,3 +34,15 @@ openssl
 gnupg
 sudo
 procps
+# Structured-control stack: the agent drives native apps through the AT-SPI
+# accessibility tree (atspi.py needs the bus + python3-pyatspi) and the live
+# LibreOffice document through python3-uno. libreoffice-gtk3 is required —
+# LO only bridges to AT-SPI through the gtk3 VCL plugin (no-install-recommends
+# would skip it). dconf-cli supplies the gsettings backend used to force
+# toolkit-accessibility on.
+at-spi2-core
+python3-pyatspi
+python3-uno
+libreoffice-gtk3
+dconf-cli
+libglib2.0-bin

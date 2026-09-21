@@ -685,21 +685,96 @@ body.verbose .verbose-only { display: grid; }
 /* file + image deliveries */
 .file-note { margin: 0 0 8px; }
 
-.file-link {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 7px 12px;
+.fcard {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: fit-content;
+  min-width: 260px;
+  max-width: min(460px, 100%);
+  padding: 9px 11px;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--text);
-  text-decoration: none;
-  transition: border-color 0.12s, background 0.12s;
+  border-radius: var(--radius-card);
 }
-.file-link:hover { background: var(--surface); border-color: var(--line-strong); }
-.file-name { font-family: var(--mono); font-size: 12px; }
-.file-size { font-size: 12px; color: var(--text-3); }
+
+.fcard .ftile {
+  --k: var(--text-3);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--k);
+}
+.fcard .ftile svg { width: 22px; height: 22px; }
+
+.fcard.k-image .ftile   { --k: #4f8f7b; }
+.fcard.k-pdf .ftile     { --k: #b23a2e; }
+.fcard.k-audio .ftile   { --k: #7a5ea8; }
+.fcard.k-video .ftile   { --k: #4a7fb5; }
+.fcard.k-archive .ftile { --k: #9a7a4f; }
+.fcard.k-code .ftile    { --k: #5f67a3; }
+.fcard.k-sheet .ftile   { --k: #538f54; }
+.fcard.k-slides .ftile  { --k: #c47a3a; }
+.fcard.k-doc .ftile     { --k: #6b7a8d; }
+
+.fcard .fmeta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.fcard .fname {
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fcard .fsub {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fcard .facts { margin-left: auto; flex: none; display: flex; gap: 6px; }
+
+.fbtn {
+  height: 26px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.fbtn:hover { background: var(--surface-3); }
+.fbtn.ghost { border-color: transparent; color: var(--text-2); }
+.fbtn.ghost:hover { color: var(--text); }
+.fbtn svg { width: 13px; height: 13px; }
+.fcard.saved .fbtn { color: var(--mint-ink); }
+
+.saved-note {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+button.linkish {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--mint-ink);
+  text-decoration: underline;
+}
+button.linkish:hover { background: none; color: var(--text); }
 
 .msg-img {
   display: block;
@@ -1141,7 +1216,9 @@ body.takeover #desktopPane { border-color: var(--clay); }
 /* Settings is a page, not a modal: it swaps in for the chat/desktop panes
    inside <main> so every section gets the full window width. */
 body.settings-open #chatPane,
-body.settings-open #desktopPane { display: none; }
+body.settings-open #desktopPane,
+body.about-open #chatPane,
+body.about-open #desktopPane { display: none; }
 
 #settingsPage {
   flex: 1;
@@ -1492,6 +1569,133 @@ body.settings-open #desktopPane { display: none; }
 .dev-update:hover:not(:disabled) { background: var(--mint-soft); }
 .dev-update:disabled { color: var(--text-3); }
 .dev-update.failed:not(:disabled) { color: var(--bad); }
+
+/* ── about page ("What gut can do") ─────────────────────── */
+/* A sub-page of Settings — same page-swap pattern, and Back returns to
+   Settings rather than the main view. */
+#aboutPage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.about-lede {
+  margin: 0;
+  max-width: 64ch;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+/* capability lists — a small muted glyph, a bold lead-in, plain text */
+.about-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.about-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.about-list li + li { border-top: 1px solid var(--line); }
+.about-list .ph {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--text-3);
+  transform: translateY(2px);
+}
+.about-list b { color: var(--text); font-weight: 600; }
+
+/* the settings row that opens it */
+.about-nav { padding: 8px 20px; }
+#aboutBtn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: auto;
+  padding: 6px 2px;
+  border: 0;
+  background: none;
+  text-align: left;
+}
+#aboutBtn:hover { background: none; }
+#aboutBtn .ph { width: 16px; height: 16px; flex: none; color: var(--text-3); }
+.an-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.an-text small {
+  display: block;
+  margin-top: 1px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+.an-go { width: 14px; height: 14px; flex: none; color: var(--text-3); }
+#aboutBtn:hover .an-text { color: var(--mint-ink); }
+#aboutBtn:hover .an-go { color: var(--text); }
+
+/* clickable example prompts — click one to load it into the composer */
+.try-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+button.try {
+  height: auto;
+  padding: 8px 12px;
+  text-align: left;
+  white-space: normal;
+  font-weight: 400;
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--text);
+}
+button.try::before {
+  content: "→";
+  margin-right: 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mint-ink);
+}
+button.try:hover {
+  background: var(--mint-soft);
+  border-color: var(--mint-line);
+}
+
+/* shortcut tips — a mono "key" chip next to a plain explanation */
+.tip-rows {
+  display: flex;
+  flex-direction: column;
+  margin-top: 10px;
+}
+.tip {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 7px 0;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.tip + .tip { border-top: 1px solid var(--line); }
+.tip-k {
+  flex: none;
+  width: 168px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
 
 /* narrow screens: chat on top */
 @media (max-width: 760px) {

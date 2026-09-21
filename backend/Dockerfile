@@ -89,9 +89,17 @@ RUN ARCH="$(dpkg --print-architecture)" && \
 COPY backend/start.sh /opt/gut/start.sh
 COPY backend/agent_daemon.py /opt/gut/agent_daemon.py
 COPY backend/tcpmux.py /opt/gut/tcpmux.py
+COPY backend/atspi.py /opt/gut/atspi.py
+COPY backend/uno_eval.py /opt/gut/uno_eval.py
 COPY backend/wallpaper.png /opt/gut/wallpaper.png
 COPY backend/device_wallpaper.py /opt/gut/device_wallpaper.py
-RUN echo "${GUT_VERSION}" > /opt/gut/VERSION && chmod +x /opt/gut/start.sh
+# soffice/libreoffice launchers get shadowed by a wrapper in /usr/local/bin
+# (ahead of /usr/bin in PATH) that injects the UNO listener — office_eval
+# can then drive the live document no matter how LO was started.
+COPY packaging/gut-office /usr/local/bin/soffice
+RUN ln -f /usr/local/bin/soffice /usr/local/bin/libreoffice && \
+    chmod 755 /usr/local/bin/soffice && \
+    echo "${GUT_VERSION}" > /opt/gut/VERSION && chmod +x /opt/gut/start.sh
 
 USER agent
 ENV HOME=/home/agent DISPLAY=:0

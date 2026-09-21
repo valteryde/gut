@@ -70,6 +70,11 @@ install -m644 "$ROOT/packaging/litellm-requirements.txt" \
 install -m644 "$ROOT/backend/wallpaper.png" "$STAGE/opt/gut/wallpaper.png"
 install -m644 "$ROOT/backend/device_wallpaper.py" \
             "$STAGE/opt/gut/device_wallpaper.py"
+install -m644 "$ROOT/backend/atspi.py" "$STAGE/opt/gut/atspi.py"
+install -m644 "$ROOT/backend/uno_eval.py" "$STAGE/opt/gut/uno_eval.py"
+# soffice/libreoffice wrappers inject the UNO listener (see gut-office).
+install -m755 "$ROOT/packaging/gut-office" "$STAGE/usr/local/bin/soffice"
+install -m755 "$ROOT/packaging/gut-office" "$STAGE/usr/local/bin/libreoffice"
 echo "$VERSION" > "$STAGE/opt/gut/VERSION"
 
 install -m644 "$ROOT/litellm_config.yaml" "$STAGE/etc/gut/litellm.yaml"

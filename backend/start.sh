@@ -52,6 +52,16 @@ for _ in \$(seq 1 60); do
   xfconf-query -c xsettings -p /Xft/DPI -n -t int -s ${DPI} >/dev/null 2>&1 && break
   sleep 1
 done
+# AT-SPI accessibility bus — the agent's desktop_tree/desktop_* tools drive
+# native apps through the a11y tree instead of pixel hunting. The launcher
+# registers the a11y bus on this session bus (org.a11y.Bus) so every GTK/LO
+# app finds it; toolkit-accessibility flips LibreOffice's ATK bridging on.
+for b in /usr/libexec/at-spi-bus-launcher \
+         /usr/lib/at-spi2-core/at-spi-bus-launcher; do
+  if [ -x "\$b" ]; then "\$b" --launch-immediately & break; fi
+done
+gsettings set org.gnome.desktop.interface toolkit-accessibility true \
+  >/dev/null 2>&1 || true
 # Flat wallpaper on every workspace. The xfdesktop property path embeds the
 # monitor's RandR name — Xvfb exposes a single monitor called "screen".
 MON=\$(xrandr --listmonitors 2>/dev/null | awk 'NR==2 {print \$NF}')

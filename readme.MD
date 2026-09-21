@@ -98,6 +98,8 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 │   ├── Dockerfile              # builds the gut-desktop image (context: repo root)
 │   ├── start.sh                # Xvfb + XFCE + x11vnc + noVNC + daemon launcher
 │   ├── agent_daemon.py         # FastAPI: WS chat, desktop control, LiteLLM, cost
+│   ├── atspi.py                # AT-SPI bridge — desktop_tree/desktop_act for native apps
+│   ├── uno_eval.py             # UNO bridge — office_eval on the live LibreOffice doc
 │   ├── requirements.txt
 │   ├── wallpaper.png/.py       # base desktop art + procedural generator
 │   └── device_wallpaper.py     # hue-rotates the base per DEVICE_NAME at boot
@@ -114,6 +116,7 @@ point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`.
 │   ├── debian/                 # control, postinst (secrets + postgres + services), prerm/postrm
 │   ├── systemd/                # gut-bot.service, gut-litellm.service, gut-openserp.service
 │   ├── openserp-browser        # Chrome launcher for OpenSERP (no-sandbox only, non-snap)
+│   ├── gut-office              # soffice/libreoffice wrapper — injects the UNO listener
 │   ├── gut-bot                 # CLI: info/status/logs/restart/version
 │   └── chromium-gut.conf       # /etc/chromium.d flags (CDP, no-sandbox, scale)
 └── .github/workflows/

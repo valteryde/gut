@@ -16,6 +16,11 @@ contextBridge.exposeInMainWorld('gut', {
   updateLocal: () => ipcRenderer.invoke('local:update'),
   removeLocal: () => ipcRenderer.invoke('local:remove'),
   openExternal: (url) => ipcRenderer.invoke('shell:open', url),
+  // File deliveries save into ~/Downloads via the shell — no save dialog,
+  // and the UI gets back the real path for its "Show in Finder" button.
+  saveFile: (name, b64) => ipcRenderer.invoke('file:save', name, b64),
+  revealFile: (p) => ipcRenderer.invoke('file:reveal', p),
+  openFile: (p) => ipcRenderer.invoke('file:open', p),
   onLocalLog: (cb) => ipcRenderer.on('local:log', (_e, line) => cb(line)),
   updateState: () => ipcRenderer.invoke('update:state'),
   checkUpdate: () => ipcRenderer.invoke('update:check'),

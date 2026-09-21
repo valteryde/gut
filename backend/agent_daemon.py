@@ -79,8 +79,10 @@ COMPACT_RATIO = float(os.environ.get("AGENT_COMPACT_RATIO", "0.75"))
 COMPACT_CONTEXT_LIMIT = int(os.environ.get("AGENT_CONTEXT_LIMIT", "128000"))
 COMPACT_KEEP = int(os.environ.get("AGENT_COMPACT_KEEP", "6"))
 # Steps without an update_todos call before the checklist is nudged back
-# into view on long tasks.
+# into view on long tasks. TODO_NUDGE_STEPS covers the empty case — a run
+# that deep with no checklist usually means the task only looked small.
 TODO_REMIND_STEPS = int(os.environ.get("TODO_REMIND_STEPS", "20"))
+TODO_NUDGE_STEPS = int(os.environ.get("TODO_NUDGE_STEPS", "10"))
 TODO_MAX_ITEMS = int(os.environ.get("TODO_MAX_ITEMS", "30"))
 SCREENSHOT_MAX_EDGE = int(os.environ.get("SCREENSHOT_MAX_EDGE", "1568"))
 SCREENSHOT_MAX_PIXELS = int(os.environ.get("SCREENSHOT_MAX_PIXELS", "1000000"))
@@ -100,6 +102,15 @@ LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
 SEND_FILE_MAX_BYTES = int(os.environ.get("SEND_FILE_MAX_BYTES", str(9 * 1024 * 1024)))
 CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 CDP_HTTP = f"http://localhost:{CDP_PORT}"
+# Structured-control helpers run under the SYSTEM python (/usr/bin/python3)
+# — pyatspi and uno arrive as apt packages (python3-pyatspi / python3-uno),
+# not in the daemon venv. UNO_PORT is the LibreOffice listener the gut-office
+# wrapper injects into every soffice/libreoffice launch.
+SYS_PY = "/usr/bin/python3"
+GUT_DIR = Path(__file__).resolve().parent
+ATSPI_HELPER = GUT_DIR / "atspi.py"
+UNO_HELPER = GUT_DIR / "uno_eval.py"
+UNO_PORT = os.environ.get("GUT_UNO_PORT", "2002")
 # OpenSERP endpoint for web_search — the compose stacks run one on the
 # internal network, gut-bot runs it as a systemd unit on localhost.
 # Empty = fall back to DuckDuckGo's HTML endpoint.
@@ -211,7 +222,20 @@ Environment:
   browser_click / browser_type by ref; browser_eval runs arbitrary JS.
   Fall back to pixel tools for anything outside the page.
 - LibreOffice Writer, Calc and Impress are installed
-  (`libreoffice --writer/--calc/--impress`).
+  (`libreoffice --writer/--calc/--impress`). office_eval runs Python-UNO
+  against the LIVE document — insert content, format, save, export as PDF —
+  no GUI clicking. Globals: `doc` (current document, None if none open),
+  `desktop`, `load(path)`, `file_url`, `uno`; set `result` to return a
+  value. For producing documents from scratch, prefer writing the file
+  directly (python-docx, openpyxl, pandoc, or `soffice --headless
+  -env:UserInstallation=file:///tmp/lo-headless --convert-to pdf out.docx`)
+  and only open the GUI to eyeball the result.
+- desktop_tree is the native-app equivalent of browser_dom: it dumps the
+  focused window's accessibility tree as numbered #refs with role, name,
+  actions and bounds. Act on them with desktop_act (press/activate/select
+  by ref), desktop_type (set text directly) or desktop_click (pixel-click
+  the ref's bounds). Always prefer these over guessing pixel coordinates;
+  re-run desktop_tree after the UI changes — refs go stale.
 - run_command gives you a bash shell (cwd {home}, DISPLAY already set).
   Launch GUI apps in the background so the command returns, e.g. `google-chrome &`.
 - {home}/scratch is wiped when the task ends — use it for temp and
@@ -245,12 +269,15 @@ Talking to the user — act like a teammate, not a live feed:
   Make it a good one: what was done, where results live, what to check.
 
 Planning — match the effort to the task:
-- Small tasks: just do them — no plan, no checklist.
-- Big multi-phase tasks: call share_plan once with a concise plan (it posts
-  to the user as a card — no approval needed, keep working), then
-  update_todos with the step list. Pass the full list every call, keep
-  exactly one item in_progress, mark steps done as you go. If the scope
-  changes, share_plan again and rewrite the list.
+- Quick one-off actions: just do them — no plan, no checklist.
+- Anything with several distinct phases or likely more than ~15 steps
+  (research-then-write, multi-site collection, install-and-configure): call
+  share_plan once with a concise plan (it posts to the user as a card — no
+  approval needed, keep working), then update_todos with the step list.
+  Pass the full list every call, keep exactly one item in_progress, mark
+  steps done as you go. When in doubt, make the checklist — it costs little
+  and the user watches it live. If the scope changes, share_plan again and
+  rewrite the list.
 - On very long runs your older context gets compacted into a handoff
   summary — the checklist always survives it. Anything else worth keeping
   (paths, URLs, decisions, findings) belongs in the todo text or in files
@@ -262,7 +289,10 @@ Guidelines:
 - Batch predictable sequences into one response — emit several tool calls at
   once (e.g. click field → type → press enter). Split only when the next step
   depends on what the screen shows after the previous one.
-- Prefer keyboard shortcuts, direct typing and run_command over pixel hunting.
+- Prefer desktop_* refs, office_eval, keyboard shortcuts and run_command
+  over pixel hunting — raw coordinates are the fallback, not the default.
+- In file chooser dialogs press ctrl+l to open the location bar, type the
+  absolute path and hit enter — never navigate the places list by mouse.
 - For anything online, web_search/fetch_url first; browser_* only when they
   fail or the page genuinely needs a browser (JS, auth, interaction).
 - If an action changes nothing after two tries, stop and brainstorm at least
@@ -274,8 +304,10 @@ Guidelines:
   landing, click the target field first (or use browser_type on web pages).
 - Never click tel:/mailto: links; they're blocked and just pop a dead-end OS
   dialog. Read phone numbers and addresses with browser_text instead.
-- If an OS dialog does appear ('Open xdg-open?', permission prompts, file
-  pickers), press Escape to dismiss it rather than pixel-clicking buttons.
+- If an OS dialog does appear ('Open xdg-open?', permission prompts),
+  press Escape to dismiss it rather than pixel-clicking buttons. File
+  pickers you opened yourself are fine — use ctrl+l (see above) or
+  desktop_tree to work them.
 - If a login, 2FA, CAPTCHA or genuinely ambiguous decision blocks you, call
   ask_user — the human can click into the live screen to help, then resume you.
 - When your task ends the system closes the apps, windows and browser tabs
@@ -337,6 +369,9 @@ class AgentState:
             self.shot_size = (1024, 768)
         self.frame_hash: str | None = None  # last frame sent to the model
         self.browser_ws: str | None = None  # CDP ws url of the active page
+        # Last desktop_tree ref map: ref -> a11y path ("app|i,j,...").
+        # Stale after any UI change — desktop_tree refreshes it.
+        self.a11y_map: dict[int, str] = {}
         self.conversation_id: str | None = None  # conversation of the current/last run
         self.session_usd = 0.0
         self.tokens_in = 0
@@ -907,24 +942,38 @@ async def push_status() -> None:
 
 # ── Desktop control ──────────────────────────────────────────────────────────
 
-def capture_frame() -> tuple[str, str]:
-    """Return (base64 JPEG, content hash) of the current screen."""
+def capture_frame(region: tuple[int, int, int, int] | None = None
+                  ) -> tuple[str, str]:
+    """Return (base64 JPEG, content hash) of the current screen. `region` is
+    a real-pixel (left, upper, right, lower) crop for zoomed detail reads —
+    it may be upscaled for legibility and does NOT move the coordinate
+    bookkeeping (clicks keep mapping through the last full frame)."""
     subprocess.run(["scrot", "-o", str(SHOT_PATH)], check=True)
     img = Image.open(SHOT_PATH).convert("RGB")
+    if region:
+        box = (max(0, region[0]), max(0, region[1]),
+               min(img.width, region[2]), min(img.height, region[3]))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            raise ValueError("region is outside the screen")
+        img = img.crop(box)
     # Vision APIs silently rescale images past their limits (Anthropic: >1568px
     # long edge or >~1.15MP) and the model then emits coordinates in that
-    # rescaled space — clicks land off-target. Stay under both limits.
+    # rescaled space — clicks land off-target. Stay under both limits. Full
+    # frames are never enlarged; crops exist to be read, so upscaling a small
+    # region is the point (bounded by the same caps).
     scale = min(
         SCREENSHOT_MAX_EDGE / max(img.size),
         (SCREENSHOT_MAX_PIXELS / (img.width * img.height)) ** 0.5,
-        1.0,
     )
-    if scale < 1.0:
-        img = img.resize((round(img.width * scale), round(img.height * scale)))
+    scale = min(scale, 8.0) if region else min(scale, 1.0)
+    if abs(scale - 1.0) > 1e-3:
+        img = img.resize((max(1, round(img.width * scale)),
+                          max(1, round(img.height * scale))))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=80)
-    state.coord_scale = 1.0 / scale
-    state.shot_size = img.size
+    if not region:
+        state.coord_scale = 1.0 / scale
+        state.shot_size = img.size
     data = buf.getvalue()
     return base64.b64encode(data).decode(), hashlib.sha256(data).hexdigest()
 
@@ -986,6 +1035,19 @@ def press_keys(spec: str) -> str:
     keys = [_KEYMAP.get(k.lower(), k.lower()) for k in spec.split()]
     pyautogui.press(keys)
     return f"pressed {' '.join(keys)}"
+
+
+def _session_combo(spec: str) -> bool:
+    """ctrl+alt combos that hijack or end the whole session — logout
+    (delete), xkill (escape), X zap (backspace), VT switch (F-keys)."""
+    sep = "+" if "+" in spec else None
+    keys = {_KEYMAP.get(k.strip().lower(), k.strip().lower())
+            for k in spec.split(sep)}
+    if not {"ctrl", "alt"} <= keys:
+        return False
+    rest = keys - {"ctrl", "alt", "shift", "win"}
+    return bool(rest & {"delete", "esc", "backspace"}) or \
+        any(k.startswith("f") and k[1:].isdigit() for k in rest)
 
 
 def type_text(text: str) -> str:
@@ -1068,6 +1130,95 @@ def _unfocused_warning() -> str | None:
         return (f"NOTE: focus is on '{win}', not an app — keystrokes may "
                 "have gone nowhere. focus_window or click a field first.")
     return None
+
+
+# ── Structured desktop control (AT-SPI + UNO) ────────────────────────────────
+# Same idea as the CDP bridge below, for native apps: read the accessibility
+# tree and act on named elements instead of hunting pixels; drive the live
+# LibreOffice document over its UNO socket. Both helpers run under the
+# system python and need the session bus — borrowed via _session_env (the
+# daemon itself starts outside dbus-run-session).
+
+def _sys_py(helper: Path, *argv: str, stdin: str = "",
+            timeout: int = 20) -> str:
+    if not helper.exists():
+        return f"helper missing: {helper} (image/package out of date?)"
+    try:
+        p = subprocess.run([SYS_PY, str(helper), *argv], input=stdin,
+                           capture_output=True, text=True, timeout=timeout,
+                           env=_session_env())
+    except subprocess.TimeoutExpired:
+        return f"{helper.name} timed out — the UI may be unresponsive"
+    except OSError as e:
+        return f"cannot run {helper.name}: {e}"
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    if out:
+        if p.returncode and err:
+            out += f"\n(stderr: {err[-400:]})"
+        return out
+    return err or f"(exit {p.returncode}, no output)"
+
+
+def desktop_tree(app: str = "") -> str:
+    out = _sys_py(ATSPI_HELPER, "tree", app)
+    body, sep, raw = out.partition("\n@@map ")
+    if not sep:
+        state.a11y_map = {}
+        return out
+    try:
+        state.a11y_map = {int(k): v for k, v in json.loads(raw).items()}
+    except (ValueError, AttributeError):
+        state.a11y_map = {}
+    return body
+
+
+def _a11y_path(ref) -> str | None:
+    try:
+        return state.a11y_map.get(int(ref))
+    except (TypeError, ValueError):
+        return None
+
+
+def desktop_act(ref, action: str = "") -> str:
+    path = _a11y_path(ref)
+    if not path:
+        return f"unknown ref {ref} — run desktop_tree first"
+    return _sys_py(ATSPI_HELPER, "act", path, action)
+
+
+def desktop_click(ref) -> str:
+    path = _a11y_path(ref)
+    if not path:
+        return f"unknown ref {ref} — run desktop_tree first"
+    out = _sys_py(ATSPI_HELPER, "bounds", path)
+    try:
+        x, y, w, h, cx, cy = (int(v) for v in out.split()[:6])
+    except (ValueError, IndexError):
+        return f"no bounds for ref {ref}: {out}"
+    if not (w and h):
+        return f"ref {ref} has no on-screen bounds — try desktop_act"
+    pyautogui.click(cx, cy)
+    return f"clicked ref {ref} at {cx},{cy}"
+
+
+def desktop_type(ref, text: str) -> str:
+    path = _a11y_path(ref)
+    if not path:
+        return f"unknown ref {ref} — run desktop_tree first"
+    out = _sys_py(ATSPI_HELPER, "settext", path, text)
+    if not out.startswith("error:"):
+        return out
+    # Not an editable node — fall back to focus + real keystrokes.
+    foc = _sys_py(ATSPI_HELPER, "focus", path)
+    if foc.startswith("error:"):
+        return f"{out}; focus fallback also failed: {foc}"
+    return type_text(text)
+
+
+def office_eval(code: str) -> str:
+    # Cold-starting LibreOffice can take tens of seconds on a weak VPS.
+    return _sys_py(UNO_HELPER, stdin=code, timeout=90)
 
 
 # ── Chrome DevTools Protocol ──────────────────────────────────────────────────
@@ -1610,12 +1761,22 @@ SCREEN_TOOLS = {
     "scroll", "type_text", "key", "run_command", "wait",
     "browser_navigate", "browser_click", "browser_type", "open_url",
     "focus_window",
+    "desktop_act", "desktop_click", "desktop_type", "office_eval",
 }
 
 TOOLS = [
     {"type": "function", "function": {
-        "name": "screenshot", "description": "Capture the current screen.",
-        "parameters": {"type": "object", "properties": {}}}},
+        "name": "screenshot",
+        "description": "Capture the current screen. Pass `region` "
+                       "[x, y, w, h] (in screenshot coordinates) to zoom "
+                       "into a detail — the crop is enlarged for "
+                       "readability. Positions in a crop are relative to "
+                       "the crop: keep issuing clicks in normal "
+                       "full-screen coordinates.",
+        "parameters": {"type": "object", "properties": {
+            "region": {"type": "array", "items": {"type": "integer"},
+                       "minItems": 4, "maxItems": 4,
+                       "description": "optional [x, y, w, h] crop"}}}}},
     {"type": "function", "function": {
         "name": "wait",
         "description": "Wait for the screen to change (page loads, app launches, "
@@ -1759,6 +1920,55 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "match": {"type": "string"}}, "required": ["match"]}}},
     {"type": "function", "function": {
+        "name": "desktop_tree",
+        "description": "Dump the focused window's accessibility tree — the "
+                       "native-app equivalent of browser_dom: numbered #refs "
+                       "with role, name, available actions and on-screen "
+                       "bounds. Pass `app` (name substring) to target a "
+                       "window that isn't focused. Required before "
+                       "desktop_act/desktop_click/desktop_type; re-run after "
+                       "the UI changes — refs go stale.",
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string",
+                    "description": "app name substring, e.g. 'libreoffice'"}}}}},
+    {"type": "function", "function": {
+        "name": "desktop_act",
+        "description": "Perform an accessibility action on #ref from the last "
+                       "desktop_tree — 'press' a button, 'activate' a menu "
+                       "item, 'select' a row. Far more reliable than pixel "
+                       "clicks. `action` may be omitted when the element has "
+                       "only one.",
+        "parameters": {"type": "object", "properties": {
+            "ref": {"type": "integer"},
+            "action": {"type": "string",
+                       "description": "action name from the ref's [..] list"}},
+            "required": ["ref"]}}},
+    {"type": "function", "function": {
+        "name": "desktop_click",
+        "description": "Pixel-click the center of #ref's bounds from the last "
+                       "desktop_tree — for elements with no useful action.",
+        "parameters": {"type": "object", "properties": {
+            "ref": {"type": "integer"}}, "required": ["ref"]}}},
+    {"type": "function", "function": {
+        "name": "desktop_type",
+        "description": "Set the text of editable #ref directly (no "
+                       "keystrokes); falls back to focusing the node and "
+                       "typing when it isn't editable.",
+        "parameters": {"type": "object", "properties": {
+            "ref": {"type": "integer"}, "text": {"type": "string"}},
+            "required": ["ref", "text"]}}},
+    {"type": "function", "function": {
+        "name": "office_eval",
+        "description": "Run Python-UNO code against the LIVE LibreOffice "
+                       "document — insert content, format, save, export as "
+                       "PDF — without touching the GUI. Globals: `doc` (the "
+                       "open document, None if none), `desktop`, `load(path)` "
+                       "to open a file, `file_url`, `uno`; assign `result` "
+                       "to return a value. Starts LibreOffice with the "
+                       "listener if it isn't running.",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string"}}, "required": ["code"]}}},
+    {"type": "function", "function": {
         "name": "send_message",
         "description": "Send a chat message to the user. Like a teammate: "
                        "milestones, blockers, things worth interrupting for — "
@@ -1814,10 +2024,10 @@ TOOLS = [
             "name": {"type": "string"}}}}},
     {"type": "function", "function": {
         "name": "share_plan",
-        "description": "Post your plan to the user as a card in chat. On big "
+        "description": "Post your plan to the user as a card in chat. On "
                        "multi-phase tasks share the plan once before "
                        "starting, then track the steps with update_todos. "
-                       "Small tasks need neither.",
+                       "Quick one-off actions need neither.",
         "parameters": {"type": "object", "properties": {
             "plan": {"type": "string",
                      "description": "concise plan, markdown ok"}},
@@ -2073,6 +2283,23 @@ async def execute_tool(name: str, args: dict,
             return f"{name} isn't available to the {agent} agent", False
     try:
         if name == "screenshot":
+            region = args.get("region")
+            if region:
+                try:
+                    rx, ry, rw, rh = (int(v) for v in region[:4])
+                    x0, y0 = to_real_xy([rx, ry])
+                    x1, y1 = to_real_xy([rx + rw, ry + rh])
+                    b64, _ = capture_frame((x0, y0, x1, y1))
+                except (ValueError, TypeError, IndexError,
+                        subprocess.SubprocessError) as e:
+                    return f"screenshot region failed: {e}", False
+                return [{"type": "text", "text":
+                         f"crop of region [{rx},{ry} {rw}x{rh}], enlarged "
+                         "for reading — positions in this image are "
+                         "crop-relative; clicks still use normal "
+                         "screenshot coordinates"},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}"}}], False
             return [{"type": "text", "text": "captured screenshot"},
                     screenshot_block(force=True)], False
         if name == "wait":
@@ -2114,7 +2341,11 @@ async def execute_tool(name: str, args: dict,
             if warn:
                 result = _note(result, warn)
         elif name == "key":
-            result = press_keys(str(args.get("keys", "")))
+            spec = str(args.get("keys", ""))
+            if agent == JANITOR_NAME and _session_combo(spec):
+                return ("key combo blocked — session-level shortcuts are "
+                        "off limits during cleanup", False)
+            result = press_keys(spec)
             warn = _unfocused_warning()
             if warn:
                 result = _note(result, warn)
@@ -2149,6 +2380,20 @@ async def execute_tool(name: str, args: dict,
             result = list_windows()
         elif name == "focus_window":
             result = focus_window(str(args.get("match", "")))
+        elif name == "desktop_tree":
+            result = await asyncio.to_thread(desktop_tree,
+                                             str(args.get("app", "")))
+        elif name == "desktop_act":
+            result = await asyncio.to_thread(desktop_act, args.get("ref"),
+                                             str(args.get("action", "")))
+        elif name == "desktop_click":
+            result = await asyncio.to_thread(desktop_click, args.get("ref"))
+        elif name == "desktop_type":
+            result = await asyncio.to_thread(desktop_type, args.get("ref"),
+                                             str(args.get("text", "")))
+        elif name == "office_eval":
+            result = await asyncio.to_thread(office_eval,
+                                             str(args.get("code", "")))
         elif name == "send_message":
             text = str(args.get("text", "")).strip()
             if not text:
@@ -2741,8 +2986,12 @@ def _snapshot_procs() -> dict[str, str]:
         if not p.name.isdigit():
             continue
         try:
-            out[p.name] = \
-                (p / "stat").read_text().rsplit(")", 1)[1].split()[19]
+            st = (p / "stat").read_text().rsplit(")", 1)[1].split()
+            # Zombies are already dead — a pid-1 uvicorn never reaps
+            # orphans, so they linger and would be swept every time.
+            if st[0] == "Z":
+                continue
+            out[p.name] = st[19]
         except (OSError, IndexError):
             continue
     return out
@@ -2800,9 +3049,57 @@ def _persist_baseline(b: dict | None) -> None:
         pass
 
 
+# Desktop/session plumbing the sweep must never kill, even when it respawned
+# mid-run — a new pid+starttime reads as run-created, but SIGTERM to
+# xfce4-panel takes the top bar and dock with it, and losing the session,
+# VNC or model stack is worse. comm strings are capped at 15 chars.
+PROTECTED_PROCS = {
+    "Xvfb", "Xorg", "x11vnc", "xfce4-session", "xfce4-panel", "xfdesktop",
+    "xfwm4", "xfsettingsd", "xfconfd", "Thunar", "wrapper-2.0",
+    "dbus-daemon", "dbus-launch", "dbus-run-sessio", "gpg-agent",
+    "ssh-agent", "startxfce4", "gut-session.sh", "xfce4-power-man",
+    "light-locker", "litellm", "openserp",
+}
+PROTECTED_PREFIXES = ("gvfs", "at-spi", "xfsm-", "postgres")
+PROTECTED_CMDLINES = ("websockify", "tcpmux", "litellm", "openserp")
+
+
+def _proc_protected(pid: int) -> bool:
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return False
+    if comm in PROTECTED_PROCS or comm.startswith(PROTECTED_PREFIXES):
+        return True
+    try:
+        cl = (Path(f"/proc/{pid}/cmdline").read_bytes()
+              .replace(b"\0", b" ").decode("utf-8", "replace"))
+    except OSError:
+        return False
+    return any(s in cl for s in PROTECTED_CMDLINES)
+
+
+def _window_owners() -> dict[str, int]:
+    """window-id -> owner pid via `wmctrl -lp` (0 when unresolvable)."""
+    try:
+        p = subprocess.run(["wmctrl", "-l", "-p"], capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out = {}
+    for ln in p.stdout.splitlines():
+        parts = ln.split(None, 4)
+        if len(parts) >= 3:
+            try:
+                out[parts[0]] = int(parts[2])
+            except ValueError:
+                out[parts[0]] = 0
+    return out
+
+
 def sweep_desktop(baseline: dict) -> dict:
     """Close tabs/windows and kill processes created since baseline — never
-    anything that predates the run. Returns counts."""
+    anything that predates the run or is desktop infrastructure."""
     stats = {"tabs": 0, "windows": 0, "procs": 0, "scratch": 0}
 
     # Closing a tab never logs anyone out — cookies live in the profile.
@@ -2821,7 +3118,13 @@ def sweep_desktop(baseline: dict) -> dict:
         pass
 
     # Graceful close so apps shut down clean (no soffice recovery prompt).
-    for wid in set(_snapshot_windows()) - set(baseline.get("windows") or []):
+    # Windows owned by protected processes (a panel that respawned mid-run,
+    # the desktop itself) read as "new" but are not residue — skip them.
+    owners = _window_owners()
+    wids = set(owners) or set(_snapshot_windows())
+    for wid in wids - set(baseline.get("windows") or []):
+        if _proc_protected(owners.get(wid) or 0):
+            continue
         subprocess.run(["wmctrl", "-i", "-c", wid],
                        check=False, capture_output=True)
         stats["windows"] += 1
@@ -2835,7 +3138,8 @@ def sweep_desktop(baseline: dict) -> dict:
 
     def new_procs() -> list[int]:
         return [int(p) for p, s in _snapshot_procs().items()
-                if old_pids.get(p) != s and p != me]
+                if old_pids.get(p) != s and p != me
+                and not _proc_protected(int(p))]
 
     for pid in new_procs():
         try:
@@ -2864,6 +3168,78 @@ def sweep_desktop(baseline: dict) -> dict:
     return stats
 
 
+def _proc_alive(comm: str) -> bool:
+    """pgrep -x, minus zombies: orphaned procs reparent to pid 1 — the
+    daemon itself — which never reaps, so the dead still list."""
+    try:
+        pids = subprocess.run(["pgrep", "-x", comm], capture_output=True,
+                              text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for pid in pids:
+        try:
+            st = Path(f"/proc/{pid}/stat").read_text() \
+                .rsplit(")", 1)[1].split()[0]
+            if st != "Z":
+                return True
+        except (OSError, IndexError):
+            continue
+    return False
+
+
+def _session_env() -> dict:
+    """The daemon's env lacks the session bus — dbus-run-session creates a
+    private one for gut-session.sh — so borrow it from the session manager
+    for relaunched components to land on the right bus and display."""
+    env = dict(os.environ)
+    try:
+        pids = subprocess.run(["pgrep", "-x", "xfce4-session"],
+                              capture_output=True, text=True,
+                              timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for pid in pids:
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            continue
+        for kv in raw.split(b"\0"):
+            k, _, v = kv.partition(b"=")
+            if k in (b"DBUS_SESSION_BUS_ADDRESS", b"DISPLAY", b"XAUTHORITY"):
+                env[k.decode()] = v.decode()
+        if env.get("DBUS_SESSION_BUS_ADDRESS"):
+            break
+    return env
+
+
+def heal_desktop() -> list[str]:
+    """Relaunch desktop components missing after cleanup — a panel or WM
+    that died mid-run (or was swept before protection existed) leaves a
+    bare screen. No-op when the session itself is gone (real logout), so
+    this never fights a shutdown."""
+    if not _proc_alive("xfce4-session"):
+        return []
+    env = _session_env()
+    revived = []
+    for proc, cmd in (("xfwm4", ["xfwm4"]),
+                      ("xfsettingsd", ["xfsettingsd"]),
+                      ("xfdesktop", ["xfdesktop"]),
+                      ("xfce4-panel", ["xfce4-panel"])):
+        if _proc_alive(proc):
+            continue
+        try:
+            subprocess.Popen(["setsid", *cmd], env=env,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            revived.append(proc)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if revived:
+        time.sleep(1.5)  # let them register before the next baseline
+    return revived
+
+
 # The janitor gets desktop tools only — no run_command (too broad for an
 # unsupervised pass), no browser_* (tabs were just closed), no ask_user
 # (cleanup must never block) and no send_* (the wrap-up already went out).
@@ -2871,7 +3247,7 @@ JANITOR_NAME = "janitor"
 JANITOR_TOOL_NAMES = {
     "screenshot", "wait", "list_windows", "focus_window", "left_click",
     "right_click", "double_click", "mouse_move", "scroll", "type_text",
-    "key", "task_complete",
+    "key", "desktop_tree", "desktop_act", "desktop_click", "task_complete",
 }
 JANITOR_TOOLS = [t for t in TOOLS
                  if t["function"]["name"] in JANITOR_TOOL_NAMES]
@@ -2885,7 +3261,10 @@ discard prompts, stray windows), close it. Escape or alt-F4 for dialogs.
 Rules:
 - Discard unsaved work when asked — deliverables were already sent to the user.
 - Never delete files, clear browser data, or log out of anything.
-- Leave the panels, wallpaper and desktop icons alone.
+- Leave the panels, wallpaper and desktop icons alone — never click power,
+  session, "Log Out" or "Shut Down" controls (including the panel's corner
+  button), and never send Ctrl+Alt+Delete. If a logout or shutdown dialog
+  is already open, cancel it with Escape or its Cancel button.
 - When nothing is left to close — or nothing needed closing — call \
 task_complete with a one-line summary of what you closed.
 """
@@ -3004,12 +3383,15 @@ async def cleanup_after_run(conv_id: str, baseline: dict | None,
             report = await janitor_pass(conv_id)
             if baseline:
                 await asyncio.to_thread(sweep_desktop, baseline)
+        revived = await asyncio.to_thread(heal_desktop)
         text = "tidy-up"
         if parts:
             text += ": closed " + ", ".join(parts)
         if report:
             text += f" — janitor: {report}"
-        if parts or report:
+        if revived:
+            text += " — restarted " + ", ".join(revived)
+        if parts or report or revived:
             await broadcast({"type": "cleanup", "text": text})
     except Exception as e:
         print(f"[gut] cleanup failed: {e}")
@@ -3101,19 +3483,26 @@ async def agent_loop(conv_id: str, task_text: str,
                     if last_tin > limit * COMPACT_RATIO:
                         await compact_context(http, conv_id, messages)
 
-                # Stale-checklist nudge on long tasks: applied onto the last
-                # tool result so it lands in the same request.
-                if state.todos:
-                    state.steps_since_todo += 1
-                    if (state.steps_since_todo >= TODO_REMIND_STEPS
-                            and messages
-                            and messages[-1].get("role") == "tool"):
-                        state.steps_since_todo = 0
-                        messages[-1]["content"] = _note(
-                            messages[-1]["content"],
-                            f"your checklist hasn't changed in "
-                            f"{TODO_REMIND_STEPS} steps — mark progress via "
-                            "update_todos")
+                # Checklist nudges on long tasks: bootstrap one when the run
+                # is deep with none, or poke a stale one back into view.
+                # Applied onto the last tool result so it lands in the same
+                # request.
+                state.steps_since_todo += 1
+                threshold = (TODO_REMIND_STEPS if state.todos
+                             else TODO_NUDGE_STEPS)
+                if (state.steps_since_todo >= threshold
+                        and messages
+                        and messages[-1].get("role") == "tool"):
+                    state.steps_since_todo = 0
+                    note = (
+                        f"your checklist hasn't changed in "
+                        f"{TODO_REMIND_STEPS} steps — mark progress via "
+                        "update_todos") if state.todos else (
+                        f"{TODO_NUDGE_STEPS} steps in and no checklist — if "
+                        "the task has multiple phases left, track it with "
+                        "update_todos")
+                    messages[-1]["content"] = _note(
+                        messages[-1]["content"], note)
 
                 prune_images(messages)
                 if cache_friendly():
@@ -3574,6 +3963,9 @@ async def lifespan(_app: FastAPI):
             try:
                 stats = await asyncio.to_thread(sweep_desktop, stale)
                 print(f"[gut] swept leftovers of interrupted run: {stats}")
+                revived = await asyncio.to_thread(heal_desktop)
+                if revived:
+                    print(f"[gut] restarted desktop components: {revived}")
             except Exception as e:
                 print(f"[gut] startup sweep failed: {e}")
         _persist_baseline(None)

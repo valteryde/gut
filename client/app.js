@@ -351,17 +351,85 @@ function fmtSize(n) {
   return `${n} B`;
 }
 
-const FILE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+const svgIcon = (inner) =>
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>' +
-  '<path d="M14 2v6h6"/></svg>';
+  inner + '</svg>';
+
+const FILE_PAGE = '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 ' +
+  '0 0 2-2V8z"/><path d="M14 2v6h6"/>';
+const FILE_ICON = svgIcon(FILE_PAGE);
+
+// File-card iconography: each delivery gets a tinted tile whose glyph and
+// color say what kind of file it is. Kinds match on extension first, then
+// mime; CSS tints the tile via the `k-<kind>` class.
+const FILE_KINDS = {
+  image:   { exts: 'png jpg jpeg gif webp svg bmp ico tif tiff avif heic',
+             glyph: '<rect x="3" y="3" width="18" height="18" rx="2"/>' +
+                    '<circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>' },
+  pdf:     { exts: 'pdf',
+             glyph: FILE_PAGE + '<path d="M8 13h8M8 16.5h5"/>' },
+  audio:   { exts: 'mp3 wav ogg flac m4a aac opus mid midi',
+             glyph: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/>' +
+                    '<circle cx="18" cy="16" r="3"/>' },
+  video:   { exts: 'mp4 mov webm mkv avi m4v',
+             glyph: '<rect x="2.5" y="5" width="19" height="14" rx="2"/>' +
+                    '<path d="M10 9.2l5 2.8-5 2.8z" fill="currentColor" stroke="none"/>' },
+  archive: { exts: 'zip tar gz tgz bz2 xz 7z rar zst dmg iso jar',
+             glyph: '<path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/>' +
+                    '<path d="M10 12h4"/>' },
+  code:    { exts: 'js mjs cjs ts mts cts jsx tsx py rb go rs java c h cc ' +
+                   'cpp hpp cs php sh bash zsh swift kt kts scala lua pl r ' +
+                   'html css scss json yml yaml toml xml sql vue svelte env lock',
+             glyph: '<path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/>' },
+  sheet:   { exts: 'csv tsv xls xlsx ods numbers',
+             glyph: '<rect x="3" y="4" width="18" height="16" rx="2"/>' +
+                    '<path d="M3 10h18M3 15h18M10 4v16"/>' },
+  slides:  { exts: 'ppt pptx odp key',
+             glyph: '<rect x="3" y="4" width="18" height="12" rx="1.5"/>' +
+                    '<path d="M12 16v4M8 20h8"/>' },
+  doc:     { exts: 'txt md markdown log rtf doc docx odt pages tex epub',
+             glyph: FILE_PAGE + '<path d="M8 13h8M8 16.5h8"/>' },
+};
+const KIND_BY_EXT = {};
+for (const [k, v] of Object.entries(FILE_KINDS))
+  for (const e of v.exts.split(' ')) KIND_BY_EXT[e] = k;
+const KIND_BY_MIME = {
+  'application/pdf': 'pdf',
+  'application/json': 'code',
+  'application/javascript': 'code', 'text/javascript': 'code',
+  'application/xml': 'code', 'text/xml': 'code',
+  'application/zip': 'archive', 'application/gzip': 'archive',
+  'application/x-tar': 'archive', 'application/x-7z-compressed': 'archive',
+  'application/x-rar-compressed': 'archive',
+  'text/csv': 'sheet',
+  'application/vnd.ms-excel': 'sheet',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'sheet',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'doc',
+  'application/vnd.ms-powerpoint': 'slides',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'slides',
+};
+
+function fileKind(name, mime) {
+  const nm = String(name || '').toLowerCase();
+  const ext = nm.includes('.') ? nm.split('.').pop() : '';
+  if (KIND_BY_EXT[ext]) return KIND_BY_EXT[ext];
+  const m = String(mime || '').toLowerCase();
+  if (KIND_BY_MIME[m]) return KIND_BY_MIME[m];
+  if (FILE_KINDS[m.split('/')[0]]) return m.split('/')[0];
+  if (m.startsWith('text/')) return 'doc';
+  return 'file';
+}
+
+const fileGlyph = (kind) => svgIcon((FILE_KINDS[kind] || {}).glyph || FILE_PAGE);
 
 // An attachment chip: file icon + name (+ size when known). `removable`
 // adds the × used by the composer's staging tray.
 function attachChip(f, removable, onRemove) {
   const chip = document.createElement('span');
   chip.className = 'att';
-  chip.insertAdjacentHTML('beforeend', FILE_ICON);
+  chip.insertAdjacentHTML('beforeend', fileGlyph(fileKind(f.name, f.mime)));
   const nm = document.createElement('span');
   nm.className = 'nm';
   nm.textContent = f.name;
@@ -436,6 +504,111 @@ function addUserMsg(m) {
   if (mode) body.appendChild(queueTag(mode, cid, m.seq));
 }
 
+const ICON_DOWNLOAD = svgIcon('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 ' +
+  '1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>');
+const ICON_FOLDER = svgIcon('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 ' +
+  '1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>');
+
+const finderLabel = () =>
+  gut?.platform === 'darwin' ? 'Show in Finder'
+    : gut?.platform === 'win32' ? 'Show in Explorer' : 'Show in folder';
+
+// "saved to ~/Downloads/x — Show in Finder" line appended once a delivery
+// has been written to disk.
+function savedNote(r) {
+  const s = document.createElement('span');
+  s.className = 'saved-note';
+  s.append(`saved to ${r.display} — `);
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'linkish';
+  b.textContent = finderLabel();
+  b.onclick = () => gut.revealFile(r.path);
+  s.appendChild(b);
+  return s;
+}
+
+// Save a delivered file: inside Electron it goes straight to ~/Downloads
+// via IPC (returns the real path); in a plain browser we trigger a blob
+// download and can only point at the Downloads folder.
+async function saveDelivery(m) {
+  if (gut?.saveFile) return gut.saveFile(m.name || 'file', m.data);
+  const a = document.createElement('a');
+  a.href = b64ToBlobUrl(m.data, m.mime);
+  a.download = m.name || 'file';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10e3);
+  return { ok: true };
+}
+
+// A delivered file: tinted type tile, name + "TYPE · size", and a download
+// button that turns into "Show in Finder" once the file is on disk.
+function fileCard(m) {
+  const kind = fileKind(m.name, m.mime);
+  const card = document.createElement('div');
+  card.className = `fcard k-${kind}`;
+
+  const tile = document.createElement('span');
+  tile.className = 'ftile';
+  tile.innerHTML = fileGlyph(kind);
+
+  const nm = String(m.name || 'file');
+  const ext = nm.includes('.') ? nm.split('.').pop().toUpperCase() : '';
+  const sub0 = `${ext || kind} · ${fmtSize(m.size || 0)}`;
+  const meta = document.createElement('span');
+  meta.className = 'fmeta';
+  const name = document.createElement('span');
+  name.className = 'fname';
+  name.textContent = nm;
+  name.title = nm;
+  const sub = document.createElement('span');
+  sub.className = 'fsub';
+  sub.textContent = sub0;
+  meta.append(name, sub);
+
+  const acts = document.createElement('span');
+  acts.className = 'facts';
+  const dl = document.createElement('button');
+  dl.type = 'button';
+  dl.className = 'fbtn';
+  dl.innerHTML = `${ICON_DOWNLOAD}<span>Download</span>`;
+  dl.onclick = async () => {
+    dl.disabled = true;
+    dl.querySelector('span').textContent = 'Saving…';
+    const r = await saveDelivery(m);
+    if (r?.ok && r.path) {
+      sub.textContent = `${sub0} · ${r.display}`;
+      acts.innerHTML = '';
+      const reveal = document.createElement('button');
+      reveal.type = 'button';
+      reveal.className = 'fbtn';
+      reveal.innerHTML = `${ICON_FOLDER}<span>${finderLabel()}</span>`;
+      reveal.onclick = () => gut.revealFile(r.path);
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'fbtn ghost';
+      open.innerHTML = '<span>Open</span>';
+      open.onclick = () => gut.openFile(r.path);
+      acts.append(reveal, open);
+      card.classList.add('saved');
+    } else if (r?.ok) {
+      sub.textContent = `${sub0} · saved to your Downloads folder`;
+      dl.querySelector('span').textContent = 'Download';
+      dl.disabled = false;
+    } else {
+      sub.textContent = `save failed — ${r?.error || 'unknown error'}`;
+      dl.querySelector('span').textContent = 'Download';
+      dl.disabled = false;
+    }
+  };
+  if (!m.data) dl.disabled = true;
+  acts.appendChild(dl);
+  card.append(tile, meta, acts);
+  return card;
+}
+
 function addFileMsg(m) {
   const { body } = entry('file', agentName);
   if (m.note) {
@@ -444,18 +617,7 @@ function addFileMsg(m) {
     p.textContent = m.note;
     body.appendChild(p);
   }
-  const a = document.createElement('a');
-  a.className = 'file-link';
-  a.href = b64ToBlobUrl(m.data, m.mime);
-  a.download = m.name;
-  const name = document.createElement('span');
-  name.className = 'file-name';
-  name.textContent = m.name;
-  const size = document.createElement('span');
-  size.className = 'file-size';
-  size.textContent = fmtSize(m.size || 0);
-  a.append(name, size);
-  body.appendChild(a);
+  body.appendChild(fileCard(m));
 }
 
 function addImageMsg(m) {
@@ -465,6 +627,20 @@ function addImageMsg(m) {
   a.href = url;
   a.target = '_blank';
   a.download = m.name || 'image';
+  let note = null;
+  // In the shell a click saves to ~/Downloads instead of popping a dialog;
+  // the blob URL is only a fallback preview target in a plain browser.
+  if (gut?.saveFile) {
+    a.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const r = await saveDelivery(m);
+      if (!r?.ok || !r.path) return;
+      const n = savedNote(r);
+      if (note) note.replaceWith(n);
+      else body.appendChild(n);
+      note = n;
+    });
+  }
   const img = document.createElement('img');
   img.className = 'msg-img';
   img.src = url;
@@ -2310,6 +2486,7 @@ async function waitForVersion(d, target, info) {
 const settingsOpen = () => !settingsPage.hidden;
 
 function openSettings() {
+  if (aboutOpen()) closeAbout();
   settingsPage.hidden = false;
   document.body.classList.add('settings-open');
 }
@@ -2513,7 +2690,47 @@ $('settingsBtn').onclick = () => {
 
 $('settingsBack').onclick = closeSettings;
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && settingsOpen() && !editingKey) closeSettings();
+  if (e.key !== 'Escape') return;
+  if (settingsOpen() && !editingKey) closeSettings();
+  else if (aboutOpen()) backToSettings();  // about is a sub-page of Settings
+});
+
+// ── about page ("What gut can do") ─────────────────────────────────────
+// A sub-page of Settings: the entry row lives at the bottom of the
+// settings page and Back/Esc return there rather than to the main view.
+const aboutPage = $('aboutPage');
+const aboutOpen = () => !aboutPage.hidden;
+
+function openAbout() {
+  if (settingsOpen()) closeSettings();
+  aboutPage.hidden = false;
+  document.body.classList.add('about-open');
+}
+
+function closeAbout() {
+  aboutPage.hidden = true;
+  document.body.classList.remove('about-open');
+  // Same rescale fix as closeSettings — the stream canvas was 0-sized while
+  // the pane was hidden.
+  requestAnimationFrame(() => { if (rfb) rfb.scaleViewport = true; });
+}
+
+function backToSettings() {
+  openSettings();       // closes this page
+  startDeviceProbe();   // resume live status probing
+}
+
+$('aboutBtn').onclick = openAbout;
+$('aboutBack').onclick = backToSettings;
+
+// Example prompts load into the composer, ready to send.
+document.querySelectorAll('#aboutPage .try').forEach(btn => {
+  btn.onclick = () => {
+    closeAbout();
+    chatInput.value = btn.textContent.trim();
+    chatInput.dispatchEvent(new Event('input'));  // autosize + send button
+    chatInput.focus();
+  };
 });
 
 document.querySelectorAll('.preset[data-host]').forEach(btn => {

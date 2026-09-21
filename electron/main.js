@@ -3,6 +3,7 @@
 // that manages a local Docker-based backend stack.
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { certFp, tlsHandshake } = require('./tls');
 const local = require('./localstack');
@@ -58,6 +59,18 @@ async function downloadUpdate() {
     pushUpdate({ status: 'error', error: e.message });
   }
   return updateState;
+}
+
+// File deliveries save straight into ~/Downloads — no save dialog. An
+// existing file of the same name gets " (n)" appended instead of clobbering.
+function downloadsDest(name) {
+  const dir = app.getPath('downloads');
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  let p = path.join(dir, name);
+  for (let i = 2; fs.existsSync(p); i++)
+    p = path.join(dir, `${stem} (${i})${ext}`);
+  return p;
 }
 
 function clientDir() {
@@ -130,6 +143,25 @@ app.whenReady().then(() => {
     local.remove((line) => e.sender.send('local:log', line)));
   ipcMain.handle('shell:open', (_e, url) => {
     if (/^https?:\/\//.test(String(url))) shell.openExternal(url);
+  });
+  ipcMain.handle('file:save', (_e, name, b64) => {
+    try {
+      const clean = path.basename(String(name || 'file'))
+        .replace(/^\.+/, '') || 'file';
+      const dest = downloadsDest(clean);
+      fs.writeFileSync(dest, Buffer.from(String(b64 || ''), 'base64'));
+      return { ok: true, path: dest,
+               display: dest.replace(os.homedir(), '~') };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+  ipcMain.handle('file:reveal', (_e, p) => {
+    if (p) shell.showItemInFolder(String(p));
+  });
+  ipcMain.handle('file:open', (_e, p) => {
+    if (p) return shell.openPath(String(p));
+    return '';
   });
   ipcMain.handle('update:state', () => updateState);
   ipcMain.handle('update:check', () => checkForUpdate());
