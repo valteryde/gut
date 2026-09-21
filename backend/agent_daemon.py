@@ -83,6 +83,7 @@ CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "LLM_MAX_RETRIES", "ASK_USER_TIMEOUT", "COMMAND_TIMEOUT",
     "SEND_FILE_MAX_BYTES", "ATTACH_TOTAL_MAX_BYTES",
     "GUT_CLEANUP", "JANITOR_MAX_STEPS", "OPENSERP_URL",
+    "SEARCH_LANG", "SEARCH_REGION",
     # Boot-time settings — persisted here, applied by start.sh next boot.
     "RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE", "CDP_PORT",
 })
@@ -234,6 +235,11 @@ UNO_PORT = os.environ.get("GUT_UNO_PORT", "2002")
 # internal network, gut-bot runs it as a systemd unit on localhost.
 # Empty = fall back to DuckDuckGo's HTML endpoint.
 OPENSERP_URL = os.environ.get("OPENSERP_URL", "").rstrip("/")
+# Locale passed to openserp (lang/region) and DuckDuckGo (kl) — unset =
+# whatever the container IP implies, which is usually wrong for non-English
+# or location-specific queries. The model can override per call.
+SEARCH_LANG = os.environ.get("SEARCH_LANG", "")
+SEARCH_REGION = os.environ.get("SEARCH_REGION", "")
 SHOT_PATH = Path("/tmp/gut_screen.png")
 HOME_DIR = Path(os.environ.get("HOME") or Path.home())
 KEY_FILE = Path(os.environ.get("GUT_KEY_FILE") or HOME_DIR / ".gut_litellm_key")
@@ -405,6 +411,21 @@ Planning — match the effort to the task:
   (paths, URLs, decisions, findings) belongs in the todo text or in files
   under {home}.
 
+Accuracy — never fabricate:
+- Facts that end up in a deliverable (prices, dates, names, statistics,
+  URLs) must come from a tool result in this run — a fetched page, a file
+  you read, command output. Never fill gaps from memory or invent
+  plausible-looking values.
+- When the user asks for sources, a source is a specific page you actually
+  opened with fetch_url or browser_text — never a bare homepage, and never
+  a URL you constructed to look right.
+- If real attempts can't verify a value, mark it as an estimate in the
+  deliverable and tell the user which parts are unverified. A flagged
+  estimate beats a confident invention — a wrong "fact" delivered as truth
+  is the worst possible outcome.
+- Search snippets are leads, not sources: fetch_url the result page before
+  putting its claims or its URL into the deliverable.
+
 Guidelines:
 - A fresh screenshot is attached automatically after each turn's actions; only
   call screenshot when nothing changed or you need an extra look.
@@ -417,6 +438,12 @@ Guidelines:
   absolute path and hit enter — never navigate the places list by mouse.
 - For anything online, web_search/fetch_url first; browser_* only when they
   fail or the page genuinely needs a browser (JS, auth, interaction).
+- Think in English — your reasoning and tool arguments stay English for
+  quality — but face the user in their language: chat messages, questions
+  and deliverables match the language they write in, and they may switch
+  languages between requests. Set web_search's lang/region to the locale
+  each query targets (a request in Danish asking for Danish prices →
+  DA/DK); never assume the server's locale.
 - If an action changes nothing after two tries, stop and brainstorm at least
   5 different approaches (keyboard navigation, menus, run_command, the
   browser_* tools, a different app entirely) and try the most promising
@@ -466,6 +493,11 @@ Rules:
   paths instead of pasting everything.
 - You cannot see the screen, drive the browser, or ask the user anything —
   put blockers in the report instead.
+- Report only what you verified through tools — never invent facts, URLs or
+  numbers; mark anything you couldn't verify as unverified.
+- Reason and report in English regardless of the task's language — the main
+  agent translates for the user. For web_search, set lang/region to the
+  locale the task targets (Danish prices → DA/DK), not the server's.
 - A reply with no tool calls also ends your run, with the reply as the
   report — but prefer task_complete so the intent is clear.
 """
@@ -1080,6 +1112,8 @@ async def broadcast(msg: dict) -> None:
 async def push_status() -> None:
     await broadcast({"type": "status", "state": state.phase,
                      "model": state.model,
+                     "run_started":
+                         state.run_start if state.running else None,
                      "conversation_id":
                          state.conversation_id if state.running else None})
 
@@ -1394,15 +1428,17 @@ _SNAP_NEUTRAL_ROLES = {
 
 
 def _a11y_at(x: int, y: int) -> dict | None:
-    """Element report at real screen point (x, y); None when AT-SPI is
-    unreachable — clicks must still work when the a11y bus is down."""
+    """Element report at real screen point (x, y); None when CLICK_A11Y is
+    off. A failed lookup returns {"error": ...} so the click result can say
+    grounding is down instead of silently omitting the annotation — clicks
+    still work either way."""
     if not CLICK_A11Y:
         return None
     out = _sys_py(ATSPI_HELPER, "at", str(x), str(y), timeout=15)
     try:
         return json.loads(out)
     except ValueError:
-        return None
+        return {"error": out.strip()[:120] or "no output"}
 
 
 def _a11y_desc(n: dict) -> str:
@@ -1433,7 +1469,9 @@ def _click_at(args, button: str = "left", double: bool = False) -> str:
     x, y, pos = _pos(args)
     tx, ty, note = x, y, ""
     info = _a11y_at(x, y)
-    if info is not None:
+    if info and info.get("error"):
+        note = f" — click grounding unavailable ({info['error']})"
+    elif info is not None:
         hit, near = info.get("hit"), info.get("near")
         if hit and (hit.get("actions") or hit.get("editable")):
             note = f" — on {_a11y_desc(hit)}"
@@ -1915,49 +1953,95 @@ class _DDGResults(HTMLParser):
         self._cls = ""
 
 
-async def _ddg_search(query: str) -> list[dict]:
+async def _ddg_search(query: str, lang: str = "", region: str = "") -> list[dict]:
+    data = {"q": query}
+    if lang and region:  # kl = "country-language", e.g. dk-da
+        data["kl"] = f"{region.lower()}-{lang.lower()}"
     async with httpx.AsyncClient(timeout=15, follow_redirects=True,
                                  headers={"User-Agent": WEB_UA}) as c:
-        r = await c.post("https://html.duckduckgo.com/html/",
-                         data={"q": query})
+        r = await c.post("https://html.duckduckgo.com/html/", data=data)
         r.raise_for_status()
     p = _DDGResults()
     p.feed(r.text)
     return p.results
 
 
-async def web_search(query: str, max_results: int = 8) -> str:
+async def web_search(query: str, max_results: int = 8,
+                     lang: str = "", region: str = "") -> str:
     query = query.strip()
     if not query:
         return "empty query"
     n = max(1, min(int(max_results or 8), 15))
+    lang = (lang or SEARCH_LANG).strip().upper()
+    region = (region or SEARCH_REGION).strip().upper()
     results, backend = [], ""
     if OPENSERP_URL:
         try:
             # /mega/search fans out to every engine and merges+dedupes —
             # per-engine blocks (CAPTCHA, rate limits) don't sink the query.
+            params: dict = {"text": query, "limit": n}
+            if lang:
+                params["lang"] = lang
+            if region:
+                params["region"] = region
             async with httpx.AsyncClient(timeout=35) as c:
-                r = await c.get(f"{OPENSERP_URL}/mega/search",
-                                params={"text": query, "limit": n})
+                r = await c.get(f"{OPENSERP_URL}/mega/search", params=params)
             if r.status_code == 200:
                 results = [{"title": str(it.get("title", "")),
                             "url": str(it.get("url", "")),
                             "snippet": str(it.get("snippet") or "")}
                            for it in r.json().get("results", [])]
                 backend = "openserp"
-        except Exception:
-            pass  # fall through to the DDG fallback
+            else:
+                print(f"[gut] openserp search HTTP {r.status_code}: "
+                      f"{r.text[:200]}")
+        except Exception as e:
+            print(f"[gut] openserp search failed: {e}")  # fall back to DDG
     if not results:
         try:
-            results, backend = await _ddg_search(query), "duckduckgo"
+            results, backend = await _ddg_search(query, lang, region), \
+                "duckduckgo"
         except Exception as e:
             return (f"search failed ({e}) — use the browser tools instead")
     if not results:
-        return "no results — try rephrasing, or use the browser tools"
+        return ("no results — try rephrasing, a different lang/region, or "
+                "the browser tools")
     lines = [f"{i}. {r['title']}\n   {r['url']}"
              + (f"\n   {r['snippet']}" if r["snippet"] else "")
              for i, r in enumerate(results[:n], 1)]
     return f"results for '{query}' via {backend}:\n" + "\n".join(lines)
+
+
+async def _openserp_extract(url: str, cap: int) -> str | None:
+    """Render `url` through openserp's bundled Chrome and return the page as
+    markdown — rescues JS-heavy pages (SPAs) that a plain GET reads as an
+    empty shell. None when unavailable or extraction failed."""
+    if not OPENSERP_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            r = await c.get(f"{OPENSERP_URL}/extract",
+                            params={"url": url, "mode": "auto",
+                                    "format": "markdown"})
+        if r.status_code != 200:
+            return None
+        body = r.text.strip()
+        if body.startswith("{"):
+            # JSON envelope ({page_content, metadata}) or an error payload.
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                if data.get("error") or \
+                        (data.get("metadata") or {}).get("error"):
+                    return None
+                body = str(data.get("page_content") or
+                           data.get("content") or "").strip()
+        return body[:cap] or None
+    except Exception as e:
+        print(f"[gut] openserp extract failed for {url}: {e}")
+        return None
 
 
 async def fetch_url(url: str, max_chars: int = 6000) -> str:
@@ -1979,12 +2063,23 @@ async def fetch_url(url: str, max_chars: int = 6000) -> str:
                     if len(raw) > 2_000_000:
                         break
     except Exception as e:
+        rendered = await _openserp_extract(url, cap)
+        if rendered:
+            return f"{url}\n(rendered via openserp)\n\n{rendered}"
         return (f"fetch failed: {e} — if the page needs JS or a login, "
                 "use the browser tools")
     if ctype in ("", "text/html", "application/xhtml+xml"):
         p = _PageText(final_url)
         p.feed(raw.decode(enc, errors="replace"))
         text, title, links = p.result()
+        if len(text) < 400:
+            # A near-empty body on a plain GET usually means a JS-rendered
+            # SPA — try openserp's headless-Chrome extractor before giving
+            # the model a useless shell.
+            rendered = await _openserp_extract(final_url, cap)
+            if rendered and len(rendered) > len(text):
+                return (f"# {title or final_url}\n{final_url}\n"
+                        f"(rendered via openserp)\n\n{rendered}")
         out = [f"# {title or final_url}", final_url, "", text[:cap]]
         if len(text) > cap:
             out.append(f"\n[truncated — {len(text)} chars total; refetch with "
@@ -2103,15 +2198,26 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"},
             "max_results": {"type": "integer",
-                            "description": "results to return, default 8"}},
+                            "description": "results to return, default 8"},
+            "lang": {"type": "string",
+                     "description": "ISO language code for the results, e.g. "
+                                    "DA, EN, DE — set it to the language of "
+                                    "the query (defaults to SEARCH_LANG)"},
+            "region": {"type": "string",
+                       "description": "ISO country code for local results, "
+                                      "e.g. DK, US — set it when the query is "
+                                      "location-specific (defaults to "
+                                      "SEARCH_REGION)"}},
             "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "fetch_url",
         "description": "Fetch a URL over HTTP and return the page's text plus "
                        "its links — no browser needed. Much cheaper than "
-                       "browser_* for reading articles, docs, posts. Pages "
-                       "that need JS or a login come back thin; use the "
-                       "browser then.",
+                       "browser_* for reading articles, docs, posts. "
+                       "JS-heavy pages are automatically rendered through a "
+                       "headless browser when one is configured; pages that "
+                       "still need a login come back thin — use the browser "
+                       "then.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "max_chars": {"type": "integer",
@@ -2611,7 +2717,9 @@ async def execute_tool(name: str, args: dict,
                 agent is not None)
         elif name == "web_search":
             result = await web_search(str(args.get("query", "")),
-                                      int(args.get("max_results") or 8))
+                                      int(args.get("max_results") or 8),
+                                      str(args.get("lang") or ""),
+                                      str(args.get("region") or ""))
         elif name == "fetch_url":
             result = await fetch_url(str(args.get("url", "")),
                                      int(args.get("max_chars") or 6000))
@@ -2871,6 +2979,39 @@ def _note(content, text: str):
             return content
     content.append({"type": "text", "text": text})
     return content
+
+
+def tool_result_images_ok() -> bool:
+    """Anthropic-family models consume image blocks inside tool results
+    natively. The OpenAI-format providers LiteLLM fronts for everything
+    else (OpenRouter, Ollama, vLLM, …) drop them — frames must ride a user
+    message instead or the model never sees the screen."""
+    return cache_friendly()
+
+
+def _hoist_tool_images(messages: list, extra: dict | None = None) -> None:
+    """Move image blocks out of the trailing tool results into a user
+    message — the shape every vision provider accepts. `extra` is a frame
+    that would otherwise have been attached to the last tool result."""
+    imgs = []
+    for msg in reversed(messages):
+        if msg.get("role") != "tool":
+            break
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        moved = [b for b in content if b.get("type") == "image_url"]
+        if not moved:
+            continue
+        imgs = moved + imgs
+        keep = [b for b in content if b.get("type") != "image_url"]
+        msg["content"] = keep or [
+            {"type": "text", "text": "(image attached below)"}]
+    if extra is not None:
+        imgs.append(extra)
+    if imgs:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": "(latest screen)"}] + imgs})
 
 
 def _unstick_note(reason: str) -> str:
@@ -3705,16 +3846,19 @@ async def janitor_pass(conv_id: str) -> str:
                     if fin:
                         return str(res2 if isinstance(res2, str)
                                    else prev)[:300]
-                if acted:
-                    shot = screenshot_block()
-                    if shot is not None:
-                        t = messages[-1]
-                        c = t["content"]
-                        if isinstance(c, str):
-                            t["content"] = [{"type": "text", "text": c}, shot]
-                        elif not any(b.get("type") == "image_url"
-                                     for b in c):
-                            c.append(shot)
+                shot = screenshot_block() if acted else None
+                if not tool_result_images_ok():
+                    # Same hoist as the main loop — tool-result images
+                    # never reach OpenAI-format providers.
+                    _hoist_tool_images(messages, shot)
+                elif shot is not None:
+                    t = messages[-1]
+                    c = t["content"]
+                    if isinstance(c, str):
+                        t["content"] = [{"type": "text", "text": c}, shot]
+                    elif not any(b.get("type") == "image_url"
+                                 for b in c):
+                        c.append(shot)
     except Exception as e:
         return f"janitor error: {e}"
     return f"hit the {JANITOR_MAX_STEPS}-step cap"
@@ -3738,6 +3882,7 @@ async def cleanup_after_run(conv_id: str, baseline: dict | None,
         if janitor:
             await broadcast({"type": "status", "state": "cleanup",
                              "model": state.model,
+                             "run_started": state.run_start,
                              "conversation_id": conv_id})
             # janitor_pass swaps state.model to JANITOR_MODEL for the pass;
             # restore whatever the conversation was using.
@@ -3786,7 +3931,9 @@ async def agent_loop(conv_id: str, task_text: str,
         if GUT_CLEANUP:
             await asyncio.to_thread(_persist_baseline, baseline)
         await broadcast({"type": "status", "state": "running",
-                         "model": state.model, "conversation_id": conv_id})
+                         "model": state.model,
+                         "run_started": state.run_start,
+                         "conversation_id": conv_id})
         # A revisited conversation resumes its own stored context; a fresh
         # one starts from just the system prompt.
         # The client resizes the display to fit its pane, so RESOLUTION (the
@@ -3813,6 +3960,7 @@ async def agent_loop(conv_id: str, task_text: str,
         done = False
         recent_sigs, unchanged_streak, stuck_rescues = \
             deque(maxlen=10), 0, 0
+        blocked_sigs: set[str] = set()
         idle_replies = 0
         state.todos = conv_load_todos(conv_id)
         state.plan_shared = False
@@ -3974,16 +4122,29 @@ async def agent_loop(conv_id: str, task_text: str,
                     if acted_on_screen and name in SCREEN_TOOLS:
                         await asyncio.sleep(INTER_ACTION_DELAY)
                     await broadcast({"type": "action", "tool": name, "args": args})
-                    result, finished = await execute_tool(name, args)
-                    acted_on_screen = acted_on_screen or name in SCREEN_TOOLS
+                    # A call that already earned a STUCK note is a proven
+                    # dead-end — refuse to run it again so the model is
+                    # forced to change approach instead of ignoring the note.
+                    sig = (name + " " + json.dumps(args, sort_keys=True,
+                                                   default=str)
+                           if name not in ("ask_user", "task_complete")
+                           else "")
+                    if sig and sig in blocked_sigs:
+                        result, finished = (
+                            "BLOCKED: this exact call was already repeated "
+                            "with no progress and is disabled for the rest "
+                            "of this run — use a different tool or different "
+                            "arguments."), False
+                    else:
+                        result, finished = await execute_tool(name, args)
+                        acted_on_screen = acted_on_screen \
+                            or name in SCREEN_TOOLS
 
                     # Stall detector: identical tool+args seen several times
                     # in the recent window — catches loops that interleave
                     # other actions between repeats (a strictly-consecutive
                     # counter resets the moment the model does anything else).
-                    if name not in ("ask_user", "task_complete"):
-                        sig = name + " " + json.dumps(args, sort_keys=True,
-                                                      default=str)
+                    if sig:
                         recent_sigs.append(sig)
                         seen = sum(1 for s in recent_sigs if s == sig)
                         if seen == 3:
@@ -3996,13 +4157,14 @@ async def agent_loop(conv_id: str, task_text: str,
                                 f"you've repeated this exact action {seen} "
                                 "times with no progress"))
                             recent_sigs.clear()
+                            blocked_sigs.add(sig)
                             stuck_rescues += 1
                             if (stuck_rescues >= ESCALATION_RESCUES
                                     and await maybe_escalate(
                                         messages, conv_id,
                                         "kept repeating a dead-end action")):
                                 stuck_rescues = 0
-                            elif stuck_rescues >= 3:
+                            elif stuck_rescues >= (3 if ESCALATION_MODEL else 2):
                                 stuck_rescues = 0
                                 answer = await ask_user(STUCK_ASK_USER)
                                 result = _note(result,
@@ -4026,6 +4188,7 @@ async def agent_loop(conv_id: str, task_text: str,
 
                 # One fresh screenshot per turn on the last tool result —
                 # skipped when the frame is byte-identical to the last sent.
+                shot = None
                 if acted_on_screen and not done and not state.stop:
                     shot = screenshot_block()
                     # An unchanged frame right after an action usually means
@@ -4065,13 +4228,13 @@ async def agent_loop(conv_id: str, task_text: str,
                                         messages, conv_id,
                                         "actions had no visible effect")):
                                 stuck_rescues = 0
-                            elif stuck_rescues >= 3:
+                            elif stuck_rescues >= (3 if ESCALATION_MODEL else 2):
                                 stuck_rescues = 0
                                 answer = await ask_user(STUCK_ASK_USER)
                                 target["content"] = _note(
                                     target["content"],
                                     f"[user replied]: {answer}")
-                    else:
+                    elif tool_result_images_ok():
                         unchanged_streak = 0
                         stuck_rescues = 0
                         content = target["content"]
@@ -4083,6 +4246,14 @@ async def agent_loop(conv_id: str, task_text: str,
                             content.append(shot)
                         # else: last result already carries a frame (e.g. the
                         # turn ended on the screenshot tool) — don't double up.
+                    else:
+                        unchanged_streak = 0
+                        stuck_rescues = 0
+                # Providers that can't read images inside tool results get
+                # this turn's frames — the auto-shot plus any tool-returned
+                # images (screenshot/crop) — as a user message instead.
+                if not tool_result_images_ok():
+                    _hoist_tool_images(messages, shot)
 
                 # Persist context each step so a follow-up message — or a
                 # daemon restart — resumes mid-conversation.
@@ -4239,9 +4410,12 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
                 conv_set_model(cid, model)
             except ValueError:
                 pass
-        # Apply live when it targets the running conversation, when the
-        # device is idle, or when no conversation was given (legacy clients).
-        if not cid or cid == state.conversation_id or not state.running:
+        # Apply live when it targets the running conversation or when the
+        # device is idle. A cid-less set_model mid-run is a boot-time
+        # default sync from a just-connected client — applying it would
+        # swap the live agent's model (and its coordinate convention)
+        # underneath it.
+        if cid == state.conversation_id or not state.running:
             state.model = model
         await push_status()
     elif mtype == "ping":
@@ -4455,6 +4629,7 @@ async def chat_ws(ws: WebSocket):
     await ws.send_text(json.dumps({
         "type": "hello", "state": state.phase, "model": state.model,
         "device": DEVICE_NAME,
+        "run_started": state.run_start if state.running else None,
         "running_conversation":
             state.conversation_id if state.running else None,
         # Queued mid-run messages — lets a rejoining client restore the

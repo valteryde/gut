@@ -259,6 +259,8 @@ let agentPhase = 'idle';
 let lastEntryKey = null;
 let liveStatus = '';   // freshest thing the agent is doing or thinking
 let liveKind = '';     // 'thought' | 'action' — styles the typing text
+let liveIcon = 'spark';
+let runStartedAt = 0;  // when the current run began — drives the elapsed ticker
 
 // ── conversation state ──────────────────────────────────────────────────
 let conversations = [];          // metas for the active device
@@ -292,18 +294,42 @@ const typingBody = document.createElement('div');
 typingBody.className = 'body';
 const typingDots = document.createElement('span');
 typingDots.className = 'dots';
+const typingIcon = document.createElement('span');
+typingIcon.className = 'ticon';
 const typingText = document.createElement('span');
 typingText.className = 'typing-text';
-typingBody.append(typingDots, typingText);
+const typingTime = document.createElement('span');
+typingTime.className = 'ttime';
+typingBody.append(typingDots, typingIcon, typingText, typingTime);
 typingEl.append(typingWho, typingBody);
+
+const fmtElapsed = (t0) => {
+  const s = Math.max(0, Math.floor((Date.now() - t0) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+// The clock covers the whole run — including the end-of-run cleanup sweep.
+const runClockOn = () => !!runStartedAt &&
+  (agentPhase === 'running' || agentPhase === 'cleanup');
+
+// Elapsed-time ticker — the proof-of-life bit that keeps counting even when
+// the status text hasn't moved for a while.
+setInterval(() => {
+  typingTime.textContent = runClockOn() ? fmtElapsed(runStartedAt) : '';
+}, 1000);
 
 // Ephemeral — never a transcript entry. The freshest activity/thought rides
 // the typing row where the reply will land and echoes in the header's
 // activity line; it's cleared when the run goes idle.
-function setLiveStatus(text, kind) {
+function setLiveStatus(text, kind, icon) {
   liveStatus = text;
   liveKind = kind || '';
+  liveIcon = icon || 'spark';
   activityEl.textContent = text;
+  // Re-trigger the fade so a status swap reads as a change, not a flicker.
+  typingText.classList.remove('swap');
+  void typingText.offsetWidth;
+  typingText.classList.add('swap');
   updateTyping();
 }
 
@@ -314,8 +340,10 @@ function updateTyping() {
   typingWho.textContent = agentName;
   typingEl.dataset.phase = agentPhase;
   typingEl.dataset.kind = liveKind;
+  typingIcon.innerHTML = svgIcon(TICONS[liveIcon] || TICONS.spark);
   typingText.textContent = STATE_LABEL[agentPhase] || liveStatus ||
     (agentPhase === 'running' ? 'working…' : '');
+  typingTime.textContent = runClockOn() ? fmtElapsed(runStartedAt) : '';
   if (typingEl.parentNode !== messagesEl) messagesEl.appendChild(typingEl);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -729,6 +757,42 @@ function toolStatus(m) {
   return f ? f(m.args || {}) : `using ${m.tool}`;
 }
 
+// Small glyph per activity, drawn in the typing row next to the dots —
+// mint for actions, clay for thoughts (styled in css via data-kind).
+const TICONS = {
+  spark:  '<path d="M12 3l1.9 5.6 5.6 1.9-5.6 1.9L12 18l-1.9-5.6-5.6-1.9 5.6-1.9z"/>',
+  eye:    '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>',
+  clock:  '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  cursor: '<path d="M3 3l7.1 17 2.5-7.4 7.4-2.5z"/><path d="M13 13l6 6"/>',
+  kbd:    '<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h2m2 0h2m2 0h2m2 0h.01M7 14h10"/>',
+  term:   '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6.5 9l3 3-3 3M12 15h5.5"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/>',
+  page:   '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-2.7 2.6-4 5.7-4 9s1.3 6.4 4 9c2.7-2.6 4-5.7 4-9s-1.3-6.4-4-9z"/>',
+  grid:   '<rect x="3" y="3" width="8" height="10" rx="1"/><rect x="13" y="3" width="8" height="6" rx="1"/><rect x="13" y="11" width="8" height="10" rx="1"/><rect x="3" y="15" width="8" height="6" rx="1"/>',
+  doc:    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
+  image:  '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
+  chat:   '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.5 0-3-.4-4.2-1L3 21l2-5.3A8.5 8.5 0 1 1 21 11.5z"/>',
+  helper: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/>',
+  plan:   '<path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+  check:  '<path d="M4 12.5l5 5L20 6.5"/>',
+  dot:    '<circle cx="12" cy="12" r="4"/>',
+};
+
+const TOOL_ICON = {
+  screenshot: 'eye', wait: 'clock',
+  left_click: 'cursor', middle_click: 'cursor', right_click: 'cursor',
+  double_click: 'cursor', mouse_move: 'cursor', scroll: 'cursor',
+  desktop_act: 'cursor', desktop_click: 'cursor', browser_click: 'cursor',
+  type_text: 'kbd', key: 'kbd', desktop_type: 'kbd', browser_type: 'kbd',
+  run_command: 'term', browser_eval: 'term', office_eval: 'doc',
+  web_search: 'search', fetch_url: 'page', browser_navigate: 'page',
+  open_url: 'page', browser_dom: 'page', browser_text: 'page',
+  list_windows: 'grid', focus_window: 'grid', desktop_tree: 'grid',
+  send_message: 'chat', ask_user: 'chat', send_file: 'doc',
+  send_image: 'image', spawn_agent: 'helper', collect_agent: 'helper',
+  share_plan: 'plan', update_todos: 'plan', task_complete: 'check',
+};
+
 // One renderer for live events and stored history alike. `live` adds the
 // ephemeral side effects (activity line, pending-question state).
 function renderEvent(m, live) {
@@ -754,12 +818,14 @@ function renderEvent(m, live) {
       // The agent's inner voice, live in the status line — a thought reads
       // like "checking the totals…", an action like "clicking".
       if (live) setLiveStatus(
-        `${m.agent ? m.agent + ' · ' : ''}${clip(m.text, 140)}`, 'thought');
+        `${m.agent ? m.agent + ' · ' : ''}${clip(m.text, 140)}`,
+        'thought', 'spark');
       break;
     case 'action':
       addVerbose('action', `▶ ${m.agent ? m.agent + '·' : ''}${m.tool} ${JSON.stringify(m.args)}`);
       if (live) setLiveStatus(
-        `${m.agent ? m.agent + ' · ' : ''}${toolStatus(m)}`, 'action');
+        `${m.agent ? m.agent + ' · ' : ''}${toolStatus(m)}`,
+        'action', TOOL_ICON[m.tool] || 'dot');
       break;
     case 'action_result':
       addVerbose('action', `✓ ${m.agent ? m.agent + '·' : ''}${m.tool}: ${(m.result || '').trim()}`);
@@ -767,7 +833,8 @@ function renderEvent(m, live) {
     case 'subagent':
       addVerbose('action', `◈ ${m.name} ${m.state}` +
         (m.result ? ` — ${String(m.result).trim()}` : ''));
-      if (live) setLiveStatus(`helper ${m.name} ${m.state}`, 'action');
+      if (live) setLiveStatus(`helper ${m.name} ${m.state}`,
+        'action', 'helper');
       break;
     case 'cleanup':
       addVerbose('thought', m.text || '');
@@ -801,12 +868,25 @@ const STATE_LABEL = {
   cleanup: 'tidying up',
 };
 
-function setAgentState(s) {
+function setAgentState(s, runStarted) {
+  const was = agentPhase;
   agentPhase = s;
   document.body.dataset.agent = s;
   stopBtn.hidden = !(s === 'running' || s === 'waiting_user' || s === 'paused');
   steerBtn.hidden = s === 'idle';
-  if (s === 'idle') { activityEl.textContent = ''; liveStatus = ''; liveKind = ''; }
+  // The daemon's run_started is the truth — it survives reconnects and
+  // pauses; the local stamp is a fallback for older daemons. A cleanup→
+  // running transition is the next queued task, so it starts a new clock.
+  if (s === 'running' || s === 'cleanup') {
+    if (runStarted) runStartedAt = runStarted * 1000;
+    else if (!runStartedAt || was === 'cleanup') runStartedAt = Date.now();
+  }
+  if (s === 'idle') {
+    activityEl.textContent = '';
+    liveStatus = '';
+    liveKind = '';
+    runStartedAt = 0;
+  }
   syncPlaceholder();
   updateTyping();
 }
@@ -1113,6 +1193,7 @@ function clearTranscript(title) {
   awaitingAnswer = false;
   liveStatus = '';
   liveKind = '';
+  liveIcon = 'spark';
   syncPlaceholder();
   convTitleEl.textContent = title || 'New conversation';
   renderTodoCard([]);
@@ -1269,7 +1350,7 @@ function connectChat() {
         for (const q of m.queue || []) {
           if (q.seq != null) queuedSeqs.set(qkey(q.conv, q.seq), q.mode);
         }
-        setAgentState(m.state);
+        setAgentState(m.state, m.run_started);
         if (m.model && (!activeConvId || runningConvId === activeConvId)) {
           syncModel(m.model);
         }
@@ -1282,7 +1363,7 @@ function connectChat() {
       case 'status':
         runningConvId = m.state === 'idle'
           ? null : (m.conversation_id || runningConvId);
-        setAgentState(m.state);
+        setAgentState(m.state, m.run_started);
         if (m.model && (!activeConvId || runningConvId === activeConvId)) {
           syncModel(m.model);
         }
@@ -1307,7 +1388,7 @@ function connectChat() {
         if (runningConvId && runningConvId === activeConvId) {
           setLiveStatus(
             `${m.agent ? m.agent + ' · ' : ''}${clip(m.text, 140)}`,
-            'thought');
+            'thought', 'spark');
         }
         break;
       case 'cost':
@@ -1424,7 +1505,9 @@ async function loadModels() {
     if (convModel) syncModel(convModel);
     else if (cfg.model && models.some(m => m.id === cfg.model))
       modelSelect.value = cfg.model;
-    if (!activeConvId && modelSelect.value)
+    // Don't push the default mid-run — a cid-less set_model would only add
+    // noise (the daemon ignores it for the live agent since the fix).
+    if (!activeConvId && agentPhase === 'idle' && modelSelect.value)
       send({ type: 'set_model', model: modelSelect.value });
     setAgentName(modelSelect.value);
     updateModelInfo();
@@ -1487,7 +1570,7 @@ function switchDevice(id) {
   });
   keyNote = null;  // key status describes the old device — drop it
   editingKey = null;
-  if (settingsOpen()) refreshKeys();
+  if (settingsOpen()) { refreshKeys(); refreshDeviceCfg(); }
 }
 
 deviceSelect.onchange = () => switchDevice(deviceSelect.value);
@@ -2615,6 +2698,7 @@ function fillDeviceForm(d) {
   renderDeviceList();
   keyNote = '';
   refreshKeys();  // cards follow the device being looked at
+  refreshDeviceCfg();
 }
 
 function newDeviceForm() {
@@ -2625,6 +2709,7 @@ function newDeviceForm() {
   renderDeviceList();
   keyNote = '';
   refreshKeys();
+  refreshDeviceCfg();
   devNameInput.focus();
 }
 
@@ -2766,8 +2851,122 @@ function removeDevice(id) {
   populateDeviceSelect();
   renderDeviceList();
   refreshKeys();  // the removed row may have been the keys target
+  refreshDeviceCfg();
   if (wasActive) switchDevice(cfg.activeDevice);
 }
+
+// ── device settings (per-device config via /api/config) ────────────────
+// Same target rule as the provider cards: the device selected in the list
+// (editingDevId), else the active one. An empty field removes the override
+// — the device falls back to its deploy default.
+const CFG_FIELDS = [
+  ['cfgEscModel', 'ESCALATION_MODEL'],
+  ['cfgSubModel', 'SUBAGENT_MODEL'],
+  ['cfgMaxUsd', 'AGENT_MAX_USD'],
+  ['cfgMaxSteps', 'AGENT_MAX_STEPS'],
+  ['cfgSearchLang', 'SEARCH_LANG'],
+  ['cfgSearchRegion', 'SEARCH_REGION'],
+];
+const devCfgHint = $('devCfgHint'), devCfgForm = $('devCfgForm'),
+      devCfgNote = $('devCfgNote'), devCfgTarget = $('devCfgTarget'),
+      cfgModelList = $('cfgModelList'), cfgCleanup = $('cfgCleanup'),
+      devCfgSave = $('devCfgSave');
+let devCfgState = 'idle';  // idle|checking|ready|old|auth|offline
+
+function renderDevCfg() {
+  const d = keyDev();
+  devCfgTarget.textContent = `· ${d.name || d.host}`;
+  const hints = {
+    checking: 'loading…',
+    old: 'This backend is too old for remote settings — ' +
+         'update it from the device row above.',
+    auth: 'The device rejected the saved password — re-save it above.',
+    offline: 'Device is offline — its settings can’t be read.',
+  };
+  devCfgHint.textContent = devCfgState === 'ready'
+    ? 'Changes apply live. An empty field falls back to the device default.'
+    : (hints[devCfgState] || '');
+  devCfgForm.hidden = devCfgState !== 'ready';
+  if (devCfgState !== 'ready') devCfgNote.hidden = true;
+}
+
+async function refreshDeviceCfg() {
+  const d = keyDev();
+  devCfgState = 'checking';
+  renderDevCfg();
+  try {
+    const r = await devFetch(d, '/api/config', { signal: probeSignal() });
+    if (d.id !== keyDev().id) return;  // target switched mid-fetch
+    if (r.status === 404 || r.status === 405) devCfgState = 'old';
+    else if (r.status === 401 || r.status === 403) devCfgState = 'auth';
+    else if (!r.ok) devCfgState = 'offline';
+    else {
+      const eff = (await r.json()).effective || {};
+      for (const [id, key] of CFG_FIELDS)
+        $(id).value = eff[key] == null ? '' : String(eff[key]);
+      // effective returns the coerced global — a bool for GUT_CLEANUP.
+      const off = v => v === false ||
+        ['off', '0', 'false', 'no'].includes(String(v).toLowerCase());
+      cfgCleanup.checked = !off(eff.GUT_CLEANUP ?? 'on');
+      devCfgState = 'ready';
+      // Deployed-model suggestions for the two model fields — best effort.
+      devFetch(d, '/api/models', { signal: probeSignal() })
+        .then(mr => mr.ok ? mr.json() : [])
+        .then(ms => {
+          cfgModelList.innerHTML = '';
+          for (const m of ms || []) {
+            const o = document.createElement('option');
+            o.value = m.id;
+            cfgModelList.appendChild(o);
+          }
+        }).catch(() => {});
+    }
+  } catch (_) {
+    if (d.id !== keyDev().id) return;
+    devCfgState = 'offline';
+  }
+  renderDevCfg();
+}
+
+devCfgSave.onclick = async () => {
+  const d = keyDev();
+  const name = d.name || d.host;
+  const updates = {};
+  for (const [id, key] of CFG_FIELDS) {
+    const el = $(id), v = el.value.trim();
+    if (el.type === 'number' && v && isNaN(+v)) {
+      devCfgNote.hidden = false;
+      devCfgNote.textContent = `${key} must be a number — nothing was changed.`;
+      return;
+    }
+    updates[key] = v;
+  }
+  updates.GUT_CLEANUP = cfgCleanup.checked ? 'on' : 'off';
+  devCfgNote.hidden = false;
+  devCfgNote.textContent = `Saving on ${name}…`;
+  let r;
+  try {
+    r = await devFetch(d, '/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: updates }),
+    });
+  } catch (_) {
+    devCfgNote.textContent = `Could not reach ${name} — nothing was changed.`;
+    return;
+  }
+  if (!r.ok) {
+    devCfgNote.textContent =
+      `Save failed (HTTP ${r.status}) — nothing was changed.`;
+    return;
+  }
+  const j = await r.json();
+  const pending = (j.restart_required || []).filter(k => updates[k]);
+  devCfgNote.textContent = pending.length
+    ? `Saved on ${name} — ${pending.join(', ')} apply after ` +
+      'the backend restarts.'
+    : `Saved on ${name} — changes apply live.`;
+};
 
 $('settingsBtn').onclick = () => {
   if (settingsOpen()) { closeSettings(); return; }
@@ -2869,6 +3068,7 @@ $('devForm').addEventListener('submit', (e) => {
       loadModels();
       loadConversations();
       refreshKeys();  // host/password may have changed — re-check key state
+      refreshDeviceCfg();
     });
   }
   renderDeviceList();

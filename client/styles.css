@@ -394,6 +394,16 @@ main {
   text-overflow: ellipsis;
 }
 #activityLine:empty { display: none; }
+/* same shimmer as the typing row while the agent is mid-run */
+body[data-agent="running"] #activityLine:not(:empty) {
+  background: linear-gradient(100deg,
+    var(--text-3) 38%, var(--mint) 50%, var(--text-3) 62%);
+  background-size: 240% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: status-shimmer 2.8s linear infinite;
+}
 
 /* ── transcript ──────────────────────────────────────────── */
 #messages {
@@ -531,8 +541,20 @@ main {
   animation-name: dot-slide-back;
 }
 /* non-running phases swap the dots for a text label */
-.msg.typing:not([data-phase="running"]) .dots { display: none; }
-/* live status: a single clipped line — thoughts render italic, actions plain */
+.msg.typing:not([data-phase="running"]) .dots,
+.msg.typing:not([data-phase="running"]) .ticon { display: none; }
+
+/* activity glyph — mint for actions, clay for thoughts */
+.msg.typing .ticon {
+  flex: none;
+  display: inline-flex;
+  color: var(--mint);
+}
+.msg.typing .ticon svg { width: 13px; height: 13px; display: block; }
+.msg.typing[data-kind="thought"] .ticon { color: var(--clay); }
+
+/* live status: a single clipped line with a shimmer sweep running over it —
+   mint for actions, clay for the agent's italic inner voice */
 .typing-text {
   color: var(--text-3);
   min-width: 0;
@@ -540,7 +562,40 @@ main {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.msg.typing[data-kind="thought"] .typing-text { font-style: italic; }
+.msg.typing[data-phase="running"] .typing-text {
+  background: linear-gradient(100deg,
+    var(--text-3) 38%, var(--mint) 50%, var(--text-3) 62%);
+  background-size: 240% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: status-shimmer 2.8s linear infinite;
+}
+.msg.typing[data-phase="running"][data-kind="thought"] .typing-text {
+  font-style: italic;
+  background-image: linear-gradient(100deg,
+    var(--text-3) 38%, var(--clay) 50%, var(--text-3) 62%);
+}
+/* status swap: fade the new line in instead of an abrupt flip — must
+   out-specify the shimmer rule and keep it running alongside the fade */
+.msg.typing[data-phase="running"] .typing-text.swap {
+  animation: status-in .22s ease-out, status-shimmer 2.8s linear infinite;
+}
+@keyframes status-in {
+  from { opacity: 0; transform: translateY(2px); }
+}
+@keyframes status-shimmer {
+  to { background-position: -240% 0; }
+}
+/* elapsed run time ticking at the end of the row */
+.msg.typing .ttime {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-3);
+  opacity: .75;
+  font-variant-numeric: tabular-nums;
+}
+.msg.typing .ttime:empty { display: none; }
 .msg.typing[data-phase="waiting_user"] .typing-text,
 .msg.typing[data-phase="paused"] .typing-text { color: var(--clay-ink); }
 .typing-text:empty { display: none; }
@@ -555,7 +610,10 @@ main {
 }
 @media (prefers-reduced-motion: reduce) {
   .msg.typing .dots::before,
-  .msg.typing .dots::after { animation: none; }
+  .msg.typing .dots::after,
+  .msg.typing[data-phase="running"] .typing-text,
+  .msg.typing[data-phase="running"] .typing-text.swap,
+  body[data-agent="running"] #activityLine:not(:empty) { animation: none; }
 }
 
 /* full-bleed band: clay when the agent needs you */
@@ -1452,12 +1510,23 @@ body.about-open #desktopPane { display: none; }
   background: var(--mint, #7fd8be);
   vertical-align: middle;
 }
-.dev-form menu {
+.dev-form menu, #devCfgBox menu {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   padding: 0;
   margin: 16px 0 0;
+}
+
+/* device settings fields — two columns like the device form row */
+.cfg-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 24px;
+}
+.cfg-grid label { min-width: 0; }
+@media (max-width: 720px) {
+  .cfg-grid { grid-template-columns: 1fr; }
 }
 
 .presets {

@@ -158,8 +158,14 @@ reports it via `GET /api/version`.
   gut-bot as `gut-openserp.service` — with a DuckDuckGo HTML fallback when
   unset) and `fetch_url` (plain-HTTP page
   text + links) let the agent research without opening Chrome: no
-  screenshots, no CAPTCHA walls, one turn instead of five. The `browser_*`
-  tools stay for what needs a real browser — JS-heavy pages, logins, forms.
+  screenshots, no CAPTCHA walls, one turn instead of five. `SEARCH_LANG` /
+  `SEARCH_REGION` (or per-call `lang`/`region` args) localize search —
+  unset follows the container IP's locale, which is wrong for non-English
+  or location-specific queries. When a plain GET returns a thin JS-shell
+  page, `fetch_url` re-renders it through openserp's bundled Chrome
+  (`/extract`), so JS-heavy sites still read as text. The `browser_*`
+  tools stay for what needs a real browser — logins, forms, interactive
+  pages.
 - **Cost controls.** Only the last `SCREENSHOT_HISTORY` frames stay in context
   (older ones become text placeholders), one screenshot is attached per turn
   and skipped when the frame is unchanged, Anthropic-style prompt caching is
@@ -221,9 +227,9 @@ reports it via `GET /api/version`.
   Remote daemons never return key values, so only the app holds a copy.
 - **Device config.** Non-secret settings — model tiering, cost caps,
   screenshot/step limits, cleanup behavior, click tuning — live in
-  `config.json` on the data volume, not in `.env`. Read them with
-  `GET /api/config` and change them with
-  `POST /api/config {"config": {"AGENT_MAX_USD": "0.5"}}`; most apply live,
+  `config.json` on the data volume, not in `.env`. The common ones are
+  editable per device in Settings → Device settings (the app reads and
+  writes them through `GET`/`POST /api/config`); most apply live,
   the few that feed `start.sh` (`RESOLUTION`, `UI_SCALE`, `DEVICE_NAME`,
   ports) persist and apply on the next container start. A value in
   `config.json` overrides the same-named env var, so env remains a
