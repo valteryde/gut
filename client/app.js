@@ -1457,6 +1457,12 @@ function renderTodoCard(items) {
     txt.className = 'todo-text';
     txt.textContent = it.content || '';
     li.append(mark, txt);
+    if (it.kind) {
+      const kind = document.createElement('span');
+      kind.className = 'todo-kind';
+      kind.textContent = it.kind;
+      li.appendChild(kind);
+    }
     todoList.appendChild(li);
   }
   todoCount.textContent = list.length ? `${done}/${list.length}` : '';
@@ -3437,6 +3443,7 @@ const CFG_FIELDS = [
   ['cfgSubModel', 'SUBAGENT_MODEL'],
   ['cfgMaxUsd', 'AGENT_MAX_USD'],
   ['cfgMaxSteps', 'AGENT_MAX_STEPS'],
+  ['cfgCtxLimits', 'MODEL_CONTEXT_LIMITS'],
   ['cfgSearchLang', 'SEARCH_LANG'],
   ['cfgSearchRegion', 'SEARCH_REGION'],
 ];
@@ -3510,6 +3517,13 @@ devCfgSave.onclick = async () => {
     if (el.type === 'number' && v && isNaN(+v)) {
       devCfgNote.hidden = false;
       devCfgNote.textContent = `${key} must be a number — nothing was changed.`;
+      return;
+    }
+    if (key === 'MODEL_CONTEXT_LIMITS' && v &&
+        !v.split(',').every(p => /^[^=,]+=\d+[kKmM]?$/.test(p.trim()))) {
+      devCfgNote.hidden = false;
+      devCfgNote.textContent = `${key} wants name=tokens entries ` +
+        '(e.g. *=128000 or ollama/qwen=32k) — nothing was changed.';
       return;
     }
     updates[key] = v;

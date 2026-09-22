@@ -1,0 +1,61 @@
+[
+  {
+    "id": "single-price",
+    "why": "One lookup. Orchestrate mode must spawn exactly one worker and relay a sourced figure; classic mode must fetch the page, not quote a snippet.",
+    "text": "What does 1 kg of carrots (gulerødder) cost in a Danish supermarket right now? Give the price in DKK and the URL of the page you got it from.",
+    "expect": {
+      "summary_digits": true,
+      "summary_any": ["kr", "dkk"],
+      "summary_url": true,
+      "min_workers": 1,
+      "max_workers": 3,
+      "max_steps": 20
+    }
+  },
+  {
+    "id": "build-only",
+    "why": "No research at all — a pure build+deliver task. Measures whether the orchestrator wastes workers on it and whether the file gets built by script and verified.",
+    "text": "Create an Excel file savings.xlsx with a 12-month savings plan: start with 5000 DKK, deposit 1500 DKK at the start of every month, 3% yearly interest compounded monthly on the balance. Columns: month, deposit, interest, balance. Send me the file.",
+    "expect": {
+      "files": [{"glob": "*.xlsx", "min_rows": 12}],
+      "max_workers": 1,
+      "max_steps": 15
+    }
+  },
+  {
+    "id": "three-compare",
+    "why": "Three independent targets → three workers in parallel, one CSV assembled from their files. The canonical fan-out case.",
+    "text": "Compare the current monthly price in Denmark of Netflix (standard plan), Disney+ (standard plan) and HBO Max (standard plan). Deliver a CSV file with columns: service, plan, price_dkk, source_url. Send me the file.",
+    "expect": {
+      "files": [{"glob": "*.csv", "min_rows": 3, "contains_url": true,
+                 "contains_any": ["netflix"]}],
+      "min_workers": 3,
+      "plan": true,
+      "max_steps": 35
+    }
+  },
+  {
+    "id": "budget-220",
+    "why": "The run that motivated this work: Danish prices for three items, comparison across shops, an Excel budget for 220 people with sources. Failed on a small model by marking research done with no data and delivering an empty workbook.",
+    "text": "Lav et budget for 220 personer til en fest med pulled pork burger, coleslaw og hjemmelavet ovn kartofler. Find danske priser på ingredienserne (pulled pork/nakkefilet, burgerboller, coleslaw-ingredienser, kartofler), sammenlign priser fra forskellige butikker, og lav et Excel-ark med budgettet. Angiv kilder til alle priser i arket. Send mig arket.",
+    "expect": {
+      "files": [{"glob": "*.xlsx", "min_rows": 5, "contains_url": true,
+                 "contains_any": ["kartof", "pork", "nakke", "coleslaw", "boller"]}],
+      "min_workers": 3,
+      "plan": true,
+      "max_steps": 45
+    }
+  },
+  {
+    "id": "danish-fact",
+    "why": "A Danish-language single fact with a source. Checks locale handling through a worker and that the answer reaches the user in Danish with a URL.",
+    "text": "Hvad er indbyggertallet i Aarhus Kommune ifølge de nyeste tal? Skriv tallet og hvor du fandt det (link).",
+    "expect": {
+      "summary_digits": true,
+      "summary_url": true,
+      "min_workers": 1,
+      "max_workers": 2,
+      "max_steps": 15
+    }
+  }
+]

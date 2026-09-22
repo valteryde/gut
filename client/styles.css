@@ -981,6 +981,14 @@ body.verbose .verbose-only { display: grid; }
 .todo-item.done { color: var(--text-3); }
 .todo-item.done .todo-mark { color: var(--mint-ink); }
 .todo-item.done .todo-text { text-decoration: line-through; }
+.todo-kind {
+  flex: none;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  opacity: .7;
+}
 
 /* file + image deliveries */
 .file-note { margin: 0 0 8px; }

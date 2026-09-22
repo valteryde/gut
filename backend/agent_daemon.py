@@ -82,8 +82,9 @@ CONFIG_GLOBALS = {
 CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "DEFAULT_MODEL", "ESCALATION_MODEL", "ESCALATION_RESCUES",
     "SUBAGENT_MODEL", "SUBAGENT_MAX_STEPS", "SUBAGENT_MAX_CONCURRENT",
+    "SUBAGENT_MAX_TOTAL", "AGENT_ORCHESTRATE", "AGENT_GATE_BOUNCES",
     "COMPACT_MODEL", "JANITOR_MODEL", "SCROLL_MAX_CLICKS",
-    "AGENT_VERIFY", "VERIFY_MODEL",
+    "MODEL_CONTEXT_LIMITS", "AGENT_VERIFY", "VERIFY_MODEL",
     "AGENT_MAX_USD", "TOOL_RESULT_HISTORY", "TOOL_RESULT_STUB_CHARS",
     "SCREENSHOT_MAX_EDGE", "SCREENSHOT_MAX_PIXELS", "SCREENSHOT_HISTORY",
     "TODO_REMIND_STEPS", "TODO_NUDGE_STEPS", "TODO_MAX_ITEMS",
@@ -92,7 +93,7 @@ CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "LLM_MAX_RETRIES", "ASK_USER_TIMEOUT", "COMMAND_TIMEOUT",
     "SEND_FILE_MAX_BYTES", "ATTACH_TOTAL_MAX_BYTES",
     "GUT_CLEANUP", "JANITOR_MAX_STEPS", "OPENSERP_URL", "OPENSERP_ENGINES",
-    "SEARCH_LANG", "SEARCH_REGION",
+    "OPENSERP_MAX_CONCURRENT", "SEARCH_LANG", "SEARCH_REGION",
     # Boot-time settings — persisted here, applied by start.sh next boot.
     "RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE", "CDP_PORT",
 })
@@ -157,6 +158,21 @@ COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "60"))
 SUBAGENT_MAX_STEPS = int(os.environ.get("SUBAGENT_MAX_STEPS", "40"))
 SUBAGENT_MAX_CONCURRENT = int(os.environ.get("SUBAGENT_MAX_CONCURRENT", "4"))
 SUBAGENT_MODEL = os.environ.get("SUBAGENT_MODEL", "")
+# Helpers one run may spawn in total — bounds an orchestrator that keeps
+# re-spawning a worker for a step that never yields evidence.
+SUBAGENT_MAX_TOTAL = int(os.environ.get("SUBAGENT_MAX_TOTAL", "12"))
+# Orchestrator mode: the main agent plans, delegates and assembles — it
+# has no web_search/fetch_url of its own, so every research step is a
+# focused worker with one goal. One agent juggling the plan, the
+# research and the deliverable in a single context is where small models
+# lose the thread; a worker with one goal and five tools has nothing to
+# confuse. off = the classic single agent that may research itself.
+AGENT_ORCHESTRATE = os.environ.get("AGENT_ORCHESTRATE", "on").lower() not in (
+    "off", "0", "false", "no")
+# Plan-lint / evidence-gate bounces one run tolerates before the checklist
+# is accepted as posted — a gate a weak model can't satisfy must not wedge
+# the run (same shape as AGENT_VERIFY_MAX_REJECTS).
+GATE_MAX_BOUNCES = int(os.environ.get("AGENT_GATE_BOUNCES", "4"))
 # Stronger model a struggling run escalates to — pair a cheap DEFAULT_MODEL
 # with a premium ESCALATION_MODEL so easy work stays cheap and only
 # demonstrably-stuck runs pay premium rates. Empty = never escalate.
@@ -208,15 +224,22 @@ VERIFY_MIN_CALLS = int(os.environ.get("AGENT_VERIFY_MIN_CALLS", "4"))
 VERIFY_INPUT_CHARS = int(os.environ.get("AGENT_VERIFY_INPUT_CHARS", "120000"))
 VERIFY_RESULT_CHARS = int(os.environ.get("AGENT_VERIFY_RESULT_CHARS", "400"))
 # Long-horizon support. When a request's prompt_tokens exceed
-# AGENT_COMPACT_RATIO of the model's context window (max_input_tokens from
-# LiteLLM's /model/info; AGENT_CONTEXT_LIMIT is the fallback when it reports
-# none — deliberately conservative: over-compacting wastes one call,
-# under-compacting kills the run), history is summarized into a handoff
-# note and the loop continues on summary + todos + the last
-# AGENT_COMPACT_KEEP messages.
+# AGENT_COMPACT_RATIO of the model's usable context window (max_input_tokens
+# from LiteLLM's /model/info, capped by MODEL_CONTEXT_LIMITS;
+# AGENT_CONTEXT_LIMIT is the fallback when it reports none — deliberately
+# conservative: over-compacting wastes one call, under-compacting kills the
+# run), history is summarized into a handoff note and the loop continues on
+# summary + todos + the last AGENT_COMPACT_KEEP messages.
 COMPACT_RATIO = float(os.environ.get("AGENT_COMPACT_RATIO", "0.75"))
 COMPACT_CONTEXT_LIMIT = int(os.environ.get("AGENT_CONTEXT_LIMIT", "128000"))
 COMPACT_KEEP = int(os.environ.get("AGENT_COMPACT_KEEP", "6"))
+# Ceiling on the context a model may use, per model — comma-separated
+# name=tokens entries ("ollama/qwen2.5vl:7b=32k", k/m suffixes ok); "*"
+# caps every model with no entry of its own. A cap only shrinks the
+# window model_context_limit resolves — the detected size wins when it's
+# smaller — so the agent compacts early enough to stay under it. Empty =
+# every model may use its full window.
+MODEL_CONTEXT_LIMITS = os.environ.get("MODEL_CONTEXT_LIMITS", "")
 # Steps without a plan call before the checklist is nudged back
 # into view on long tasks. TODO_NUDGE_STEPS covers the empty case — a run
 # that deep with no checklist usually means the task only looked small.
@@ -279,6 +302,22 @@ UNO_PORT = os.environ.get("GUT_UNO_PORT", "2002")
 # internal network, gut-bot runs it as a systemd unit on localhost.
 # Empty = fall back to DuckDuckGo's HTML endpoint.
 OPENSERP_URL = os.environ.get("OPENSERP_URL", "").rstrip("/")
+# Concurrent /mega/search requests daemon-wide — openserp launches a Chrome
+# per query, so unbounded parallelism from parallel workers is a self-DoS.
+OPENSERP_MAX_CONCURRENT = int(os.environ.get("OPENSERP_MAX_CONCURRENT", "3"))
+_openserp_sem: asyncio.Semaphore | None = None
+_openserp_sem_n = 0
+
+
+def _search_sem() -> asyncio.Semaphore:
+    """The search semaphore for the current OPENSERP_MAX_CONCURRENT —
+    rebuilt lazily so a runtime config change takes effect on the next
+    acquire (holders of the old one just finish)."""
+    global _openserp_sem, _openserp_sem_n
+    n = max(1, OPENSERP_MAX_CONCURRENT)
+    if _openserp_sem is None or _openserp_sem_n != n:
+        _openserp_sem, _openserp_sem_n = asyncio.Semaphore(n), n
+    return _openserp_sem
 # Locale passed to openserp (lang/region) and DuckDuckGo (kl) — unset =
 # whatever the container IP implies, which is usually wrong for non-English
 # or location-specific queries. The model can override per call.
@@ -383,20 +422,17 @@ pyautogui.PAUSE = 0.05
 
 SYSTEM_PROMPT = """You are Gut, an autonomous operator of a Linux desktop (XFCE4, {res}).
 You perceive the screen through screenshots and act with mouse/keyboard tools.
-
+{role}
 Environment:
-- To find or read web content, start with the text tools — fast and cheap,
-  no browser or screenshots needed: web_search finds pages, fetch_url reads
-  a page's text and links (run_command + curl works for APIs and downloads).
-- Google Chrome is installed with DevTools on localhost:{cdp}. Use the
-  browser_* tools only when the text tools can't do the job — pages needing
+{web}- Google Chrome is installed with DevTools on localhost:{cdp}. Use the
+  browser_* tools only when {textalt} can't do the job — pages needing
   JS, logins/sessions, forms, or visual checks (DOM refs, not pixels):
   open_url to get somewhere, browser_text to read the
   page's text, browser_dom to list interactive elements as #refs, then
   browser_click / browser_type by ref; browser_eval runs arbitrary JS.
   open_url reports the HTTP status and title: a 404 means the
-  URL was wrong — go back to web_search, don't try variations of it. Read
-  pages with browser_text/fetch_url, not by scrolling through screenshots.
+  URL was wrong — {on404}, don't try variations of it. Read
+  pages with browser_text, not by scrolling through screenshots.
   Fall back to pixel tools for anything outside the page.
 - LibreOffice Writer, Calc and Impress are installed
   (`libreoffice --writer/--calc/--impress`). office_eval runs Python-UNO
@@ -463,7 +499,10 @@ Talking to the user — act like a teammate, not a live feed:
   visible on screen, and never just because you're stuck — brainstorm more
   approaches instead.
 - task_complete: ends the task and sends `summary` as your wrap-up message.
-  Make it a good one: what was done, where results live, what to check.
+  The summary IS the answer: when the user asked a question, it holds the
+  values with units and the source URLs verbatim — "sources are
+  provided" or "see the report" is not an answer, the user sees nothing
+  else. Then what was done, where files are, and what to check.
 
 Planning — match the effort to the task:
 - Quick one-off actions: just do them — no plan, no checklist.
@@ -475,14 +514,23 @@ Planning — match the effort to the task:
   and `steps` (your checklist).
   Pass the full `steps` list every call, keep exactly one item
   in_progress, mark steps done as you go — task_complete bounces a
-  stale list back, so it ends the run truthful. Keep steps small — one
-  verifiable outcome each; a step that takes 15 tool calls was really
-  several steps, so split it when you notice. And update the list the
-  moment you start work that belongs to a different step — a stale
-  checklist triggers forced reposts that spend real turns. When in
-  doubt, post the plan and checklist — they cost little and the user
-  watches both live. If the scope changes, call plan again with a new
-  summary and list.
+  stale list back, so it ends the run truthful.
+- One step = one target, one verifiable outcome. Give each step a `kind`:
+  research (look ONE thing up — it becomes one worker), build (make or
+  compute a file with run_command), desktop (act on the screen), deliver
+  (send_file), decide (a judgment needing no tool). "Find prices for A, B
+  and C" is three research steps, never one — a bundled research step is
+  rejected and you must re-post it split. A step that takes 15 tool calls
+  was really several steps, so split it when you notice.
+- A step only becomes done on evidence of its kind since it started — a
+  worker's report for research, a command that ran for build, a send_file
+  for deliver. Marking a step done with no such evidence puts it straight
+  back in_progress: do the work, then mark it.
+- Update the list the moment you start work that belongs to a different
+  step — a stale checklist triggers forced reposts that spend real turns.
+  When in doubt, post the plan and checklist — they cost little and the
+  user watches both live. If the scope changes, call plan again with a
+  new summary and list.
 - On very long runs your older context gets compacted into a handoff
   summary — the checklist always survives it. Anything else worth keeping
   (paths, URLs, decisions, findings) belongs in the todo text or in files
@@ -490,39 +538,32 @@ Planning — match the effort to the task:
 
 Accuracy — never fabricate:
 - Facts that end up in a deliverable (prices, dates, names, statistics,
-  URLs) must come from a tool result in this run — a fetched page, a file
+  URLs) must come from a tool result in this run — {factsrc}, a file
   you read, command output. Never fill gaps from memory or invent
   plausible-looking values.
-- When the user asks for sources, a source is a specific page you actually
-  opened with fetch_url or browser_text — never a bare homepage, and never
-  a URL you constructed to look right.
+- When the user asks for sources, a source is a specific page that was
+  actually opened ({srcsrc}) — never a bare homepage, and never
+  a URL constructed to look right.
 - If real attempts can't verify a value, mark it as an estimate in the
   deliverable and tell the user which parts are unverified. A flagged
   estimate beats a confident invention — a wrong "fact" delivered as truth
   is the worst possible outcome.
-- Search snippets are leads, not sources: fetch_url the result page before
-  putting its claims or its URL into the deliverable.
-
+{leads}
 Guidelines:
 - A fresh screenshot is attached automatically after each turn's actions; only
   call screenshot when nothing changed or you need an extra look.
 - Batch predictable sequences into one response — emit several tool calls at
-  once (e.g. click field → type → press enter). Independent web_search and
-  fetch_url calls in one reply run in parallel, and web_search's `queries`
-  list runs several lookups in a single call — N lookups is one call, not
-  N turns. Split only when the next step depends on a result.
+  once (e.g. click field → type → press enter{batch}). Split only when the
+  next step depends on a result.
 - Prefer desktop_* refs, office_eval, keyboard shortcuts and run_command
   over pixel hunting — raw coordinates are the fallback, not the default.
 - In file chooser dialogs press ctrl+l to open the location bar, type the
   absolute path and hit enter — never navigate the places list by mouse.
-- For anything online, web_search/fetch_url first; browser_* only when they
-  fail or the page genuinely needs a browser (JS, auth, interaction).
+- {online}
 - Think in English — your reasoning and tool arguments stay English for
   quality — but face the user in their language: chat messages, questions
   and deliverables match the language they write in, and they may switch
-  languages between requests. Set web_search's lang/region to the locale
-  each query targets (a request in Danish asking for Danish prices →
-  DA/DK); never assume the server's locale.
+  languages between requests. {locale}
 - If an action changes nothing after two tries, stop and brainstorm at least
   5 different approaches (keyboard navigation, menus, run_command, the
   browser_* tools, a different app entirely) and try the most promising
@@ -546,7 +587,60 @@ Guidelines:
   you opened and stops leftover processes. Logins and cookies persist across
   tasks — never log out or wipe browser data as "cleanup".
 
-Delegating — spawn_agent runs a helper agent in the background:
+{delegate}"""
+
+# The operating model, per mode. Orchestrator: plan → one worker per
+# research target → assemble from their files → deliver. Classic: the
+# single agent that may research itself, with delegation as an option.
+ROLE_ORCHESTRATOR = """
+You work as an orchestrator: you plan, delegate research to focused
+workers, assemble their findings into the deliverable, and talk to the
+user. You have no web_search or fetch_url of your own — every lookup is a
+worker with one goal. You keep the screen, the shell and the user.
+"""
+ROLE_CLASSIC = ""
+
+WEB_ORCHESTRATOR = """- Web research is done by workers (spawn_agent), one goal each — see
+  Workers below. run_command + curl still works for APIs and downloads
+  whose URL a worker already reported.
+"""
+WEB_CLASSIC = """- To find or read web content, start with the text tools — fast and cheap,
+  no browser or screenshots needed: web_search finds pages, fetch_url reads
+  a page's text and links (run_command + curl works for APIs and downloads).
+"""
+
+LEADS_CLASSIC = """- Search snippets are leads, not sources: fetch_url the result page before
+  putting its claims or its URL into the deliverable.
+"""
+LEADS_ORCHESTRATOR = """- A worker's report ends with an evidence footer the daemon wrote —
+  pages fetched, files written. Figures in a report whose footer shows no
+  page fetched are unverified: send the worker back or flag them.
+"""
+
+DELEGATE_ORCHESTRATOR = """Workers — spawn_agent runs a focused helper in the background:
+- One worker, one goal: "the current price per kg of pulled pork in
+  Denmark", not "prices for the whole menu". Pass the goal as `task`, in
+  English, with the unit, locale and time frame you need — the worker sees
+  only that text, never your conversation. The daemon wraps it in a fixed
+  contract: verify through tools, write findings to
+  {home}/scratch/<name>/, report values + sources + an UNVERIFIED list.
+- Spawn every independent research step at once (up to {subcap} run
+  concurrently), then collect_agent — its report arrives as a message
+  either way. Keep the desktop work and the user yourself; a worker has
+  no screen, no browser and cannot ask anyone anything.
+- Assemble, don't transcribe: build the deliverable with one script that
+  reads the workers' files (JSON/CSV under {home}/scratch/) so every
+  number in it has a single source. Retyping figures from reports into a
+  file is how numbers drift. Then verify the artifact — reload it, print
+  a check total — before send_file.
+- When the deliverable carries sources, a source is the URL the worker
+  fetched — copy it verbatim from its file/report into the artifact.
+  A shop or site name ("Nemlig", "tilbudsugen.dk" as text) is not a
+  source; a row whose source cell has no URL is unsourced.
+- A worker that reports nothing usable gets a narrower goal, not a
+  retry of the same one; {subtotal} spawns per run is the cap.
+"""
+DELEGATE_CLASSIC = """Delegating — spawn_agent runs a helper agent in the background:
 - Give it self-contained headless subtasks: web research, reading or writing
   files, crunching data with run_command. It has no screen, no browser and
   no way to reach the user — anything needing eyes, clicks or logins is yours.
@@ -563,30 +657,97 @@ Delegating — spawn_agent runs a helper agent in the background:
   helper. At most {subcap} helpers run at once.
 """
 
-SUBAGENT_PROMPT = """You are '{name}', a background helper spawned by Gut on a Linux desktop.
-The main agent works in parallel and only ever sees your final report.
+
+def system_prompt(res: str, coords: str) -> str:
+    """The main agent's system prompt for the active mode."""
+    orch = AGENT_ORCHESTRATE
+    return SYSTEM_PROMPT.format(
+        res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
+        role=ROLE_ORCHESTRATOR if orch else ROLE_CLASSIC,
+        web=WEB_ORCHESTRATOR if orch else WEB_CLASSIC,
+        textalt="a worker" if orch else "the text tools",
+        on404=("have a worker find the right page"
+               if orch else "go back to web_search"),
+        factsrc=("a worker's report and the file it wrote"
+                 if orch else "a fetched page"),
+        srcsrc=("a URL a worker fetched and listed in its report"
+                if orch else "with fetch_url or browser_text"),
+        leads=LEADS_ORCHESTRATOR if orch else LEADS_CLASSIC,
+        batch=("; several spawn_agent calls" if orch else
+               "). Independent web_search and fetch_url calls in one reply "
+               "run in parallel, and web_search's `queries` list runs "
+               "several lookups in a single call — N lookups is one call, "
+               "not N turns"),
+        online=("For anything online, a worker first; browser_* only for "
+                "what genuinely needs a browser (JS, auth, interaction)."
+                if orch else
+                "For anything online, web_search/fetch_url first; browser_* "
+                "only when they fail or the page genuinely needs a browser "
+                "(JS, auth, interaction)."),
+        locale=("Tell each worker the locale its goal targets (a request "
+                "in Danish asking for Danish prices → Denmark, DKK, Danish "
+                "shops); never assume the server's locale."
+                if orch else
+                "Set web_search's lang/region to the locale each query "
+                "targets (a request in Danish asking for Danish prices → "
+                "DA/DK); never assume the server's locale."),
+        delegate=(DELEGATE_ORCHESTRATOR if orch else DELEGATE_CLASSIC).format(
+            home=HOME_DIR, subcap=SUBAGENT_MAX_CONCURRENT,
+            subtotal=SUBAGENT_MAX_TOTAL))
+
+
+SUBAGENT_PROMPT = """You are '{name}', a focused worker spawned by Gut on a Linux desktop.
+You have exactly one goal — the GOAL below — and the orchestrator that
+spawned you only ever sees your final report.
 
 Tools:
 - web_search + fetch_url: find and read web content (text only).
+  web_search's `queries` list runs several searches in one call; set
+  lang/region to the locale the goal targets (Danish prices → DA/DK).
 - run_command: bash, cwd {home}. There is no display — GUI apps and anything
   needing a screen fail; stay headless (curl, scripts, files, packages).
-- send_file: deliver a file to the user (paths relative to {home}).
-- task_complete: finish; `summary` becomes your report to the main agent.
+- send_file: deliver a file to the user (paths relative to {home}) — only
+  when the goal says to.
+- task_complete: finish; `summary` becomes your report.
+
+Method — thorough on one thing beats shallow on many:
+1. Search (2-3 queries at once), pick the 2-4 most promising result pages.
+2. fetch_url each of them — a snippet is a lead, not a source. Read the
+   actual figure, unit and date off the page.
+3. Cross-check: two sources agreeing is a finding; one source is a lead
+   you flag as single-source.
+4. Write findings to {workdir}/findings.json (machine-readable: value,
+   unit, currency, source_url, date, note) plus anything else the goal
+   asks for. Create the directory first (mkdir -p). Every figure and URL
+   in your report must also be in that file — the file is the record,
+   the report only summarizes it; task_complete checks this.
+5. task_complete with a report of 5-15 lines: the values with units and
+   currency, the source URLs you actually fetched, and an UNVERIFIED list
+   of anything you could not confirm. Never pad, never speculate.
 
 Rules:
-- Your whole output is the final report — pack in findings, file paths,
-  blockers. For substantial output, write files under {home} and return the
-  paths instead of pasting everything.
-- You cannot see the screen, drive the browser, or ask the user anything —
-  put blockers in the report instead.
-- Report only what you verified through tools — never invent facts, URLs or
-  numbers; mark anything you couldn't verify as unverified.
-- Reason and report in English regardless of the task's language — the main
-  agent translates for the user. For web_search, set lang/region to the
-  locale the task targets (Danish prices → DA/DK), not the server's.
+- Stay on the goal. Anything outside it — even if interesting — is not
+  your job; note it in one line at most.
+- Every number, name and URL in your report must come from a tool result
+  in this run. If real attempts fail, say UNVERIFIED and what you tried —
+  a flagged gap beats a plausible guess.
+- You cannot see the screen, drive the browser, or ask anyone anything —
+  a login wall or CAPTCHA is a blocker you report, not something to guess
+  around.
+- Reason and report in English whatever the goal's language — the
+  orchestrator faces the user.
 - A reply with no tool calls also ends your run, with the reply as the
   report — but prefer task_complete so the intent is clear.
 """
+
+# The user-turn wrapper spawn_agent puts around the orchestrator's goal —
+# the contract is the daemon's, so a terse or sloppy goal still yields a
+# report in the shape the gate and the orchestrator expect.
+SUBAGENT_TASK = """GOAL: {goal}
+
+Deliver: values with units/currency, the URLs you fetched, an UNVERIFIED
+list. Write {workdir}/findings.json before you finish (mkdir -p first).
+Only this goal — nothing else."""
 
 COORD_PROMPT_PIXEL = ("Tool coordinates refer to pixels in the screenshot "
                       "image you received.")
@@ -598,6 +759,65 @@ COORD_PROMPT_NORM = ("Tool coordinates use a normalized 0-1000 grid over the "
 COORD_PROMPT_NORM_YX = ("Tool coordinates use a normalized 0-1000 grid over "
                         "the screenshot in [y, x] order — [500, 500] is the "
                         "center of the screen, [0, 0] the top-left corner.")
+
+
+# ── Step kinds ─────────────────────────────────────────────────────────────
+# Every checklist step has a kind, and the kind decides what counts as
+# evidence that it was actually done (see update_todos). The model may set
+# it; when it doesn't, a lexicon guess fills it in — the gate must never
+# depend on a weak model remembering a field.
+STEP_KINDS = ("research", "build", "desktop", "deliver", "decide")
+_KIND_LEXICON = (
+    ("decide", r"\b(decide|decision|choose|pick|assume|beslut|vælg|antag)"),
+    ("deliver", r"\b(send|deliver|attach|share|hand ?over|send_file|"
+                r"sende?|aflever|lever|vedhæft)\b"),
+    ("desktop", r"\b(open|click|log ?in|login|sign ?in|type|navigate|"
+                r"install|configure|screenshot|browser|app|window|form|"
+                r"upload|download|åbn|klik|installer)\b"),
+    ("build", r"\b(creat|build|make|generat|writ|compil|assembl|produc|"
+              r"export|sav|calculat|comput|format|excel|spreadsheet|"
+              r"sheet|xlsx|docx|csv|pdf|report|script|budget|"
+              r"lav|opret|skriv|gem|udregn|beregn|ark|dokument|rapport)"),
+    ("research", r"\b(search|find|look ?up|research|compar|check|price|"
+                 r"prices|cost|source|verify|collect|gather|identif|"
+                 r"list|survey|søg|undersøg|sammenlign|tjek|pris|"
+                 r"priser|kilde|indsaml)"),
+)
+
+
+def infer_step_kind(content: str) -> str:
+    """Guess a step's kind from its wording — decide/deliver/desktop/build
+    verbs win over research ones, since "find prices and build a sheet"
+    is a build step that happens to mention prices; desktop beats build
+    because a desktop step accepts build evidence (run_command) while the
+    reverse would false-bounce a clicked-through step. Falls back to
+    research: a vague step is more likely a lookup than a screen action."""
+    text = content.lower()
+    for kind, pat in _KIND_LEXICON:
+        if re.search(pat, text):
+            return kind
+    return "research"
+
+
+# Enumerations inside one research step — "priser på A, B og C" — are the
+# canonical bundled step: one worker asked for three things does one well
+# and guesses two. Separators: commas, semicolons, slashes and the
+# conjunctions of the languages the agent meets most.
+_ENUM_SPLIT_RE = re.compile(
+    r"\s*(?:,|;|/|&|\bog\b|\beller\b|\band\b|\bor\b|\bund\b|\boder\b)\s*",
+    re.I)
+
+
+def enumerated_targets(content: str) -> list[str]:
+    """The items a step enumerates, when it bundles three or more —
+    otherwise []. Splits on list separators and keeps items that look like
+    nouns (short, no verbs of their own)."""
+    tail = re.split(r"\b(?:på|for|of|om|about|af|til|to|from|fra)\b",
+                    content, maxsplit=1, flags=re.I)
+    body = tail[-1] if len(tail) > 1 else content
+    items = [i.strip(" .:-") for i in _ENUM_SPLIT_RE.split(body)]
+    items = [i for i in items if 1 <= len(i.split()) <= 5]
+    return items if len(items) >= 3 else []
 
 
 class AgentState:
@@ -666,6 +886,20 @@ class AgentState:
         # update, not just a note it can ignore.
         self.todo_nudge_done = False
         self.todo_reconcile = False
+        # Evidence gate (update_todos): counters of evidence-bearing events
+        # this run by step kind — a worker report landing (research), a
+        # command or office_eval that ran (build), a send_file (deliver), a
+        # screen action (desktop). step_marks snapshots the counters when a
+        # step goes in_progress; marking it done needs a higher count of
+        # its kind since — proof that *something* of the right sort
+        # happened, not a model's say-so. gate_bounces counts rejected plan
+        # updates (lint + gate) toward GATE_MAX_BOUNCES; spawned counts
+        # helpers toward SUBAGENT_MAX_TOTAL.
+        self.evidence: dict[str, int] = dict.fromkeys(STEP_KINDS, 0)
+        self.step_marks: dict[str, dict[str, int]] = {}
+        self.plan_mark: dict[str, int] = dict.fromkeys(STEP_KINDS, 0)
+        self.gate_bounces = 0
+        self.spawned = 0
         self.steps_since_compact = 99
         self.ctx_limit: dict[str, int] = {}  # model -> max_input_tokens
         # Context-window occupancy of the running conversation: the last
@@ -674,6 +908,7 @@ class AgentState:
         self.ctx_used = 0
         self.ctx_parts: dict = {}
         self.no_tool_choice: set[str] = set()  # models that 400 on tool_choice
+        self.no_tool_required: set[str] = set()  # …and on the "required" form
         # Delivery bookkeeping for the unsent-output nudge at task_complete:
         # run_start marks the current task's beginning; delivered maps an
         # attachment's resolved path -> mtime when the user sent it (cumulative
@@ -1631,8 +1866,39 @@ def type_text(text: str) -> str:
     return f"typed {len(text)} chars"
 
 
+_ESCAPED_NL_RE = re.compile(r"\\n")
+_INLINE_SCRIPT_RE = re.compile(r"python3?\s+-c\s|<<\s*'?\"?\w+")
+
+
+def _repair_script_newlines(command: str) -> tuple[str, bool]:
+    """Small models emit multi-line scripts as one line with literal
+    backslash-n between statements (the JSON escape leaked into the
+    string). Bash hands Python the two characters `\\` `n`, which is a
+    SyntaxError the model then retries forty times with a different typo
+    each. When a python -c / heredoc command has no real newline and two
+    or more escaped ones, they were meant as line breaks — turn them into
+    real ones and say so. The same repair the search tools make for
+    mojibake in queries."""
+    if "\n" in command or len(_ESCAPED_NL_RE.findall(command)) < 2 \
+            or not _INLINE_SCRIPT_RE.search(command):
+        return command, False
+    return _ESCAPED_NL_RE.sub("\n", command), True
+
+
 def run_command(command: str, headless: bool = False,
                 helper: str = "") -> str:
+    command, repaired = _repair_script_newlines(command)
+    out = _run_command(command, headless, helper)
+    if repaired:
+        out += ("\n[note: your command arrived as one line with literal "
+                "\\n sequences — they were converted to real newlines "
+                "before running. Emit real line breaks (a heredoc: "
+                "python3 - <<'EOF' … EOF) so this isn't needed.]")
+    return out
+
+
+def _run_command(command: str, headless: bool = False,
+                 helper: str = "") -> str:
     # Redirect via a real file, not pipes: a backgrounded child (`foo &`)
     # inherits stdout/stderr, and communicate() would block on pipe EOF until
     # that child exits — a false "still running" timeout for every GUI launch.
@@ -2437,28 +2703,39 @@ async def web_search(query: str, max_results: int = 8,
     region = (region or SEARCH_REGION).strip().upper()
     results, backend = [], ""
     if OPENSERP_URL:
-        try:
-            # /mega/search fans out to the listed engines and merges+dedupes
-            # — per-engine blocks (CAPTCHA, rate limits) don't sink the query.
-            params: dict = {"text": query, "limit": n,
-                            "engines": _openserp_engines(lang)}
-            if lang:
-                params["lang"] = lang
-            if region:
-                params["region"] = region
-            async with httpx.AsyncClient(timeout=35) as c:
-                r = await c.get(f"{OPENSERP_URL}/mega/search", params=params)
-            if r.status_code == 200:
-                results = [{"title": str(it.get("title", "")),
-                            "url": str(it.get("url", "")),
-                            "snippet": str(it.get("snippet") or "")}
-                           for it in r.json().get("results", [])]
-                backend = "openserp"
-            else:
+        # /mega/search fans out to the listed engines and merges+dedupes
+        # — per-engine blocks (CAPTCHA, rate limits) don't sink the query.
+        # A 502 means every engine failed at once (usually transient
+        # rate-limiting), so retry once before falling back to DDG — the
+        # caller's own requery with different terms is the better retry.
+        # The semaphore bounds daemon-wide concurrency: openserp spawns a
+        # Chrome per query, and a batch of workers each firing multi-query
+        # searches at once is exactly what 502s a small instance.
+        params: dict = {"text": query, "limit": n,
+                        "engines": _openserp_engines(lang)}
+        if lang:
+            params["lang"] = lang
+        if region:
+            params["region"] = region
+        for attempt in range(2):
+            try:
+                async with _search_sem():
+                    async with httpx.AsyncClient(timeout=25) as c:
+                        r = await c.get(f"{OPENSERP_URL}/mega/search",
+                                        params=params)
+                if r.status_code == 200:
+                    results = [{"title": str(it.get("title", "")),
+                                "url": str(it.get("url", "")),
+                                "snippet": str(it.get("snippet") or "")}
+                               for it in r.json().get("results", [])]
+                    backend = "openserp"
+                    break
                 print(f"[gut] openserp search HTTP {r.status_code}: "
                       f"{r.text[:200]}")
-        except Exception as e:
-            print(f"[gut] openserp search failed: {e}")  # fall back to DDG
+            except Exception as e:
+                print(f"[gut] openserp search failed: {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
     if not results:
         try:
             results, backend = await _ddg_search(query, lang, region), \
@@ -2587,6 +2864,13 @@ SCREEN_TOOLS = {
     "wait", "browser_click", "browser_type", "open_url", "focus_window",
     "desktop_act", "desktop_click", "desktop_type", "office_eval",
 }
+# The subset whose whole point is a visible effect. A run_command or
+# office_eval that leaves the screen as it was did its job in a file — an
+# orchestrator assembling a deliverable runs six of those in a row, and
+# counting them toward the "your actions have no effect" streak used to
+# spend a rescue (escalation, or a check-in with the user) on a run that
+# was working fine.
+VISUAL_TOOLS = SCREEN_TOOLS - {"run_command", "office_eval", "wait"}
 
 # Declared in the order the prompt wants them weighed: plan first, then the
 # cheap text web tools, browser refs, the screen, native-app refs, pixel
@@ -2603,10 +2887,17 @@ TOOLS = [
                        "your working checklist, pinned live above the chat "
                        "and kept across context compaction: pass the full "
                        "list every time with exactly one item in_progress "
-                       "and mark steps done as you go. Multi-phase tasks: "
-                       "call this before you start acting. task_complete "
-                       "bounces an unfinished checklist — keep it truthful. "
-                       "Quick one-off actions: skip it.",
+                       "and mark steps done as you go. One step = one "
+                       "target, one outcome: a research step names ONE "
+                       "thing to look up (it becomes one worker), never a "
+                       "list. A step only counts as done once evidence of "
+                       "its kind exists — a worker report for research, a "
+                       "command that ran for build, a send_file for "
+                       "deliver — otherwise it is put back in_progress. "
+                       "Multi-phase tasks: call this before you start "
+                       "acting. task_complete bounces an unfinished "
+                       "checklist — keep it truthful. Quick one-off "
+                       "actions: skip it.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string",
                         "description": "concise plan for the user — first "
@@ -2615,7 +2906,16 @@ TOOLS = [
                 "properties": {
                     "content": {"type": "string"},
                     "status": {"type": "string",
-                               "enum": ["pending", "in_progress", "done"]}},
+                               "enum": ["pending", "in_progress", "done"]},
+                    "kind": {"type": "string",
+                             "enum": list(STEP_KINDS),
+                             "description": "research = look something up "
+                                            "(one worker); build = make or "
+                                            "compute a file/result with "
+                                            "run_command; desktop = act on "
+                                            "the screen; deliver = "
+                                            "send_file; decide = a judgment "
+                                            "call needing no tool"}},
                 "required": ["content", "status"]}}},
             "required": ["steps"]}}},
     {"type": "function", "function": {
@@ -2891,11 +3191,13 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "task_complete",
         "description": "End the task. `summary` is sent to the user as your "
-                       "wrap-up message — cover what was done, where results "
-                       "live, and anything they should check. send_file any "
-                       "files the user needs first. Unfinished checklist "
-                       "items or unsent files bounce the call — reconcile "
-                       "and retry.",
+                       "wrap-up message and is all they see: put the actual "
+                       "answer in it — values with units, source URLs "
+                       "verbatim, file names — then what was done and what "
+                       "to check. Never 'sources are provided'; paste them. "
+                       "send_file any files the user needs first. Unfinished "
+                       "checklist items or unsent files bounce the call — "
+                       "reconcile and retry.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
@@ -2915,6 +3217,12 @@ CONTEXT_TOOLS = {
     "desktop_type": lambda: state.tree_seen,
     "office_eval": lambda: OFFICE_AVAILABLE,
     "collect_agent": lambda: bool(state.subagents),
+    # Orchestrator mode takes the text web tools away from the main agent
+    # for good: research is a worker's job, and a tool the model can't
+    # call is a rule it can't forget. (A resumed conversation whose
+    # history already calls them keeps them — tools_for_run below.)
+    "web_search": lambda: not AGENT_ORCHESTRATE,
+    "fetch_url": lambda: not AGENT_ORCHESTRATE,
 }
 
 
@@ -3065,6 +3373,55 @@ def event_files(saved: list[dict]) -> list[dict]:
             for f in saved]
 
 
+def file_digest(p: Path) -> str:
+    """One line on what a file actually contains — sheets and filled rows
+    for a workbook, paragraphs for a document, records for JSON, a head
+    for text. The mechanical counterpart to "I made the spreadsheet": it
+    rides the send_file result so the agent sees an empty artifact before
+    the user does, and the wrap-up ledger so the checker can too."""
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return f"unreadable ({e})"
+    suf = p.suffix.lower()
+    try:
+        if suf in (".xlsx", ".xlsm"):
+            import openpyxl
+            wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+            parts = []
+            for ws in wb.worksheets:
+                rows = [r for r in ws.iter_rows(values_only=True)
+                        if any(c not in (None, "") for c in r)]
+                cells = sum(1 for r in rows for c in r if c not in (None, ""))
+                head = " | ".join(str(c) for c in (rows[0] if rows else ())
+                                  if c not in (None, ""))[:80]
+                parts.append(f"'{ws.title}': {len(rows)} filled rows, "
+                             f"{cells} cells" + (f", header: {head}"
+                                                 if head else ""))
+            return f"{size} B, " + "; ".join(parts)
+        if suf == ".docx":
+            import docx
+            d = docx.Document(str(p))
+            paras = [x.text for x in d.paragraphs if x.text.strip()]
+            words = sum(len(x.split()) for x in paras)
+            return (f"{size} B, {len(paras)} paragraphs, {words} words, "
+                    f"{len(d.tables)} tables")
+        if suf == ".json":
+            data = json.loads(p.read_text(errors="replace"))
+            shape = (f"list of {len(data)}" if isinstance(data, list)
+                     else f"object with {len(data)} keys" if isinstance(data, dict)
+                     else type(data).__name__)
+            return f"{size} B, {shape}: {json.dumps(data)[:120]}"
+        if suf in (".csv", ".tsv", ".md", ".txt", ".html", ".xml", ".py"):
+            text = p.read_text(errors="replace")
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            return (f"{size} B, {len(lines)} non-empty lines, head: "
+                    + " ".join(text[:120].split()))
+    except Exception as e:
+        return f"{size} B, unreadable as {suf or 'text'} ({e})"
+    return f"{size} B"
+
+
 async def send_file(path_str: str, note: str = "",
                     conv: str | None = None) -> str:
     p = _resolve_path(path_str or "")
@@ -3081,7 +3438,8 @@ async def send_file(path_str: str, note: str = "",
         "note": note, "data": base64.b64encode(p.read_bytes()).decode()},
         conv)
     state.sent_files[str(p)] = p.stat().st_mtime
-    return f"sent {p.name} ({size} bytes) to the user"
+    digest = await asyncio.to_thread(file_digest, p)
+    return f"sent {p.name} to the user — contents: {digest}"
 
 
 async def send_image(path_str: str | None, caption: str = "") -> str:
@@ -3160,15 +3518,64 @@ _TODO_MARKS = {"done": "☑", "in_progress": "◐", "pending": "☐"}
 
 
 def render_todos(items: list[dict]) -> str:
-    return "\n".join(f"{_TODO_MARKS.get(i['status'], '☐')} {i['content']}"
-                     for i in items)
+    return "\n".join(
+        f"{_TODO_MARKS.get(i['status'], '☐')} [{i.get('kind', 'research')}] "
+        f"{i['content']}" for i in items)
+
+
+# Evidence kinds that satisfy a step of each kind. A desktop step also
+# accepts build evidence — downloads, installs and file moves are screen
+# work as often as shell work, and a run_command that did the job must not
+# bounce the step. decide needs nothing: it is a judgment, not an action.
+_EVIDENCE_FOR = {
+    "research": ("research",),
+    "build": ("build",),
+    "desktop": ("desktop", "build"),
+    "deliver": ("deliver",),
+    "decide": (),
+}
+_EVIDENCE_HINT = {
+    "research": "spawn_agent a worker for it and collect_agent its report",
+    "build": "run the script/command that produces it (run_command or "
+             "office_eval) and check its output",
+    "desktop": "act on the screen (or run_command) first",
+    "deliver": "send_file the file first",
+}
+
+
+def note_evidence(kind: str) -> None:
+    """Record one evidence-bearing event of `kind` for the running run."""
+    if kind in state.evidence:
+        state.evidence[kind] += 1
+
+
+def _has_evidence(kind: str, mark: dict[str, int]) -> bool:
+    return not _EVIDENCE_FOR.get(kind) or any(
+        state.evidence.get(k, 0) > mark.get(k, 0)
+        for k in _EVIDENCE_FOR[kind])
+
+
+def _norm_step(content: str) -> str:
+    return " ".join(content.lower().split())
 
 
 async def update_todos(raw_items) -> str:
     """Replace the running conversation's checklist — persisted next to the
     context and pushed to clients as a live card (not a transcript event:
     the card only ever shows latest state, and replayed updates would spam
-    history)."""
+    history).
+
+    The checklist is a contract, not a notepad, and this is where the
+    daemon holds the model to it:
+    * lint — a research step that enumerates three or more targets is
+      bounced whole: one target per step, because each research step
+      becomes one focused worker;
+    * evidence gate — a step may only turn done once an evidence event of
+      its kind has happened since it went in_progress (a worker report, a
+      command that ran, a send_file, a screen action); otherwise it is put
+      back in_progress and the result says what is missing.
+    Both are bounded by GATE_MAX_BOUNCES so a model that cannot satisfy
+    them still gets its list accepted, with the caveat spelled out."""
     items = []
     for it in (raw_items if isinstance(raw_items, list) else []):
         if not isinstance(it, dict):
@@ -3181,16 +3588,83 @@ async def update_todos(raw_items) -> str:
             status = "done"
         if status not in _TODO_MARKS:
             status = "pending"
-        items.append({"content": content[:200], "status": status})
-    state.todos = items[:TODO_MAX_ITEMS]
+        kind = str(it.get("kind") or "").lower()
+        if kind not in STEP_KINDS:
+            kind = infer_step_kind(content)
+        items.append({"content": content[:200], "status": status,
+                      "kind": kind})
+    items = items[:TODO_MAX_ITEMS]
+    enforce = state.gate_bounces < GATE_MAX_BOUNCES
+    notes: list[str] = []
+
+    # Lint: bundled research steps. The whole update is rejected — the
+    # model re-posts with the step split (its next reply is pinned to
+    # plan by the reconcile flag), so the checklist never holds a step
+    # that one worker cannot own.
+    if enforce:
+        for it in items:
+            targets = (enumerated_targets(it["content"])
+                       if it["kind"] == "research" and it["status"] != "done"
+                       else [])
+            if targets:
+                state.gate_bounces += 1
+                state.todo_reconcile = True
+                quoted = ", ".join(f"'{t}'" for t in targets)
+                return (f"plan NOT accepted — the research step "
+                        f"'{it['content']}' bundles {len(targets)} targets "
+                        f"({quoted}). One research step per target — each "
+                        "becomes one worker with one goal. Re-post the full "
+                        "`steps` list with that step split.")
+
+    # Evidence gate. Steps are matched to the previous list by wording;
+    # a reworded or new step counts from the last plan call.
+    prev = {_norm_step(i["content"]): i for i in state.todos}
+    held: list[dict] = []
+    for it in items:
+        key = _norm_step(it["content"])
+        before = prev.get(key)
+        was = before["status"] if before else None
+        if it["status"] == "done" and was != "done":
+            mark = state.step_marks.get(key, state.plan_mark)
+            if enforce and not _has_evidence(it["kind"], mark):
+                it["status"] = "in_progress"
+                held.append(it)
+        if it["status"] == "in_progress" and was != "in_progress":
+            state.step_marks[key] = dict(state.evidence)
+    if held:
+        state.gate_bounces += 1
+        for it in held:
+            hint = _EVIDENCE_HINT.get(it["kind"], "do the work first")
+            notes.append(f"⟲ '{it['content']}' is NOT done — no "
+                         f"{it['kind']} evidence since it started ({hint}); "
+                         "kept in_progress")
+    elif not enforce and state.gate_bounces == GATE_MAX_BOUNCES:
+        state.gate_bounces += 1  # say it once
+        notes.append("(plan checks exhausted for this run — the list is "
+                     "accepted as posted; the wrap-up audit still applies)")
+
+    state.todos = items
+    state.plan_mark = dict(state.evidence)
     state.steps_since_todo = 0
     if state.conversation_id:
         conv_save_todos(state.conversation_id, state.todos)
     await broadcast({"type": "todos",
                      "conversation_id": state.conversation_id,
                      "items": state.todos})
-    return ("checklist updated:\n"
-            + (render_todos(state.todos) or "(empty — all steps done?)"))
+    # Orchestrator mode: a research step in progress with no worker on it
+    # is the step the model is about to do itself — it can't (no web
+    # tools), so point it at the only path.
+    if AGENT_ORCHESTRATE and any(
+            i["status"] == "in_progress" and i["kind"] == "research"
+            for i in items) and not any(
+            e["status"] == "running" for e in state.subagents.values()):
+        notes.append("→ a research step is in progress and no worker is "
+                     "running: spawn_agent one now with that step's target "
+                     "as its goal (several independent research steps → "
+                     "several workers at once), then collect_agent.")
+    out = ("checklist updated:\n"
+           + (render_todos(state.todos) or "(empty — all steps done?)"))
+    return out + ("\n" + "\n".join(notes) if notes else "")
 
 
 async def execute_tool(name: str, args: dict,
@@ -3396,15 +3870,79 @@ async def execute_tool(name: str, args: dict,
                         f"browse this filesystem — send_file any they need, "
                         f"then call task_complete again; or call it again "
                         f"now if none of these are deliverables"), False
+            if agent is not None and agent != JANITOR_NAME:
+                # Findings gate: a worker's prose report is a summary; the
+                # findings file is the record the orchestrator's assembly
+                # script reads. A report that cites figures/URLs with an
+                # empty file forces transcription through prose — exactly
+                # how URLs and decimals get dropped. Bounce once so the
+                # worker writes the records it already found.
+                entry = state.subagents.get(agent)
+                summary = str(args.get("summary") or "")
+                if entry is not None and not entry.get("findings_nudge") \
+                        and _REPORT_CLAIM_RE.search(summary) \
+                        and _findings_empty(worker_dir(agent)):
+                    entry["findings_nudge"] = True
+                    return ("your report cites figures/URLs but no "
+                            "substantive findings file exists under "
+                            f"{worker_dir(agent)} — the file is the record "
+                            "the orchestrator builds from, your report only "
+                            "summarizes it. Write each finding to "
+                            "findings.json as a JSON object (value, unit, "
+                            "currency, source_url, note), then call "
+                            "task_complete again."), False
             return str(args.get("summary", "done")), True
         else:
             return f"unknown tool: {name}", False
     except Exception as e:
         return f"{name} failed: {e}", False
 
+    if agent is None:
+        _account_evidence(name, result)
     # A fresh screenshot is attached once per turn by agent_loop (deduped on
     # unchanged frames) — not per tool call.
     return result, False
+
+
+# Tool → the step kind its successful result is evidence for. Screen
+# actions other than these count as desktop evidence; reads (screenshot,
+# browser_dom, desktop_tree, list_windows) prove nothing and count for
+# nothing. Helpers' calls never reach here — a worker's work becomes
+# orchestrator evidence only through its delivered report.
+_EVIDENCE_TOOLS = {
+    "run_command": "build", "office_eval": "build",
+    "send_file": "deliver",
+    "web_search": "research", "fetch_url": "research",
+    "browser_text": "research",
+}
+# A command that crashed built nothing; a tool result that opens with an
+# error phrase found nothing. Page text is exempt from the crash patterns —
+# a fetched StackOverflow thread full of tracebacks is still research.
+_BUILD_FAILED_RE = re.compile(
+    r"Traceback \(most recent call last\)|command not found|"
+    r"No such file or directory|ModuleNotFoundError|SyntaxError|"
+    r"^\(exit [1-9]", re.M)
+_TOOL_ERR_RE = re.compile(
+    r"\A(?:BLOCKED:|url must start|search failed|fetch failed|no results|"
+    r"empty |[^\n]{0,40}\b(?:failed|isn't available|not found)\b)")
+
+
+def _account_evidence(name: str, result) -> None:
+    text = result if isinstance(result, str) else " ".join(
+        str(b.get("text", "")) for b in result if b.get("type") == "text")
+    kind = _EVIDENCE_TOOLS.get(name)
+    if kind is None:
+        if name in SCREEN_TOOLS and name != "wait":
+            kind = "desktop"
+        else:
+            return
+    if name == "send_file" and not text.startswith("sent "):
+        return
+    if _TOOL_ERR_RE.search(text):
+        return
+    if kind == "build" and _BUILD_FAILED_RE.search(text[:2000]):
+        return
+    note_evidence(kind)
 
 
 # ── Agent loop ───────────────────────────────────────────────────────────────
@@ -3700,6 +4238,15 @@ class StallDetector:
     def signature(name: str, args: dict) -> str:
         if name in ("ask_user", "task_complete"):
             return ""
+        if name == "run_command":
+            # The weak-model failure mode is respawning the same failing
+            # script with cosmetic edits (whitespace, quoting) — strip
+            # those so a semantic repeat still counts as a repeat. This is
+            # a loop key, not the command that runs, so over-normalizing
+            # only ever means a stuck loop is caught sooner.
+            cmd = re.sub(r"[\s\"']+", "",
+                         str(args.get("command", "")).lower())
+            return name + " " + cmd
         return name + " " + json.dumps(args, sort_keys=True, default=str)
 
     def observe(self, name: str, sig: str) -> tuple[str, bool]:
@@ -3775,6 +4322,18 @@ async def llm_request_forcing(http: httpx.AsyncClient, messages: list,
             state.no_tool_choice.add(state.model)
             print(f"[gut] {state.model} rejected tool_choice "
                   f"({force}): {e.response.text[:200]}")
+    if force and state.model not in state.no_tool_required:
+        # Servers that only take the string forms (LM Studio, llama.cpp)
+        # still honour "required": the reply is *some* tool call rather
+        # than the one we wanted — but never prose, which is the failure
+        # the pin exists to prevent.
+        try:
+            return await llm_request(http, messages, tools=tools,
+                                     tool_choice="required")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 400 or is_context_overflow(e):
+                raise
+            state.no_tool_required.add(state.model)
     return await llm_request(http, messages, tools=tools)
 
 
@@ -3805,7 +4364,7 @@ def wrap_up_note(remaining: int) -> str:
 async def llm_request(http: httpx.AsyncClient, messages: list,
                       model: str | None = None,
                       tools: list | None = None,
-                      tool_choice: dict | None = None) -> httpx.Response:
+                      tool_choice: dict | str | None = None) -> httpx.Response:
     """One chat-completion call with retry on transient failures.
 
     A single 429/5xx mid-task used to kill the run and waste all prior spend.
@@ -3815,9 +4374,11 @@ async def llm_request(http: httpx.AsyncClient, messages: list,
     """
     payload = {"model": model or state.model, "messages": messages,
                "tools": tools if tools is not None else TOOLS}
-    if tool_choice and any(t["function"]["name"]
-                           == tool_choice["function"]["name"]
-                           for t in payload["tools"]):
+    if isinstance(tool_choice, str) and payload["tools"]:
+        payload["tool_choice"] = tool_choice  # "required" / "auto"
+    elif tool_choice and any(t["function"]["name"]
+                             == tool_choice["function"]["name"]
+                             for t in payload["tools"]):
         payload["tool_choice"] = tool_choice
     if not payload["tools"]:
         del payload["tools"]  # no tools wanted (compaction) — an empty
@@ -3877,12 +4438,32 @@ COMPACT_INPUT_MAX_CHARS = int(
     os.environ.get("AGENT_COMPACT_INPUT_CHARS", "400000"))
 
 
+_CTX_CAP_RE = re.compile(r"(\d+)\s*([km]?)", re.I)
+
+
+def model_context_cap(model: str) -> int:
+    """Configured context ceiling for `model` from MODEL_CONTEXT_LIMITS —
+    the model's own entry, else the "*" wildcard. 0 = uncapped."""
+    caps = {}
+    for part in str(MODEL_CONTEXT_LIMITS).split(","):
+        name, _, val = part.partition("=")
+        m = _CTX_CAP_RE.fullmatch(val.strip())
+        if name.strip() and m:
+            caps[name.strip()] = (int(m.group(1)) * 1000 ** {
+                                  "": 0, "k": 1, "m": 2}[m.group(2).lower()])
+    return caps.get(model) or caps.get("*") or 0
+
+
 async def model_context_limit(http: httpx.AsyncClient) -> int:
-    """max_input_tokens for the active model, cached per model name; falls
-    back to AGENT_CONTEXT_LIMIT when LiteLLM reports nothing."""
+    """Usable context window for the active model: max_input_tokens from
+    LiteLLM's /model/info, cached per model name; AGENT_CONTEXT_LIMIT when
+    it reports nothing. A MODEL_CONTEXT_LIMITS cap then shrinks the
+    result — never grows it — so compaction fires early enough to keep a
+    run under its set context."""
     cached = state.ctx_limit.get(state.model)
     if cached:
         return cached
+    cap = model_context_cap(state.model)
     try:
         r = await http.get(
             f"{LITELLM_URL}/model/info",
@@ -3894,11 +4475,12 @@ async def model_context_limit(http: httpx.AsyncClient) -> int:
                 info = m.get("model_info") or {}
                 lim = info.get("max_input_tokens") or info.get("max_tokens")
                 if lim:
-                    state.ctx_limit[state.model] = int(lim)
-                    return int(lim)
+                    lim = min(int(lim), cap) if cap else int(lim)
+                    state.ctx_limit[state.model] = lim
+                    return lim
     except Exception:
         pass
-    return COMPACT_CONTEXT_LIMIT
+    return min(COMPACT_CONTEXT_LIMIT, cap) if cap else COMPACT_CONTEXT_LIMIT
 
 
 def _text_only(messages: list) -> list[dict]:
@@ -3953,12 +4535,17 @@ def ctx_breakdown(messages: list) -> dict:
 
 
 async def compact_context(http: httpx.AsyncClient, conv_id: str,
-                          messages: list) -> bool:
+                          messages: list, checklist: bool = True,
+                          save: bool = True) -> bool:
     """Summarize older history into a handoff note and rebuild `messages`
     in place as [system, handoff + checklist, recent tail].
 
-    Returns False with `messages` untouched when summarization fails — the
-    run just continues on the full history.
+    `checklist` appends the run's live checklist to the handoff — workers
+    pass False: the parent's plan is not theirs. `save` writes the
+    rebuilt context to the conversation — workers pass False: their
+    `messages` are their own, and conv_id is the parent's file. Returns
+    False with `messages` untouched when summarization fails — the run
+    just continues on the full history.
     """
     view = _text_only(messages[1:])
     total = sum(_msg_size(m) for m in view)
@@ -3982,7 +4569,7 @@ async def compact_context(http: httpx.AsyncClient, conv_id: str,
                          "text": f"context compaction failed: {e}"})
         return False
     usd, tin, tout = track_cost(r)
-    if usd or tin or tout:
+    if (usd or tin or tout) and conv_id:
         conv_add_usage(conv_id, usd, tin, tout)
     await push_cost()
     summary = r.json()["choices"][0]["message"].get("content") or ""
@@ -4002,12 +4589,13 @@ async def compact_context(http: httpx.AsyncClient, conv_id: str,
     handoff = ("[The earlier conversation was compacted into this handoff "
                "summary; the messages after it are the recent tail.]\n\n"
                + summary)
-    if state.todos:
+    if checklist and state.todos:
         handoff += "\n\nCurrent checklist:\n" + render_todos(state.todos)
     messages[1:] = [{"role": "user", "content": handoff}, *tail]
     sanitize_context(messages)
     state.steps_since_compact = 0
-    await asyncio.to_thread(conv_save_context, conv_id, messages)
+    if save and conv_id:
+        await asyncio.to_thread(conv_save_context, conv_id, messages)
     await broadcast({"type": "compact",
                      "text": f"context compacted — {dropped} older messages "
                              "summarized into a handoff note"})
@@ -4041,8 +4629,8 @@ def is_context_overflow(e: httpx.HTTPError) -> bool:
 VERIFY_PROMPT = """You audit an autonomous desktop agent's wrap-up message against the log of what its tools actually did and returned. Be strict about facts, generous about style.
 
 The wrap-up PASSES when:
-- every fact stated as certain (numbers, prices, dates, names, URLs, quotes, file contents) appears in the tool log, and
-- every claimed deliverable matches a send_file call or a file the log shows being created — in the form asked for: a spreadsheet request delivered as CSV, a document that only exists as chat text, or a file the log shows failing to build counts as a mismatch, and
+- every fact stated as certain (numbers, prices, dates, names, URLs, quotes, file contents) appears in the tool log — including inside subagent reports, whose [evidence — …] footer lists the pages actually fetched: a figure from a report whose footer says no page was fetched is unsupported, and
+- every claimed deliverable matches a send_file call or a file the log shows being created — in the form asked for: a spreadsheet request delivered as CSV, a document that only exists as chat text, or a file the log shows failing to build counts as a mismatch; the "actual contents" digest is authoritative — a workbook with 0 filled rows or a document with 0 paragraphs is not the deliverable described, and
 - claimed actions match calls that ran without an error result.
 
 Claims the agent itself flags as unverified, estimated or approximate are fine — flagged doubt is honest. Fail ONLY for material claims stated as fact that the log doesn't support or directly contradicts — never over omissions, tone, or hedged language.
@@ -4078,8 +4666,18 @@ def run_ledger(messages: list) -> list[str]:
                 res = " ".join(str(b.get("text", "")) for b in res
                                if b.get("type") == "text")
             res = " ".join(str(res or "").split())
-            entries.append(
-                f"{name}({argstr}) → {res[:VERIFY_RESULT_CHARS]}")
+            # Worker reports are the run's findings — keep them whole
+            # enough for the checker to match figures and footers.
+            cap = (VERIFY_RESULT_CHARS * 6 if name == "collect_agent"
+                   else VERIFY_RESULT_CHARS)
+            entries.append(f"{name}({argstr}) → {res[:cap]}")
+        elif role == "user" and isinstance(msg.get("content"), str) \
+                and msg["content"].startswith("[subagent '"):
+            # Reports auto-delivered between steps ride user turns, not
+            # tool results — without this line the checker never sees
+            # the evidence behind a delegated finding.
+            res = " ".join(msg["content"].split())
+            entries.append(f"subagent report → {res[:VERIFY_RESULT_CHARS * 6]}")
     return entries
 
 
@@ -4135,14 +4733,18 @@ async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
         users = (users[:2500] + "\n[… earlier messages trimmed …]\n"
                  + users[-3500:])
     unsent = [str(p) for p in unsent_outputs()]
+
+    def _digests(paths) -> str:
+        return "\n".join(f"- {p} — {file_digest(Path(p))}"
+                         for p in list(paths)[:15]) or "(none)"
+    sent_d, unsent_d = await asyncio.to_thread(
+        lambda: (_digests(sorted(state.sent_files)), _digests(unsent)))
     prompt = (
         "USER MESSAGES (oldest→newest):\n" + (users or "(none)") + "\n\n"
         "CHECKLIST STATE:\n" + (render_todos(state.todos) or "(none)")
         + "\n\n"
-        "send_file DELIVERED: " + (", ".join(sorted(state.sent_files))
-                                   or "(none)") + "\n"
-        "files changed this run, NOT delivered: "
-        + (", ".join(unsent[:15]) or "(none)") + "\n\n"
+        "send_file DELIVERED (with actual contents):\n" + sent_d + "\n"
+        "files changed this run, NOT delivered:\n" + unsent_d + "\n\n"
         "WRAP-UP UNDER REVIEW:\n" + summary + "\n\n"
         "TOOL LEDGER (oldest→newest):\n" + _ledger_window(entries))
     try:
@@ -4197,10 +4799,102 @@ def subagent_report(name: str, e: dict) -> str:
             f"${e.get('usd', 0):.4f}]\n{e.get('result') or '(no report)'}")
 
 
+# Claims in a worker's own report text: a fetched URL or a figure with a
+# unit/currency. Bare prose ("tried 3 searches", "220 people") doesn't
+# match — the gate targets reports that assert findings.
+_REPORT_CLAIM_RE = re.compile(
+    r"https?://|\d[\d.,]*\s*(?:kr\.?|dkk|usd|eur|gbp|sek|nok|\$|€|£|"
+    r"kg|g\b|stk|cl\b|ml\b|l\b|liter|%)", re.I)
+
+
+def _findings_empty(wd: Path) -> bool:
+    """True when a worker's dir holds no substantive findings file —
+    missing, or only a trivially empty `[]`/`{}`/stub."""
+    try:
+        files = [p for p in wd.iterdir() if p.is_file()] \
+            if wd.is_dir() else []
+    except OSError:
+        files = []
+    for p in files:
+        try:
+            body = p.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if len(body) > 20 and body not in ("[]", "{}", "null"):
+            return False
+    return True
+
+
+def worker_footer(messages: list, workdir: Path, report: str = "") -> str:
+    """Mechanical evidence trailer for a worker's report: what its tools
+    actually did (searches run, pages fetched and which, commands run) and
+    what it left on disk. Built from the worker's own message log, so it
+    cannot confabulate — a report full of prices whose footer shows no
+    page fetched is exactly the report the orchestrator must not trust."""
+    counts: dict[str, int] = {}
+    fetched: list[str] = []
+    pending: dict[str, tuple[str, dict]] = {}
+    for m in messages:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                pending[tc.get("id")] = (fn.get("name", "?"), args)
+        elif m.get("role") == "tool":
+            name, args = pending.pop(m.get("tool_call_id"), ("?", {}))
+            res = m.get("content")
+            if isinstance(res, list):
+                res = " ".join(str(b.get("text", "")) for b in res
+                               if b.get("type") == "text")
+            res = str(res or "")
+            if name == "task_complete":
+                continue
+            counts[name] = counts.get(name, 0) + 1
+            if name == "fetch_url" and not _TOOL_ERR_RE.search(res):
+                fetched.append(str(args.get("url", ""))[:120])
+    parts = [f"{n} {t}" for t, n in sorted(counts.items())]
+    if fetched:
+        shown = ", ".join(dict.fromkeys(fetched))
+        parts.append(f"pages fetched: {shown[:600]}")
+    files = []
+    try:
+        for p in sorted(workdir.iterdir()) if workdir.is_dir() else []:
+            if p.is_file():
+                files.append(f"{p.relative_to(SCRATCH_DIR)} — "
+                             f"{file_digest(p)}")
+    except OSError:
+        pass
+    parts.append("files: " + ("; ".join(files) if files else "none"))
+    foot = "[evidence — " + "; ".join(parts) + "]"
+    if not fetched and (counts.get("web_search") or counts.get("run_command")):
+        foot += ("\n⚠ no page was fetched — any figure above rests on search "
+                 "snippets or memory and is UNVERIFIED")
+    elif not counts:
+        foot += "\n⚠ no tools were used — this report is UNVERIFIED"
+    if _REPORT_CLAIM_RE.search(report) and _findings_empty(workdir):
+        foot += ("\n⚠ the report cites figures but no findings file was "
+                 "written — treat its values as UNVERIFIED")
+    return foot
+
+
+def worker_dir(name: str) -> Path:
+    """Where a worker writes its findings — one dir per worker under
+    scratch, so the orchestrator's assembly script has a known place to
+    read from and the footer has a known place to list."""
+    return SCRATCH_DIR / name
+
+
 def spawn_agent(task: str, name: str = "", model: str = "") -> str:
     task = task.strip()
     if not task:
         return "empty task — nothing spawned"
+    if state.spawned >= SUBAGENT_MAX_TOTAL:
+        return (f"spawn cap reached ({SUBAGENT_MAX_TOTAL} helpers this run) "
+                "— work with the reports you have; flag what's missing as "
+                "unverified.")
     # GC: drop finished entries whose report already reached the parent.
     for n in [n for n, e in state.subagents.items()
               if e["status"] != "running" and e.get("delivered")]:
@@ -4220,15 +4914,21 @@ def spawn_agent(task: str, name: str = "", model: str = "") -> str:
             n += 1
         name = f"agent-{n}"
     model = model.strip() or SUBAGENT_MODEL or state.model
+    # The goal rides inside the daemon's contract (SUBAGENT_TASK) — what
+    # the worker must deliver and where is never left to the caller.
+    wd = worker_dir(name)
+    prompt = SUBAGENT_TASK.format(goal=task, workdir=wd)
+    state.spawned += 1
     entry = {"name": name, "desc": task[:200], "conv": state.conversation_id,
              "status": "running", "result": None, "model": model,
-             "usd": 0.0, "steps": 0, "delivered": False}
+             "usd": 0.0, "steps": 0, "delivered": False, "workdir": str(wd)}
     entry["task"] = asyncio.create_task(
-        subagent_loop(name, task, model, entry))
+        subagent_loop(name, prompt, model, entry))
     state.subagents[name] = entry
     return (f"spawned '{name}' (model {model}) — it works in the background; "
             "its report arrives as a message. collect_agent(name) blocks "
-            "for it. Share artifacts through files under ~.")
+            f"for it. Its findings land under {wd}/ "
+            f"({state.spawned}/{SUBAGENT_MAX_TOTAL} spawns used).")
 
 
 async def collect_agent(name: str = "") -> str:
@@ -4240,14 +4940,14 @@ async def collect_agent(name: str = "") -> str:
             return f"no helper '{name}' — {agents_status()}"
         while e["status"] == "running" and not state.stop:
             await asyncio.sleep(0.3)
-        e["delivered"] = True
+        _deliver_report(e)
         return subagent_report(name, e)
     while not state.stop:
         done = [(n, e) for n, e in state.subagents.items()
                 if e["status"] != "running" and not e.get("delivered")]
         if done:
             n, e = done[0]
-            e["delivered"] = True
+            _deliver_report(e)
             return subagent_report(n, e)
         if not any(e["status"] == "running"
                    for e in state.subagents.values()):
@@ -4264,12 +4964,13 @@ async def subagent_loop(name: str, task_text: str, model: str,
     usd0 = state.session_usd
     messages = [
         {"role": "system", "content": SUBAGENT_PROMPT.format(
-            home=HOME_DIR, name=name)},
+            home=HOME_DIR, name=name, workdir=worker_dir(name))},
         {"role": "user", "content": task_text}]
     status, result = "done", "(ended without a report)"
     await broadcast_conv({"type": "subagent", "name": name,
                           "state": "running", "model": model,
                           "task": task_text[:300]}, conv_id)
+    searches, fetches, overflowed = 0, 0, False
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(300, connect=30)) as http:
@@ -4278,6 +4979,28 @@ async def subagent_loop(name: str, task_text: str, model: str,
                     status, result = "stopped", "(stopped by user)"
                     break
                 entry["steps"] = step + 1
+                # Worker discipline, daemon-side: a worker that only ever
+                # searches has read nothing — after a few searches with no
+                # page fetched, say so; two steps before the cap, demand
+                # the report — a capped worker returns nothing at all.
+                remaining = SUBAGENT_MAX_STEPS - step
+                if remaining <= 2:
+                    _inject_note(messages, (
+                        "FINAL STEP: call task_complete NOW with what you "
+                        "have — values you read off pages, the URLs, and "
+                        "an UNVERIFIED list for the rest."))
+                elif searches >= 3 and not fetches and searches % 3 == 0:
+                    _inject_note(messages, (
+                        f"you have run {searches} searches and fetched no "
+                        "page — a snippet is not a source. fetch_url the "
+                        "best 2 results now and read the figure off the "
+                        "page, or task_complete with UNVERIFIED and what "
+                        "you tried."))
+                # Workers hold fetched pages in context — prune everything
+                # but the newest few results every step (their record is
+                # findings.json, not the transcript), and on an overflow
+                # 400 prune hard and compact rather than dying.
+                prune_tool_results(messages, keep=4)
                 if cache_friendly(model):
                     apply_cache_control(messages)
                 try:
@@ -4286,6 +5009,13 @@ async def subagent_loop(name: str, task_text: str, model: str,
                 except httpx.HTTPError as e:
                     body = getattr(e.response, "text", "") \
                         if hasattr(e, "response") else ""
+                    if is_context_overflow(e) and not overflowed:
+                        overflowed = True
+                        prune_tool_results(messages, keep=2)
+                        if await compact_context(http, conv_id, messages,
+                                                 checklist=False,
+                                                 save=False):
+                            continue
                     status, result = "error", \
                         f"model request failed: {e} {body[:300]}"
                     break
@@ -4347,6 +5077,11 @@ async def subagent_loop(name: str, task_text: str, model: str,
                     prev = res if isinstance(res, str) else next(
                         (b.get("text", "") for b in res
                          if b.get("type") == "text"), "")
+                    if tname == "web_search":
+                        searches += 1
+                    elif tname == "fetch_url" and \
+                            not _TOOL_ERR_RE.search(prev):
+                        fetches += 1
                     await broadcast_conv({"type": "action_result",
                                           "tool": tname,
                                           "result": prev.strip()[:500],
@@ -4364,6 +5099,10 @@ async def subagent_loop(name: str, task_text: str, model: str,
     except Exception as e:
         status, result = "error", f"helper error: {e}"
     entry["usd"] = round(state.session_usd - usd0, 6)
+    if status == "done":
+        footer = worker_footer(messages, worker_dir(name), str(result))
+        entry["footer"] = footer
+        result = f"{result}\n{footer}"
     entry.update(status=status, result=result)
     # Even a stopped helper's report is queued — if the run was stopped the
     # drained-on-resume message tells the parent the helper died with it.
@@ -4398,10 +5137,23 @@ def drain_subagent_inbox(conv_id: str, messages: list) -> None:
         if e.get("conv") != conv_id:
             kept.append(e)
             continue
-        e["delivered"] = True
+        _deliver_report(e)
         messages.append({"role": "user",
                          "content": subagent_report(e["name"], e)})
     state.subagent_inbox.extend(kept)
+
+
+def _deliver_report(e: dict) -> None:
+    """Mark a helper's report as delivered to the orchestrator. A report
+    that finished with findings is the research evidence the checklist
+    gate looks for; one that errored, was stopped or came back empty is
+    not — a step can't be done on a worker that did nothing."""
+    if e.get("delivered"):
+        return
+    e["delivered"] = True
+    if e.get("status") == "done" and e.get("result") \
+            and not str(e["result"]).startswith("("):
+        note_evidence("research")
 
 
 async def drain_user_msgs(conv_id: str, messages: list, mode: str) -> bool:
@@ -4955,9 +5707,7 @@ async def agent_loop(conv_id: str, task_text: str,
             res = RESOLUTION
         coords = coord_prompt_for(state.model)
         messages = conv_load_context(conv_id) or [
-            {"role": "system", "content": SYSTEM_PROMPT.format(
-                res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
-                subcap=SUBAGENT_MAX_CONCURRENT)}]
+            {"role": "system", "content": system_prompt(res, coords)}]
         sanitize_context(messages)
         content = [{"type": "text", "text": task_text}]
         # Attached images go inline so the model sees them directly; other
@@ -4972,8 +5722,15 @@ async def agent_loop(conv_id: str, task_text: str,
         stall, unchanged_streak = StallDetector(), 0
         idle_replies = 0
         state.todos = conv_load_todos(conv_id)
+        for t in state.todos:  # lists stored before kinds existed
+            t.setdefault("kind", infer_step_kind(t.get("content", "")))
         state.plan_shared = False
         state.steps_since_todo = 0
+        state.evidence = dict.fromkeys(STEP_KINDS, 0)
+        state.step_marks = {}
+        state.plan_mark = dict.fromkeys(STEP_KINDS, 0)
+        state.gate_bounces = 0
+        state.spawned = 0
         state.steps_since_compact = 99
         state.url_fail_streak = 0
         state.solo_research = 0
@@ -5066,13 +5823,29 @@ async def agent_loop(conv_id: str, task_text: str,
                     _inject_note(messages, wrap_up_note(remaining))
                     if remaining == 1:
                         # The last call must land — completion nudges it can
-                        # no longer act on must not bounce it.
+                        # no longer act on must not bounce it, and neither
+                        # may the checker: a rejected wrap-up here is no
+                        # wrap-up at all, so it's accepted with the caveat.
                         state.output_nudge_done = True
                         state.todo_nudge_done = True
+                        state.verify_rejects = max(state.verify_rejects,
+                                                   VERIFY_MAX_REJECTS)
                         force = "task_complete"
 
                 prune_images(messages)
                 prune_tool_results(messages)
+                # A configured cap is a ceiling, not just the trigger above:
+                # last_tin saw the *previous* request, so one huge tool
+                # result could push this call over it. Estimate the
+                # post-prune context and compact before it does (the same
+                # 3-step gap bounds compaction spend when a single result
+                # alone is bigger than the cap).
+                if (model_context_cap(state.model)
+                        and state.steps_since_compact >= 3):
+                    limit = await model_context_limit(http)
+                    if (sum(ctx_breakdown(messages).values())
+                            > limit * COMPACT_RATIO):
+                        await compact_context(http, conv_id, messages)
                 if cache_friendly():
                     apply_cache_control(messages)
                 tools = tools_for_run(messages)
@@ -5161,7 +5934,7 @@ async def agent_loop(conv_id: str, task_text: str,
                     continue
                 idle_replies = 0
 
-                acted_on_screen = False
+                acted_on_screen = acted_visibly = False
                 parsed: list[tuple[dict, str, dict]] = []
                 for tc in tool_calls:
                     fn = tc.get("function") or {}
@@ -5229,6 +6002,8 @@ async def agent_loop(conv_id: str, task_text: str,
                         result, finished = await execute_tool(name, args)
                         acted_on_screen = acted_on_screen \
                             or name in SCREEN_TOOLS
+                        acted_visibly = acted_visibly \
+                            or name in VISUAL_TOOLS
 
                     # Stall detector: exact repeats within the recent window
                     # and longer cycles of previously-seen actions — see
@@ -5309,7 +6084,12 @@ async def agent_loop(conv_id: str, task_text: str,
                             await asyncio.sleep(min(0.3, left))
                             shot = await asyncio.to_thread(screenshot_block)
                     target = messages[-1]
-                    if shot is None:
+                    if shot is None and not acted_visibly:
+                        # Shell/UNO-only turn: an unchanged screen is the
+                        # expected outcome, not a stalled one.
+                        target["content"] = _note(target["content"],
+                                                  "(screen unchanged)")
+                    elif shot is None:
                         unchanged_streak += 1
                         target["content"] = _note(target["content"],
                                                   "(screen unchanged)")
@@ -6057,6 +6837,8 @@ async def api_config_set(body: dict = Body(...)):
                 state.model = v
         except (ValueError, TypeError):
             restart.append(k)
+    if "MODEL_CONTEXT_LIMITS" in updates:
+        state.ctx_limit.clear()  # limits re-resolve under the new caps
     store_config_file(saved)
     return {"config": saved, "effective": _config_effective(),
             "applied": applied, "restart_required": restart}
@@ -6149,11 +6931,20 @@ async def api_models():
                 if not name:
                     continue
                 info = m.get("model_info") or {}
+                ctx = info.get("max_input_tokens") or info.get("max_tokens")
+                # Report the usable window, not the raw one — a configured
+                # cap is what the agent will actually stay under.
+                cap = model_context_cap(name)
+                if cap:
+                    try:
+                        ctx = min(int(ctx or COMPACT_CONTEXT_LIMIT), cap)
+                    except (TypeError, ValueError):
+                        pass  # a malformed ctx passes through as-is
                 models.append({
                     "id": name,
                     "cost_in": info.get("input_cost_per_token"),
                     "cost_out": info.get("output_cost_per_token"),
-                    "ctx": info.get("max_input_tokens") or info.get("max_tokens"),
+                    "ctx": ctx,
                     "vision": info.get("supports_vision"),
                 })
             if models:

@@ -18,8 +18,8 @@ An open-source, vendor-neutral AI desktop environment governed by a vision-enabl
 - **Teammate-Style Chat:** Quiet by default — the agent messages you when it has something worth saying: milestone updates (`send_message`), clarifying questions (`ask_user`), file deliverables (`send_file`), inline screenshots (`send_image`), and a wrap-up summary when done (`task_complete`). Flip the **verbose** toggle to watch the full working log (thoughts, tool calls, results) live. The app raises a native notification when the agent finishes or needs you.
 - **Queue & steer mid-run:** Keep typing while the agent works — messages queue and are picked up when the run finishes (a follow-up to the same conversation lands before the end-of-run cleanup, so the desktop is still as the agent left it). Hit ⚡ or ⌘/Ctrl+Enter to steer instead: the message is injected into the run at the agent's next step. Queued messages can be sent-now or dropped from the tag under them; whatever is still queued when a run ends — even a stopped one — starts the next task automatically.
 - **File attachments:** Attach files from the composer (paperclip, drag-and-drop onto the chat, or paste an image). They're saved under `~/uploads` on the device and the agent reads them from there; attached images are also shown to the model inline.
-- **Parallel subagents:** The agent can spawn background helpers (`spawn_agent`) for headless work — web research, file and shell jobs — while it keeps driving the desktop. Helpers get `web_search`, `fetch_url`, `send_file` and a `run_command` with `DISPLAY` stripped, so nothing hijacks the screen or the browser; each helper gets a live card in chat showing its task, then its report — reports also reach the agent as messages mid-run (persisted into the conversation, so a helper that finishes after the run still delivers), or the agent blocks on `collect_agent`. Each helper can run a different (cheaper) model (`SUBAGENT_MODEL` or a per-spawn override).
-- **Long-horizon tasks:** On big multi-phase jobs the agent posts a plan and keeps a live checklist via `plan` — the summary shows as a card in chat, the steps pin above the transcript and are restored when you revisit the conversation. When a run nears the model's context window, older history is automatically compacted into a handoff summary and work continues — a context-overflow 400 triggers the same path instead of killing the run. Tunable via `AGENT_COMPACT_RATIO`, `AGENT_CONTEXT_LIMIT` and `AGENT_COMPACT_KEEP`.
+- **Parallel subagents:** The agent can spawn background helpers (`spawn_agent`) for headless work — web research, file and shell jobs — while it keeps driving the desktop. Helpers get `web_search`, `fetch_url`, `send_file` and a `run_command` with `DISPLAY` stripped, so nothing hijacks the screen or the browser; each helper gets a live card in chat showing its task, then its report — reports also reach the agent as messages mid-run (persisted into the conversation, so a helper that finishes after the run still delivers), or the agent blocks on `collect_agent`. Each helper can run a different (cheaper) model (`SUBAGENT_MODEL` or a per-spawn override). With `AGENT_ORCHESTRATE=on` (default) the main agent works as a pure orchestrator: it plans, spawns one focused worker per lookup (it has no `web_search`/`fetch_url` of its own), and assembles their findings — workers run under a daemon-issued contract (verify via tools, write `findings.json`, report values + source URLs + an UNVERIFIED list) and every report lands with a mechanical evidence footer (searches, pages fetched, files written) so a report claiming figures with no fetched page is flagged to the orchestrator.
+- **Long-horizon tasks:** On big multi-phase jobs the agent posts a plan and keeps a live checklist via `plan` — the summary shows as a card in chat, the steps pin above the transcript and are restored when you revisit the conversation. Steps are typed (`research`, `build`, `desktop`, `deliver`, `decide`): a research step bundling three or more targets is rejected and must be re-posted split, and a step only turns `done` once evidence of its kind landed since it started — a worker's report, a command that ran, a `send_file` (`AGENT_GATE_BOUNCES` bounds the retries). When a run nears the model's context window, older history is automatically compacted into a handoff summary and work continues — a context-overflow 400 triggers the same path instead of killing the run. Tunable via `AGENT_COMPACT_RATIO`, `AGENT_CONTEXT_LIMIT` and `AGENT_COMPACT_KEEP`; `MODEL_CONTEXT_LIMITS` caps the usable window per model (e.g. `*=128000` or `ollama/qwen2.5vl:7b=32k`) so a run stays under its set context.
 
 ---
 
@@ -88,6 +88,24 @@ Then run the app against it: `cd electron && npm install && npm start`,
 point a device at `127.0.0.1` with the `.env` `GUT_PASSWORD`, and paste a
 provider key in Settings → Provider keys.
 
+### Evals
+
+`evals/harness.py` runs the task suite in `evals/tasks.json` headlessly —
+it imports the daemon in-process (screen/browser stubbed) and drives
+`agent_loop` against any OpenAI-compatible server, so a small local model
+is enough:
+
+```bash
+cd evals && python -m venv .venv && .venv/bin/pip install -r ../backend/requirements.txt
+.venv/bin/python harness.py --llm http://192.168.50.63:1234 \
+    --model qwen/qwen3-vl-8b --mode both --openserp http://127.0.0.1:7070
+```
+
+`--mode` runs each task orchestrated, classic, or both for comparison.
+Checks are mechanical — file rows/URLs, worker counts, checklist shape,
+verifier rejections — never an LLM judge; results land in
+`evals/results/<ts>/` with the full transcript, metrics and artifacts.
+
 ---
 
 ## Repository Structure
@@ -121,6 +139,9 @@ provider key in Settings → Provider keys.
 │   ├── gut-office              # soffice/libreoffice wrapper — UNO listener on GUI launches, isolated profile for batch converts
 │   ├── gut-bot                 # CLI: info/status/logs/restart/version
 │   └── chromium-gut.conf       # /etc/chromium.d flags (CDP, no-sandbox, scale)
+├── evals/
+│   ├── harness.py              # headless in-process runner vs any OpenAI-compatible server
+│   └── tasks.json              # task suite with mechanical pass checks (no LLM judge)
 └── .github/workflows/
     ├── ci.yml                  # build image + deb + electron, smoke-test daemon
     └── release.yml             # tag → GHCR images + debs + dmg/exe/AppImage → GitHub Release

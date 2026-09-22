@@ -6,3 +6,5 @@ node_modules/
 electron/dist/
 dist/
 *.p12
+evals/.venv/
+evals/results/
