@@ -4,11 +4,15 @@
 # for every key it knows — env vars shared with it (.env / gut-bot.env) or
 # keys pushed from the app (POST /api/keys, stored in provider_keys.json) —
 # it registers that provider's models here via the DB-backed model store
-# (deployment ids "gut-*"). Keep provider models out of model_list: a
-# static entry suppresses the managed deployment of the same name, and an
-# os.environ/ key that isn't set leaves a dead model that fails at call
-# time. Static entries are still right for custom setups like a local
-# Ollama api_base — see the example at the bottom.
+# (deployment ids "gut-*"). Self-hosted servers count too: OLLAMA_API_BASE
+# makes the daemon register every pulled model (ollama/<tag>), and
+# OPENAI_COMPAT_BASE an OpenAI-compatible server's /v1/models (compat/<id>,
+# optional OPENAI_COMPAT_API_KEY).
+# Keep provider models out of model_list: a static entry suppresses the
+# managed deployment of the same name, and an os.environ/ key that isn't
+# set leaves a dead model that fails at call time. Static entries are
+# still right for setups the managed path can't express — see the example
+# at the bottom.
 #
 # IMPORTANT for the agent: screenshot perception requires a *vision-capable*
 # model (claude-*, gpt-4o, gemini-*, qwen-vl, llava, …). Text-only models

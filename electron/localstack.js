@@ -16,9 +16,13 @@ const http = require('http');
 const path = require('path');
 
 const GHCR = 'ghcr.io/valteryde/gut-desktop';
+// The *_BASE entries are server URLs, not secrets — they flow through the
+// same push/store path so the daemon can discover the servers' models live.
+// OPENAI_COMPAT_API_KEY is optional; most LAN servers accept anything.
 const PROVIDER_KEYS = [
   'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY',
-  'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY',
+  'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY', 'OLLAMA_API_BASE',
+  'OPENAI_COMPAT_BASE', 'OPENAI_COMPAT_API_KEY',
 ];
 
 const DEV = !app.isPackaged;

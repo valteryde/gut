@@ -13,7 +13,7 @@ An open-source, vendor-neutral AI desktop environment governed by a vision-enabl
 - **Backend Management:** Settings → Devices shows each backend's version and flags newer releases. gut-bot servers self-update in place from the app; the local stack pulls the matching desktop image.
 - **Persistent Conversations:** Every device stores its conversations — transcript plus model context — so you can revisit a thread and keep talking where the agent left off.
 - **Model Agnostic (BYOK):** Integrated with LiteLLM. Use Claude, GPT, Gemini, DeepSeek, OpenRouter (one key for hundreds of models), or local Ollama/vLLM weights.
-- **Live Dollar & Token Cost Tracking:** Transparent spend tracking per session and lifetime via LiteLLM metrics.
+- **Live Dollar & Token Cost Tracking:** Transparent spend tracking per session and lifetime via LiteLLM metrics — plus a context-window meter beside it showing how full the model's window is (hover for the breakdown: system prompt, screenshots, tool results, chat) and the point where history auto-compacts.
 - **Dual-Control Human Takeover:** The agent acts autonomously via mouse and keyboard simulation, but you can click into the live desktop screen at any second to handle 2FA, logins, or CAPTCHAs.
 - **Teammate-Style Chat:** Quiet by default — the agent messages you when it has something worth saying: milestone updates (`send_message`), clarifying questions (`ask_user`), file deliverables (`send_file`), inline screenshots (`send_image`), and a wrap-up summary when done (`task_complete`). Flip the **verbose** toggle to watch the full working log (thoughts, tool calls, results) live. The app raises a native notification when the agent finishes or needs you.
 - **Queue & steer mid-run:** Keep typing while the agent works — messages queue and are picked up when the run finishes (a follow-up to the same conversation lands before the end-of-run cleanup, so the desktop is still as the agent left it). Hit ⚡ or ⌘/Ctrl+Enter to steer instead: the message is injected into the run at the agent's next step. Queued messages can be sent-now or dropped from the tag under them; whatever is still queued when a run ends — even a stopped one — starts the next task automatically.
@@ -249,6 +249,19 @@ reports it via `GET /api/version`.
   the same way: pasted keys are pushed to the local daemon's
   `provider_keys.json` — its generated `.env` only ever holds bootstrap
   secrets.
+- **Ollama (self-hosted).** The Ollama card takes a server address instead
+  of a key — `192.168.1.5` or `http://host:11434` on your network. The
+  device probes it (`GET /api/ollama`), the card reports whether it
+  answered and which pulled models can see, and every pulled model
+  registers as `ollama/<tag>` in the picker with no restart. Pick a
+  vision-capable one (llava, qwen-vl, gemma3…) — on a text-only model the
+  agent is blind.
+- **OpenAI-compatible (self-hosted).** The same idea for any server that
+  speaks the OpenAI API — vLLM, LM Studio, llama.cpp, LocalAI, … The card
+  takes the server address (`192.168.1.5:8000`, `http://host:1234/v1`),
+  an API key only if the server needs one, probes `GET {base}/models`,
+  and registers each served model as `compat/<id>` — routed through
+  LiteLLM's `openai` provider at that base.
 - **Local key store.** Keys you paste are also remembered by the app itself
   (localStorage, next to the device passwords) — so a key used on one
   backend can be pushed to another without re-pasting. The "Saved on this computer"

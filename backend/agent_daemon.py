@@ -29,7 +29,8 @@ import time
 from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import (parse_qs, urljoin, urlparse, urlsplit,
+                          urlunsplit)
 from uuid import uuid4
 
 import httpx
@@ -667,6 +668,11 @@ class AgentState:
         self.todo_reconcile = False
         self.steps_since_compact = 99
         self.ctx_limit: dict[str, int] = {}  # model -> max_input_tokens
+        # Context-window occupancy of the running conversation: the last
+        # request's billed prompt_tokens and a proportional split
+        # (system/shots/tools/chat) normalized to it — broadcast on `cost`.
+        self.ctx_used = 0
+        self.ctx_parts: dict = {}
         self.no_tool_choice: set[str] = set()  # models that 400 on tool_choice
         # Delivery bookkeeping for the unsent-output nudge at task_complete:
         # run_start marks the current task's beginning; delivered maps an
@@ -822,8 +828,15 @@ def conv_set_model(cid: str, model: str) -> None:
         _write_meta(meta)
 
 
-def conv_add_usage(cid: str, usd: float, tokens_in: int, tokens_out: int) -> None:
-    """Accumulate spend into the conversation's meta file."""
+def conv_add_usage(cid: str, usd: float, tokens_in: int, tokens_out: int,
+                   ctx_tokens: int | None = None) -> None:
+    """Accumulate spend into the conversation's meta file.
+
+    `ctx_tokens` marks the request as carrying the conversation's own
+    context — its prompt size is stored as the conv's last known context
+    occupancy. Auxiliary calls (subagents, janitor, compact, verify) pass
+    nothing so their prompts don't overwrite it.
+    """
     try:
         meta = _read_meta(cid)
     except ValueError:
@@ -833,6 +846,8 @@ def conv_add_usage(cid: str, usd: float, tokens_in: int, tokens_out: int) -> Non
     meta["cost_usd"] = round(float(meta.get("cost_usd") or 0) + usd, 6)
     meta["tokens_in"] = int(meta.get("tokens_in") or 0) + tokens_in
     meta["tokens_out"] = int(meta.get("tokens_out") or 0) + tokens_out
+    if ctx_tokens is not None:
+        meta["ctx_tokens"] = ctx_tokens
     try:
         _write_meta(meta)
     except OSError:
@@ -886,6 +901,36 @@ def conv_save_todos(cid: str, items: list[dict]) -> None:
         tmp.replace(p)
     except (OSError, ValueError) as e:
         print(f"[gut] todos save failed for {cid}: {e}")
+
+
+def conv_ctx_estimate(cid: str, meta: dict) -> dict:
+    """Context-window occupancy for the conversation meter.
+
+    The running conversation reports the last billed prompt_tokens with its
+    live split; an idle one gets a stored-context estimate normalized to the
+    last real prompt size saved in its meta — `estimated` marks when that
+    anchor is missing and the raw chars/4 guess is all we have.
+    """
+    if state.running and state.conversation_id == cid and state.ctx_used:
+        out = {"tokens": state.ctx_used, "parts": state.ctx_parts,
+               "estimated": False}
+        limit = state.ctx_limit.get(state.model)
+        if limit:
+            out["limit"] = limit
+            out["compact_at"] = int(limit * COMPACT_RATIO)
+        return out
+    messages = conv_load_context(cid)
+    if not messages:
+        return {"tokens": 0, "parts": {}, "estimated": True}
+    raw = ctx_breakdown(messages)
+    total = sum(raw.values())
+    anchor = meta.get("ctx_tokens")
+    if anchor:
+        scale = anchor / max(1, total)
+        return {"tokens": anchor, "estimated": False,
+                "parts": {k: round(v * scale) for k, v in raw.items()}}
+    return {"tokens": round(total), "estimated": True,
+            "parts": {k: round(v) for k, v in raw.items()}}
 
 
 def sanitize_context(messages: list) -> None:
@@ -1013,6 +1058,18 @@ async def push_cost() -> None:
             meta = {}
         msg["conversation_id"] = state.conversation_id
         msg["conversation_usd"] = meta.get("cost_usd") or 0
+    # Context-window occupancy of the running conversation — the billed
+    # prompt size plus its category split; the window and the compaction
+    # threshold let the client render a gauge. Auxiliary push_cost callers
+    # (subagents, janitor) re-broadcast these unchanged — they describe the
+    # same conversation_id.
+    if state.ctx_used and state.running and state.conversation_id:
+        msg["ctx_tokens"] = state.ctx_used
+        msg["ctx_parts"] = state.ctx_parts
+        limit = state.ctx_limit.get(state.model)
+        if limit:
+            msg["ctx_limit"] = limit
+            msg["ctx_compact_at"] = int(limit * COMPACT_RATIO)
     await broadcast(msg)
 
 
@@ -1063,7 +1120,12 @@ PROVIDER_MODELS = {
         ("openrouter/deepseek-v3.2", "openrouter/deepseek/deepseek-v3.2"),
     ],
 }
-PROVIDER_KEYS = tuple(PROVIDER_MODELS)
+# The server providers' "keys" are base URLs (plus an optional API key for
+# OpenAI-compatible endpoints) and their model lists are whatever those
+# servers expose — discovered live in reconcile_models instead of static
+# entries above.
+PROVIDER_KEYS = tuple(PROVIDER_MODELS) + (
+    "OLLAMA_API_BASE", "OPENAI_COMPAT_BASE", "OPENAI_COMPAT_API_KEY")
 PROVIDER_KEYS_FILE = GUT_DATA_DIR / "provider_keys.json"
 MANAGED_PREFIX = "gut-"
 
@@ -1092,6 +1154,130 @@ def effective_provider_keys() -> dict:
     for k, v in load_provider_keys().items():
         eff[k] = (v, "pushed")
     return eff
+
+
+# Fallback when the server can't report modality — for Ollama the reliable
+# signal is 'clip' in details.families (the vision encoder it bundles into
+# multimodal models); an OpenAI-compatible /models has no such field.
+VISION_NAME_RE = re.compile(
+    r"llava|moondream|minicpm-v|qwen[\d.]*-?vl|vision|gemma3|"
+    r"mistral-small|granite|bakllava", re.I)
+
+
+def normalize_server_base(raw: str, default_port: int = 0,
+                          default_path: str = "",
+                          keep_path: bool = False) -> str:
+    """'192.168.1.5' → 'http://192.168.1.5[:default_port][default_path]'.
+
+    An explicit scheme/port wins; 'https://' with no port keeps 443 (a
+    reverse proxy), plain http gets default_port. '' when there's no usable
+    host."""
+    b = (raw or "").strip().rstrip("/")
+    if not b:
+        return ""
+    if "://" not in b:
+        b = f"http://{b}"
+    try:
+        u = urlsplit(b)
+        host = u.hostname or ""
+        if (u.scheme not in ("http", "https") or u.username or u.password
+                or not re.fullmatch(
+                    r"[A-Za-z0-9.\-_]+|[0-9a-fA-F:]*:[0-9a-fA-F:]+", host)):
+            return ""
+        # rstrip(':') cleans inputs like 'host:' that parse with no port.
+        netloc = u.netloc.rstrip(":")
+        if u.port is None and default_port and u.scheme == "http":
+            netloc = f"{netloc}:{default_port}"
+        u = u._replace(netloc=netloc)
+        path = (u.path.rstrip("/") or default_path) if keep_path else ""
+        return urlunsplit((u.scheme, u.netloc, path, "", ""))
+    except ValueError:
+        return ""
+
+
+def normalize_ollama_base(raw: str) -> str:
+    """'192.168.1.5' → 'http://192.168.1.5:11434' — path always dropped, a
+    pasted one would corrupt api_base joins."""
+    return normalize_server_base(raw, default_port=11434)
+
+
+def normalize_compat_base(raw: str) -> str:
+    """'192.168.1.5:8000' → 'http://192.168.1.5:8000/v1' — OpenAI-compatible
+    servers mount at /v1; an explicit path (/openai/v1, …) wins."""
+    return normalize_server_base(raw, default_path="/v1", keep_path=True)
+
+
+def ollama_base() -> str:
+    """The configured Ollama server URL, normalized — pushed wins over env."""
+    eff = effective_provider_keys().get("OLLAMA_API_BASE")
+    return normalize_ollama_base(eff[0]) if eff else ""
+
+
+def compat_base() -> str:
+    """Configured OpenAI-compatible server URL (…/v1), normalized."""
+    eff = effective_provider_keys().get("OPENAI_COMPAT_BASE")
+    return normalize_compat_base(eff[0]) if eff else ""
+
+
+def compat_key() -> str:
+    """Optional key for the compat server — most LAN servers need none."""
+    eff = effective_provider_keys().get("OPENAI_COMPAT_API_KEY")
+    return eff[0] if eff else ""
+
+
+async def ollama_tags(base: str) -> list[dict]:
+    """GET {base}/api/tags → [{name, vision}] — the server's pulled models."""
+    async with httpx.AsyncClient(timeout=8) as c:
+        r = await c.get(f"{base}/api/tags")
+        r.raise_for_status()
+        out = []
+        for m in r.json().get("models", []):
+            name = m.get("name") or m.get("model")
+            if not name:
+                continue
+            families = (m.get("details") or {}).get("families") or []
+            out.append({"name": name,
+                        "vision": "clip" in families
+                                  or bool(VISION_NAME_RE.search(name))})
+        return sorted(out, key=lambda m: m["name"])
+
+
+async def compat_models(base: str, key: str = "") -> list[dict]:
+    """GET {base}/models → [{name, vision}] — the OpenAI model listing."""
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    async with httpx.AsyncClient(timeout=8) as c:
+        r = await c.get(f"{base}/models", headers=headers)
+        r.raise_for_status()
+        return sorted(
+            ({"name": m["id"], "vision": bool(VISION_NAME_RE.search(m["id"]))}
+             for m in r.json().get("data", []) if m.get("id")),
+            key=lambda m: m["name"])
+
+
+def _probe_err(e: Exception, server: str, auth_hint: bool = False) -> str:
+    """A failed server probe as a friendly one-liner — httpx's str() is
+    empty on timeouts. `server` is a noun phrase like 'an Ollama server';
+    auth_hint makes 401/403 say 'key rejected' instead of 'wrong server'."""
+    if isinstance(e, httpx.HTTPStatusError):
+        c = e.response.status_code
+        if auth_hint and c in (401, 403):
+            return f"answered HTTP {c} — key rejected"
+        return f"answered HTTP {c} — is this {server}?"
+    if isinstance(e, httpx.TimeoutException):
+        return "timed out"
+    if isinstance(e, httpx.ConnectError):
+        return "no answer — is it running there?"
+    return str(e) or type(e).__name__
+
+
+# Provider values that are server addresses, not secrets — normalized on
+# store, and the hint shown when the input can't be parsed into a host.
+SERVER_BASE_KEYS = {
+    "OLLAMA_API_BASE": (normalize_ollama_base,
+                        "e.g. 192.168.1.5 or http://192.168.1.5:11434"),
+    "OPENAI_COMPAT_BASE": (normalize_compat_base,
+                           "e.g. 192.168.1.5:8000 or http://host:1234/v1"),
+}
 
 
 async def litellm_admin(method: str, path: str, **kw) -> httpx.Response:
@@ -1135,13 +1321,44 @@ async def reconcile_models() -> None:
     was reset. A model_name already served by a static (unmanaged) config
     entry is left to it.
     """
-    desired = {}
+    # model_name -> (litellm_params, extra model_info)
+    desired: dict[str, tuple[dict, dict]] = {}
     for env_key, models in PROVIDER_MODELS.items():
         eff = effective_provider_keys().get(env_key)
         if not eff:
             continue
         for name, litellm_model in models:
-            desired[name] = (litellm_model, eff[0])
+            desired[name] = ({"model": litellm_model, "api_key": eff[0],
+                              "max_tokens": 8192}, {})
+    # Ollama's stored value is the server's base URL; its models are whatever
+    # that server has pulled. A dead server means no ollama models this
+    # pass — never a failed sync for the other providers.
+    base = ollama_base()
+    if base:
+        try:
+            for m in await ollama_tags(base):
+                desired[f"ollama/{m['name']}"] = (
+                    {"model": f"ollama/{m['name']}", "api_base": base,
+                     "max_tokens": 8192},
+                    {"supports_vision": m["vision"]})
+        except Exception as e:
+            print(f"[gut] ollama server {base} unreachable: "
+                  f"{str(e) or type(e).__name__}")
+    # Same for a generic OpenAI-compatible server (vLLM, LM Studio,
+    # llama.cpp…): models from GET {base}/models, routed through LiteLLM's
+    # openai provider with api_base. No configured key → a dummy Bearer,
+    # which these servers ignore but LiteLLM's client requires.
+    cbase, ckey = compat_base(), compat_key()
+    if cbase:
+        try:
+            for m in await compat_models(cbase, ckey):
+                desired[f"compat/{m['name']}"] = (
+                    {"model": f"openai/{m['name']}", "api_base": cbase,
+                     "api_key": ckey or "gut-local", "max_tokens": 8192},
+                    {"supports_vision": m["vision"]})
+        except Exception as e:
+            print(f"[gut] openai-compat server {cbase} unreachable: "
+                  f"{str(e) or type(e).__name__}")
     async with _reconcile_lock:
         current = await litellm_deployments()
         static_names = {m.get("model_name") for m in current
@@ -1152,16 +1369,14 @@ async def reconcile_models() -> None:
                 await litellm_admin("POST", "/model/delete",
                                     json={"id": mid})
         added = []
-        for name, (litellm_model, key) in desired.items():
+        for name, (params, info) in desired.items():
             if name in static_names:
                 continue
             await litellm_admin("POST", "/model/new", json={
                 "model_name": name,
-                "litellm_params": {"model": litellm_model,
-                                   "api_key": key,
-                                   "max_tokens": 8192},
+                "litellm_params": params,
                 "model_info": {"id": _deployment_id(name),
-                               "managed_by": "gut"},
+                               "managed_by": "gut", **info},
             })
             added.append(name)
         # If the configured default model doesn't exist (no key for it),
@@ -3706,6 +3921,37 @@ def _msg_size(msg: dict) -> int:
     return len(json.dumps(msg, default=str))
 
 
+def _image_token_est() -> int:
+    """Pixel-based weight of one image block — providers bill vision frames
+    by pixels (≈ w*h/750), not by the base64 length a chars/4 guess would
+    use."""
+    w, h = state.shot_size or (1024, 768)
+    return max(85, int(w * h / 750))
+
+
+def ctx_breakdown(messages: list) -> dict:
+    """Raw context-size weights per category: {system, shots, tools, chat}.
+
+    Text weighs as serialized chars/4 (same ruler as _msg_size); image
+    blocks get the pixel estimate wherever they sit — user messages, or
+    tool results on vision-native providers. Callers normalize the weights
+    to the billed prompt_tokens, so only the proportions need to be right.
+    """
+    parts = {"system": 0, "shots": 0, "tools": 0, "chat": 0}
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            imgs = [b for b in content if b.get("type") == "image_url"]
+            if imgs:
+                parts["shots"] += len(imgs) * _image_token_est()
+                m = {**m, "content":
+                     [b for b in content if b.get("type") != "image_url"]}
+        cat = {"system": "system", "tool": "tools"}.get(m.get("role"),
+                                                        "chat")
+        parts[cat] += _msg_size(m) / 4
+    return parts
+
+
 async def compact_context(http: httpx.AsyncClient, conv_id: str,
                           messages: list) -> bool:
     """Summarize older history into a handoff note and rebuild `messages`
@@ -4858,8 +5104,19 @@ async def agent_loop(conv_id: str, task_text: str,
 
                 usd, tin, tout = track_cost(r)
                 last_tin = tin
+                if tin:
+                    # The billed prompt size IS the context occupancy — keep
+                    # a proportional category split so the client can meter
+                    # the window live (and show it drop when we compact).
+                    limit = await model_context_limit(http)
+                    raw = ctx_breakdown(messages)
+                    scale = tin / max(1, sum(raw.values()))
+                    state.ctx_used = tin
+                    state.ctx_parts = {
+                        k: round(v * scale) for k, v in raw.items()}
                 if usd or tin or tout:
-                    conv_add_usage(conv_id, usd, tin, tout)
+                    conv_add_usage(conv_id, usd, tin, tout,
+                                   ctx_tokens=tin or None)
                 await push_cost()
                 if (AGENT_MAX_USD
                         and state.session_usd - run_usd0 >= AGENT_MAX_USD):
@@ -5632,6 +5889,14 @@ async def api_keys_set(body: dict = Body(...)):
     saved = load_provider_keys()
     for k, v in updates.items():
         v = str(v or "").strip()
+        # Server providers take an address, not a secret — store it
+        # normalized so the UI and the reconciler read the same canonical
+        # value ('192.168.1.5' → 'http://192.168.1.5:11434').
+        if v and k in SERVER_BASE_KEYS:
+            norm, hint = SERVER_BASE_KEYS[k]
+            v = norm(v)
+            if not v:
+                raise HTTPException(400, f"{k} wants a host — {hint}")
         if v:
             saved[k] = v
         else:
@@ -5646,6 +5911,88 @@ async def api_keys_set(body: dict = Body(...)):
                 "error": f"saved on device but LiteLLM rejected it "
                          f"(retrying): {e}"}
     return {"keys": _keys_state(), "applied": True}
+
+
+@app.get("/api/ollama")
+async def api_ollama(base: str = ""):
+    """Live probe of the Ollama server — ?base= tests an unsaved address.
+
+    The settings card calls this to answer "does this AI work?": whether the
+    server answers from this device, which models it has pulled, and which
+    of them can see (the agent is blind on a text-only model).
+    """
+    configured = ollama_base()
+    if base.strip():
+        target = normalize_ollama_base(base)
+        if not target:
+            return {"set": bool(configured), "base": base.strip(),
+                    "reachable": False, "models": [],
+                    "error": "doesn't look like a host:port"}
+    else:
+        target = configured
+    if not target:
+        return {"set": False, "base": "", "reachable": False,
+                "models": [], "error": "no server configured"}
+    try:
+        models = await ollama_tags(target)
+    except Exception as e:
+        return {"set": bool(configured), "base": target,
+                "reachable": False, "models": [],
+                "error": _probe_err(e, "an Ollama server")}
+    # Reachable but the managed deployments drifted (server was down at the
+    # last sync, or models were pulled since) — let the sync loop heal it.
+    if target == configured:
+        try:
+            deployed = {str(m.get("model_name"))
+                        for m in await litellm_deployments()}
+            live = {f"ollama/{m['name']}" for m in models}
+            if live != {n for n in deployed if n.startswith("ollama/")}:
+                state.models_synced = False
+        except Exception:
+            pass
+    return {"set": bool(configured), "base": target, "reachable": True,
+            "models": models}
+
+
+@app.post("/api/compat")
+async def api_compat(body: dict = Body(default={})):
+    """Live probe of an OpenAI-compatible server (vLLM, LM Studio, …).
+
+    {"base": "…"} tests an unsaved address; {"key": "…"} overrides the
+    stored key for the probe ('' = anonymous, absent = use the stored one).
+    """
+    configured = compat_base()
+    raw = str(body.get("base") or "")
+    if raw.strip():
+        target = normalize_compat_base(raw)
+        if not target:
+            return {"set": bool(configured), "base": raw.strip(),
+                    "reachable": False, "models": [],
+                    "error": "doesn't look like a host:port"}
+    else:
+        target = configured
+    if not target:
+        return {"set": False, "base": "", "reachable": False,
+                "models": [], "error": "no server configured"}
+    key = (str(body["key"]).strip() if "key" in body else compat_key())
+    try:
+        models = await compat_models(target, key)
+    except Exception as e:
+        return {"set": bool(configured), "base": target,
+                "reachable": False, "models": [],
+                "error": _probe_err(e, "an OpenAI-compatible server",
+                                    auth_hint=True)}
+    if target == configured:
+        try:
+            deployed = {str(m.get("model_name"))
+                        for m in await litellm_deployments()}
+            live = {f"compat/{m['name']}" for m in models}
+            if live != {n for n in deployed if n.startswith("compat/")}:
+                state.models_synced = False
+        except Exception:
+            pass
+    return {"set": bool(configured), "base": target, "reachable": True,
+            "models": models}
 
 
 def _config_effective() -> dict:
@@ -5756,6 +6103,7 @@ async def api_conversation(cid: str):
         raise HTTPException(404, "no such conversation")
     conv["meta"]["running"] = bool(
         state.running and state.conversation_id == cid)
+    conv["ctx"] = conv_ctx_estimate(cid, conv["meta"])
     return conv
 
 

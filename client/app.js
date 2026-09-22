@@ -180,6 +180,7 @@ const MODEL_NOTES = [
   [/gemini.*flash/i, 'cheap + fast, decent'],
   [/deepseek/i, 'cheap, text-only — blind agent'],
   [/qwen.*vl|llava/i, 'budget vision, weaker'],
+  [/^compat\//i, 'self-hosted — quality varies'],
   [/ollama|local/i, 'free + self-hosted, weakest'],
 ];
 
@@ -217,6 +218,15 @@ const cpConvRow = $('cpConvRow');
 const cpConv = $('cpConv');
 const cpLifeRow = $('cpLifeRow');
 const cpLife = $('cpLife');
+const ctxPill = $('ctxPill');
+const ctxPct = $('ctxPct');
+const ctxHead = $('ctxHead');
+const ctxBarSegs = document.querySelectorAll('#ctxBar .seg');
+const ctxMark = $('ctxMark');
+const cxEls = { system: $('cxSys'), shots: $('cxShot'),
+                tools: $('cxTool'), chat: $('cxChat') };
+const ctxNoteRow = $('ctxNoteRow');
+const ctxNote = $('ctxNote');
 const takeoverBanner = $('takeoverBanner');
 const convTitleEl = $('convTitle');
 const chatInput = $('chatInput');
@@ -1170,6 +1180,69 @@ function setCost(c) {
     void costPill.offsetWidth;  // restart the flash
     costPill.classList.add('tick');
   }
+  // Live context occupancy rides the cost push — apply it only when it's
+  // the conversation being viewed (a push for another running conv must
+  // not repaint this one's meter).
+  if (c.conversation_id === activeConvId && c.ctx_tokens) {
+    ctxInfo = {
+      tokens: c.ctx_tokens,
+      limit: c.ctx_limit || (modelMeta[convModel] || {}).ctx || 0,
+      parts: c.ctx_parts || null,
+      compactAt: c.ctx_compact_at || 0,
+      estimated: false,
+    };
+    renderCtx();
+  }
+}
+
+// ── context meter ───────────────────────────────────────────────────────
+// The pill shows what share of the model's context window the viewed
+// conversation occupies; hovering opens a stacked breakdown (system /
+// screenshots / tool results / chat) and the point where the daemon
+// auto-compacts history.
+let ctxInfo = { tokens: 0, limit: 0, parts: null, compactAt: 0,
+                estimated: true };
+
+const CTX_CATS = ['system', 'shots', 'tools', 'chat'];  // seg order in #ctxBar
+
+function renderCtx() {
+  const { tokens, parts, compactAt, estimated } = ctxInfo;
+  // The window comes from the push, else the viewed model's metadata —
+  // which can arrive after the conversation fetch seeded ctxInfo.
+  const limit = ctxInfo.limit || (modelMeta[convModel] || {}).ctx || 0;
+  const show = !!(activeConvId && tokens > 0);
+  ctxPill.hidden = !show;
+  if (!show) return;
+  const pct = limit ? tokens / limit : 0;
+  ctxPct.textContent =
+    limit ? `${Math.round(pct * 100)}%` : `${fmtTok(tokens)} tok`;
+  ctxHead.textContent =
+    limit ? `${fmtTok(tokens)} / ${fmtTok(limit)}` : fmtTok(tokens);
+  // The bar is the whole window: segments cover tokens/limit of it, the
+  // rest reads as free space — so the compact mark lands where it fires.
+  const span = limit || (parts ? Object.values(parts).reduce((a, b) => a + b, 0) : tokens);
+  ctxBarSegs.forEach((seg, i) => {
+    // Without a split, one flat chat-colored fill still shows the total.
+    const v = parts ? (parts[CTX_CATS[i]] || 0) : (i === 3 ? tokens : 0);
+    const w = span ? v / span * 100 : 0;
+    seg.style.display = w > 0 ? '' : 'none';
+    seg.style.width = `${w}%`;
+  });
+  for (const k of CTX_CATS) {
+    cxEls[k].textContent = parts && parts[k] ? fmtTok(parts[k]) : '–';
+  }
+  ctxMark.hidden = !(limit && compactAt);
+  if (limit && compactAt) {
+    ctxMark.style.left = `${(compactAt / limit * 100).toFixed(1)}%`;
+  }
+  ctxNoteRow.hidden = !(estimated || compactAt);
+  ctxNote.textContent = estimated
+    ? 'estimated — updates after the next step'
+    : (compactAt
+        ? `auto-compacts at ~${Math.round(compactAt / limit * 100)}%`
+        : '');
+  ctxPill.classList.toggle('ctx-warm', pct >= 0.6 && pct < 0.85);
+  ctxPill.classList.toggle('ctx-hot', pct >= 0.85);
 }
 
 // ── desktop stream (noVNC RFB) ──────────────────────────────────────────
@@ -1402,6 +1475,9 @@ function clearTranscript(title) {
   helperCards.clear();
   planBody = null;
   convModel = null;
+  ctxInfo = { tokens: 0, limit: 0, parts: null, compactAt: 0,
+              estimated: true };
+  renderCtx();
   awaitingAnswer = false;
   liveStatus = '';
   liveKind = '';
@@ -1427,6 +1503,19 @@ async function openConversation(id) {
     clearTranscript(c.meta.title);
     convModel = c.meta.model || null;
     if (convModel) syncModel(convModel);
+    // c.ctx: daemon-side context occupancy — live values for a running
+    // conversation, a stored-context estimate (anchored to its last billed
+    // prompt) for an idle one. Live `cost` pushes overwrite it per step.
+    if (c.ctx && c.ctx.tokens) {
+      ctxInfo = {
+        tokens: c.ctx.tokens,
+        limit: c.ctx.limit || (modelMeta[convModel] || {}).ctx || 0,
+        parts: c.ctx.parts || null,
+        compactAt: c.ctx.compact_at || 0,
+        estimated: !!c.ctx.estimated,
+      };
+    }
+    renderCtx();
     renderTodoCard(c.todos);
     for (const ev of c.events) {
       if (ev.seq) lastSeq = Math.max(lastSeq, ev.seq);
@@ -1672,6 +1761,7 @@ function updateModelInfo() {
   if (price) bits.push(`${price} per 1M tok`);
   modelInfoEl.textContent = bits.join(' · ');
   modelSelect.title = bits.join(' · ') || 'Agent model';
+  renderCtx();  // a late-arriving modelMeta may supply the window size
 }
 
 function syncModel(current) {
@@ -2053,6 +2143,17 @@ const PROVIDERS = [
   { key: 'OPENROUTER_API_KEY', name: 'OpenRouter',
     models: 'Claude · GPT · Qwen via one key',
     icon: 'M16.778 1.844v1.919q-.569-.026-1.138-.032-.708-.008-1.415.037c-1.93.126-4.023.728-6.149 2.237-2.911 2.066-2.731 1.95-4.14 2.75-.396.223-1.342.574-2.185.798-.841.225-1.753.333-1.751.333v4.229s.768.108 1.61.333c.842.224 1.789.575 2.185.799 1.41.798 1.228.683 4.14 2.75 2.126 1.509 4.22 2.11 6.148 2.236.88.058 1.716.041 2.555.005v1.918l7.222-4.168-7.222-4.17v2.176c-.86.038-1.611.065-2.278.021-1.364-.09-2.417-.357-3.979-1.465-2.244-1.593-2.866-2.027-3.68-2.508.889-.518 1.449-.906 3.822-2.59 1.56-1.109 2.614-1.377 3.978-1.466.667-.044 1.418-.017 2.278.02v2.176L24 6.014Z' },
+  // url: the "key" is a server address, not a secret — the card gets a
+  // plain-text field, a Test probe, and a live status line.
+  { key: 'OLLAMA_API_BASE', name: 'Ollama', url: true,
+    models: 'Any model your server has pulled',
+    icon: 'M16.361 10.26a.894.894 0 0 0-.558.47l-.072.148.001.207c0 .193.004.217.059.353.076.193.152.312.291.448.24.238.51.3.872.205a.86.86 0 0 0 .517-.436.752.752 0 0 0 .08-.498c-.064-.453-.33-.782-.724-.897a1.06 1.06 0 0 0-.466 0zm-9.203.005c-.305.096-.533.32-.65.639a1.187 1.187 0 0 0-.06.52c.057.309.31.59.598.667.362.095.632.033.872-.205.14-.136.215-.255.291-.448.055-.136.059-.16.059-.353l.001-.207-.072-.148a.894.894 0 0 0-.565-.472 1.02 1.02 0 0 0-.474.007Zm4.184 2c-.131.071-.223.25-.195.383.031.143.157.288.353.407.105.063.112.072.117.136.004.038-.01.146-.029.243-.02.094-.036.194-.036.222.002.074.07.195.143.253.064.052.076.054.255.059.164.005.198.001.264-.03.169-.082.212-.234.15-.525-.052-.243-.042-.28.087-.355.137-.08.281-.219.324-.314a.365.365 0 0 0-.175-.48.394.394 0 0 0-.181-.033c-.126 0-.207.03-.355.124l-.085.053-.053-.032c-.219-.13-.259-.145-.391-.143a.396.396 0 0 0-.193.032zm.39-2.195c-.373.036-.475.05-.654.086-.291.06-.68.195-.951.328-.94.46-1.589 1.226-1.787 2.114-.04.176-.045.234-.045.53 0 .294.005.357.043.524.264 1.16 1.332 2.017 2.714 2.173.3.033 1.596.033 1.896 0 1.11-.125 2.064-.727 2.493-1.571.114-.226.169-.372.22-.602.039-.167.044-.23.044-.523 0-.297-.005-.355-.045-.531-.288-1.29-1.539-2.304-3.072-2.497a6.873 6.873 0 0 0-.855-.031zm.645.937a3.283 3.283 0 0 1 1.44.514c.223.148.537.458.671.662.166.251.26.508.303.82.02.143.01.251-.043.482-.08.345-.332.705-.672.957a3.115 3.115 0 0 1-.689.348c-.382.122-.632.144-1.525.138-.582-.006-.686-.01-.853-.042-.57-.107-1.022-.334-1.35-.68-.264-.28-.385-.535-.45-.946-.03-.192.025-.509.137-.776.136-.326.488-.73.836-.963.403-.269.934-.46 1.422-.512.187-.02.586-.02.773-.002zm-5.503-11a1.653 1.653 0 0 0-.683.298C5.617.74 5.173 1.666 4.985 2.819c-.07.436-.119 1.04-.119 1.503 0 .544.064 1.24.155 1.721.02.107.031.202.023.208a8.12 8.12 0 0 1-.187.152 5.324 5.324 0 0 0-.949 1.02 5.49 5.49 0 0 0-.94 2.339 6.625 6.625 0 0 0-.023 1.357c.091.78.325 1.438.727 2.04l.13.195-.037.064c-.269.452-.498 1.105-.605 1.732-.084.496-.095.629-.095 1.294 0 .67.009.803.088 1.266.095.555.288 1.143.503 1.534.071.128.243.393.264.407.007.003-.014.067-.046.141a7.405 7.405 0 0 0-.548 1.873c-.062.417-.071.552-.071.991 0 .56.031.832.148 1.279L3.42 24h1.478l-.05-.091c-.297-.552-.325-1.575-.068-2.597.117-.472.25-.819.498-1.296l.148-.29v-.177c0-.165-.003-.184-.057-.293a.915.915 0 0 0-.194-.25 1.74 1.74 0 0 1-.385-.543c-.424-.92-.506-2.286-.208-3.451.124-.486.329-.918.544-1.154a.787.787 0 0 0 .223-.531c0-.195-.07-.355-.224-.522a3.136 3.136 0 0 1-.817-1.729c-.14-.96.114-2.005.69-2.834.563-.814 1.353-1.336 2.237-1.475.199-.033.57-.028.776.01.226.04.367.028.512-.041.179-.085.268-.19.374-.431.093-.215.165-.333.36-.576.234-.29.46-.489.822-.729.413-.27.884-.467 1.352-.561.17-.035.25-.04.569-.04.319 0 .398.005.569.04a4.07 4.07 0 0 1 1.914.997c.117.109.398.457.488.602.034.057.095.177.132.267.105.241.195.346.374.43.14.068.286.082.503.045.343-.058.607-.053.943.016 1.144.23 2.14 1.173 2.581 2.437.385 1.108.276 2.267-.296 3.153-.097.15-.193.27-.333.419-.301.322-.301.722-.001 1.053.493.539.801 1.866.708 3.036-.062.772-.26 1.463-.533 1.854a2.096 2.096 0 0 1-.224.258.916.916 0 0 0-.194.25c-.054.109-.057.128-.057.293v.178l.148.29c.248.476.38.823.498 1.295.253 1.008.231 2.01-.059 2.581a.845.845 0 0 0-.044.098c0 .006.329.009.732.009h.73l.02-.074.036-.134c.019-.076.057-.3.088-.516.029-.217.029-1.016 0-1.258-.11-.875-.295-1.57-.597-2.226-.032-.074-.053-.138-.046-.141.008-.005.057-.074.108-.152.376-.569.607-1.284.724-2.228.031-.26.031-1.378 0-1.628-.083-.645-.182-1.082-.348-1.525a6.083 6.083 0 0 0-.329-.7l-.038-.064.131-.194c.402-.604.636-1.262.727-2.04a6.625 6.625 0 0 0-.024-1.358 5.512 5.512 0 0 0-.939-2.339 5.325 5.325 0 0 0-.95-1.02 8.097 8.097 0 0 1-.186-.152.692.692 0 0 1 .023-.208c.208-1.087.201-2.443-.017-3.503-.19-.924-.535-1.658-.98-2.082-.354-.338-.716-.482-1.15-.455-.996.059-1.8 1.205-2.116 3.01a6.805 6.805 0 0 0-.097.726c0 .036-.007.066-.015.066a.96.96 0 0 1-.149-.078A4.857 4.857 0 0 0 12 3.03c-.832 0-1.687.243-2.456.698a.958.958 0 0 1-.148.078c-.008 0-.015-.03-.015-.066a6.71 6.71 0 0 0-.097-.725C8.997 1.392 8.337.319 7.46.048a2.096 2.096 0 0 0-.585-.041Zm.293 1.402c.248.197.523.759.682 1.388.03.113.06.244.069.292.007.047.026.152.041.233.067.365.098.76.102 1.24l.002.475-.12.175-.118.178h-.278c-.324 0-.646.041-.954.124l-.238.06c-.033.007-.038-.003-.057-.144a8.438 8.438 0 0 1 .016-2.323c.124-.788.413-1.501.696-1.711.067-.05.079-.049.157.013zm9.825-.012c.17.126.358.46.498.888.28.854.36 2.028.212 3.145-.019.14-.024.151-.057.144l-.238-.06a3.693 3.693 0 0 0-.954-.124h-.278l-.119-.178-.119-.175.002-.474c.004-.669.066-1.19.214-1.772.157-.623.434-1.185.68-1.382.078-.062.09-.063.159-.012z' },
+  // optKey: a companion env key — an optional API key stored next to the
+  // server address; a blank field keeps whatever the device already has.
+  { key: 'OPENAI_COMPAT_BASE', name: 'OpenAI-compatible', url: true,
+    optKey: 'OPENAI_COMPAT_API_KEY',
+    models: 'vLLM · LM Studio · llama.cpp · LocalAI',
+    icon: 'M4.5 4h15A1.5 1.5 0 0 1 21 5.5v3A1.5 1.5 0 0 1 19.5 10h-15A1.5 1.5 0 0 1 3 8.5v-3A1.5 1.5 0 0 1 4.5 4zM4.5 14h15a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5v-3A1.5 1.5 0 0 1 4.5 14z' },
 ];
 
 const keysBox = $('keysBox');
@@ -2077,7 +2178,8 @@ function loadVault() {
   try {
     const v = JSON.parse(localStorage.getItem('gut.keystore') || '{}');
     return Object.fromEntries(Object.entries(v).filter(
-      ([k, val]) => PROVIDERS.some(p => p.key === k) && String(val).trim()));
+      ([k, val]) => PROVIDERS.some(p => p.key === k || p.optKey === k)
+                    && String(val).trim()));
   } catch (_) { return {}; }
 }
 
@@ -2238,6 +2340,7 @@ async function pushKeysRemote(d, keys, okNote) {
   }
   const j = await r.json();
   remoteKeys = j.keys || remoteKeys;
+  serverCache.key = null;  // a pushed server base may have changed
   keyNote = j.applied === false
     ? `Saved on ${name}, but the model router rejected it — the ` +
       `device keeps retrying (${j.error || 'unknown error'}).`
@@ -2255,39 +2358,47 @@ async function pushKeysRemote(d, keys, okNote) {
   return true;
 }
 
-async function saveProviderKey(key, value) {
+// Store one or more provider values — `updates` is an env-key map: a server
+// card commits its base plus, for compat, an optional API key. All-empty
+// values = a removal.
+async function saveProviderKeys(p, updates) {
   const d = keyDev();
+  const removing = !Object.values(updates).some(v => String(v).trim());
+  const noun = p.url ? 'server' : 'key';
+  if (p.url) serverCache.key = null;  // base changed — probe fresh
   if (keyMode === 'local') {
     try {
-      localKeysSet = await gut.saveLocalKeys({ [key]: value });
-      if (value) vaultSet(key, value);  // keep it for other devices too
+      localKeysSet = await gut.saveLocalKeys(updates);
+      for (const [k, v] of Object.entries(updates))
+        if (String(v).trim()) vaultSet(k, v);  // keep it for other devices
       keyNote = null;
     } catch (e) {
-      keyNote = `Could not save the key: ${e?.message || 'error'}`;
+      keyNote = `Could not save the ${noun}: ${e?.message || 'error'}`;
     }
     editingKey = null;
     renderProviderKeys();
     return;
   }
-  const p = PROVIDERS.find(x => x.key === key);
   const name = d.name || d.host;
   // Keys leave this machine — say so plainly before they go.
-  if (value && !confirm(
-      `Upload your ${p.name} key to ${name} (${d.host})?\n\n` +
+  if (!removing && !confirm(
+      `Upload your ${p.name} ${noun} to ${name} (${d.host})?\n\n` +
       'It is sent over plain HTTP and stored on that machine — its ' +
-      'agent needs it to call the provider.')) {
+      `agent needs it to call ${p.url ? 'the server' : 'the provider'}.`)) {
     editingKey = null;
     renderProviderKeys();
     return;
   }
-  keyNote = value ? `Uploading the ${p.name} key to ${name}…`
-                  : `Removing the ${p.name} key from ${name}…`;
+  keyNote = removing ? `Removing the ${p.name} ${noun} from ${name}…`
+                     : `Uploading the ${p.name} ${noun} to ${name}…`;
   renderProviderKeys();
-  const ok = await pushKeysRemote(d, { [key]: value },
-    value ? `${p.name} key is now on ${name} — its models show ` +
-            'up in the picker within a few seconds.'
-          : `${p.name} key removed from ${name}.`);
-  if (ok && value) vaultSet(key, value);
+  const ok = await pushKeysRemote(d, updates,
+    removing ? `${p.name} ${noun} removed from ${name}.`
+             : `${p.name} ${noun} is now on ${name} — its models show ` +
+               'up in the picker within a few seconds.');
+  if (ok && !removing)
+    for (const [k, v] of Object.entries(updates))
+      if (String(v).trim()) vaultSet(k, v);
   editingKey = null;
   renderProviderKeys();
 }
@@ -2298,7 +2409,11 @@ async function saveProviderKey(key, value) {
 keystorePush.onclick = async () => {
   const d = keyDev();
   const keys = {};
-  for (const p of PROVIDERS) if (vault[p.key]) keys[p.key] = vault[p.key];
+  for (const p of PROVIDERS) {
+    if (vault[p.key]) keys[p.key] = vault[p.key];
+    if (p.optKey && keys[p.key] && vault[p.optKey])
+      keys[p.optKey] = vault[p.optKey];  // a server key rides with its base
+  }
   if (!Object.keys(keys).length) return;
   const name = d.name || d.host;
   if (keyMode === 'local') {
@@ -2328,6 +2443,181 @@ keystorePush.onclick = async () => {
   renderProviderKeys();
 };
 
+// ── LAN server probing ──────────────────────────────────────────────────
+// "Does this AI work?" for server providers — the device probes via its own
+// endpoint (its network is the one the agent runs on); when it can't answer
+// — stack stopped, old backend — the app tries the address itself: a LAN
+// server answers this machine just as well.
+const LOCAL_VISION =
+  /llava|moondream|minicpm-v|qwen[\d.]*-?vl|vision|gemma3|mistral-small|granite|bakllava/i;
+let serverCache = { key: null, at: 0, res: null };
+
+const sigTimeout = (ms) =>
+  AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined;
+
+// '192.168.1.5' → 'http://192.168.1.5:11434' — mirrors the daemon's
+// normalize_ollama_base, keep them in step.
+function normOllamaBase(raw) {
+  let b = String(raw || '').trim().replace(/\/+$/, '');
+  if (!b) return '';
+  if (!b.includes('://')) b = `http://${b}`;
+  try {
+    const u = new URL(b);
+    if (!u.hostname || u.username || u.password) return '';
+    if (!u.port && u.protocol === 'http:') u.port = '11434';
+    return `${u.protocol}//${u.host}`;
+  } catch (_) { return ''; }
+}
+
+// '192.168.1.5:8000' → 'http://192.168.1.5:8000/v1' — OpenAI-compatible
+// servers mount at /v1; a pasted path wins. Mirrors normalize_compat_base.
+function normCompatBase(raw) {
+  let b = String(raw || '').trim().replace(/\/+$/, '');
+  if (!b) return '';
+  if (!b.includes('://')) b = `http://${b}`;
+  try {
+    const u = new URL(b);
+    if (!u.hostname || u.username || u.password) return '';
+    const path = u.pathname.replace(/\/+$/, '') || '/v1';
+    return `${u.protocol}//${u.host}${path}`;
+  } catch (_) { return ''; }
+}
+
+// Per-server-provider probe spec: how to normalize an address, ask the
+// device to check it, and read its model listing directly.
+const SERVER_PROVIDERS = {
+  OLLAMA_API_BASE: {
+    normBase: normOllamaBase,
+    example: '192.168.1.5 or http://192.168.1.5:11434',
+    // Longer than probeSignal — the daemon's own probe waits up to 8s on a
+    // dead host, and we want its error message, not our timeout.
+    deviceProbe: (d, base) => devFetch(d,
+      `/api/ollama${base ? `?base=${encodeURIComponent(base)}` : ''}`,
+      { signal: sigTimeout(12000) }),
+    directPath: '/api/tags',
+    models: (j) => (j.models || []).filter(m => m.name).map(m => ({
+      name: m.name,
+      vision: (m.details?.families || []).includes('clip')
+              || LOCAL_VISION.test(m.name) })),
+  },
+  OPENAI_COMPAT_BASE: {
+    normBase: normCompatBase,
+    example: '192.168.1.5:8000 or http://host:1234/v1',
+    // key absent → the device uses its stored key; '' → anonymous probe.
+    deviceProbe: (d, base, key) => devFetch(d, '/api/compat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(key === undefined ? { base } : { base, key }),
+      signal: sigTimeout(12000) }),
+    directPath: '/models',
+    models: (j) => (j.data || []).filter(m => m.id).map(m => ({
+      name: m.id, vision: LOCAL_VISION.test(m.id) })),
+  },
+};
+const serverSpec = (p) => SERVER_PROVIDERS[p.key];
+
+async function probeServerViaDevice(p, d, base, key) {
+  try {
+    const r = await serverSpec(p).deviceProbe(d, base, key);
+    if (r.ok) return { ...await r.json(), via: 'device' };
+    if (r.status === 404 || r.status === 405) return { via: 'old' };
+    if (r.status === 401 || r.status === 403) return { via: 'auth' };
+  } catch (_) { /* device unreachable */ }
+  return null;
+}
+
+async function probeServerDirect(p, base, key) {
+  const headers = key ? { Authorization: `Bearer ${key}` } : {};
+  try {
+    const r = await fetch(`${base}${serverSpec(p).directPath}`,
+                          { headers, signal: probeSignal() });
+    if (!r.ok)
+      return { reachable: false, base, error: `HTTP ${r.status}`, via: 'app' };
+    return { reachable: true, base, via: 'app',
+             models: serverSpec(p).models(await r.json()) };
+  } catch (e) {
+    return { reachable: false, base, via: 'app',
+             error: (e?.name === 'TimeoutError' || e?.name === 'AbortError')
+               ? 'timed out' : 'no answer' };
+  }
+}
+
+function paintServerStatus(p, el, res, d) {
+  el.hidden = false;
+  el.title = '';
+  if (!res || res.via === 'old') {
+    el.className = 'prov-status err';
+    el.textContent = `Can’t test it — ${d.name || d.host} isn’t answering` +
+      (res?.via === 'old' ? ' (backend too old).' : '.');
+    return;
+  }
+  if (res.via === 'auth') {
+    el.className = 'prov-status';
+    el.textContent = 'Set the device password below to test the server.';
+    return;
+  }
+  if (!res.reachable) {
+    el.className = 'prov-status err';
+    el.textContent = `✗ no ${p.name} server at ${res.base || 'that address'}` +
+      (res.error ? ` — ${res.error}` : '');
+    return;
+  }
+  const ms = res.models || [];
+  const vis = ms.filter(m => m.vision).length;
+  el.className = vis ? 'prov-status ok' : 'prov-status warn';
+  el.textContent = !ms.length
+    ? '✓ server answers — but it serves no models'
+    : `✓ works — ${ms.length} model${ms.length === 1 ? '' : 's'}` +
+      (vis ? `, ${vis} can see`
+           : ' — none can see; the agent needs a vision model ' +
+             '(llava, qwen-vl, gemma3…)');
+  el.title = `${res.base}\n` +
+    ms.map(m => `${m.name}${m.vision ? ' (vision)' : ''}`).join(', ');
+  // A direct probe that hit 'localhost' reached the server on THIS machine —
+  // inside the desktop container that name resolves to the container
+  // itself, so the agent still wouldn't see it.
+  try {
+    if (res.via === 'app' &&
+        /^(localhost|127\.|0\.0\.0\.0|\[?::1\]?)/.test(
+          new URL(res.base).hostname)) {
+      el.className = 'prov-status warn';
+      el.textContent += ' — note: “localhost” won’t work from the ' +
+        'desktop container; use host.docker.internal or the LAN IP';
+    }
+  } catch (_) { /* unparseable base — the status line already says enough */ }
+}
+
+// Probes the saved (or, with opts.base, a typed-but-unsaved) server and
+// paints the result into the card's status line. opts.key rides along for
+// providers with an optKey — undefined = the device's stored key, '' = none.
+// 30s cache so settings re-renders don't re-poke the server.
+async function refreshServerStatus(p, c,
+                                   { force = false, base = '', key } = {}) {
+  const d = keyDev();
+  const el = c.status;
+  const spec = serverSpec(p);
+  const cacheKey = `${d.id}|${p.key}|${base}|${key ?? ''}`;
+  if (!force && serverCache.key === cacheKey &&
+      Date.now() - serverCache.at < 30000) {
+    paintServerStatus(p, el, serverCache.res, d);
+    return;
+  }
+  el.hidden = false;
+  el.className = 'prov-status';
+  el.textContent = `Checking the ${p.name} server…`;
+  el.title = '';
+  let res = await probeServerViaDevice(p, d, base, key);
+  if ((!res || res.via === 'old' || res.via === 'auth')
+      && (base || vault[p.key])) {
+    const direct = spec.normBase(base || vault[p.key]);
+    const dk = key !== undefined ? key : (p.optKey && vault[p.optKey]) || '';
+    res = direct ? await probeServerDirect(p, direct, dk) : res;
+  }
+  if (d.id !== keyDev().id) return;  // target switched mid-probe
+  serverCache = { key: cacheKey, at: Date.now(), res };
+  paintServerStatus(p, el, res, d);
+}
+
 function renderProviderKeys() {
   updateKeysHeader();
   // The app's own key store — visible even when the target device can't
@@ -2342,10 +2632,11 @@ function renderProviderKeys() {
       chip.type = 'button';
       chip.className = 'keystore-chip';
       chip.textContent = `${p.name} ×`;
-      chip.title = `Forget the saved ${p.name} key`;
+      chip.title = `Forget the saved ${p.name} ${p.url ? 'address' : 'key'}`;
       chip.onclick = () => {
-        if (confirm(`Forget the ${p.name} key saved on this computer? ` +
-                   'Devices that already have it keep their copy.')) {
+        if (confirm(`Forget the ${p.name} ${p.url ? 'address' : 'key'} ` +
+                   'saved on this computer? Devices that already have ' +
+                   'it keep their copy.')) {
           vaultSet(p.key, '');
           renderProviderKeys();
         }
@@ -2365,28 +2656,59 @@ function renderProviderKeys() {
     const c = providerCards[p.key];
     const { set, source } = keyStateFor(p.key);
     const editing = editingKey === p.key;
+    const noun = p.url ? 'server' : 'key';
     // The pill says where the key physically lives, not just "saved".
     c.state.textContent = source === 'env' ? 'Server env'
       : set ? (keyMode === 'local' ? 'In .env' : 'On device')
-      : 'No key';
+      : (p.url ? 'No server' : 'No key');
     c.state.classList.toggle('set', set);
     // A refresh mid-edit must not wipe the paste field.
     if (editing && c.actions.querySelector('.prov-key-input')) continue;
     c.actions.innerHTML = '';
     if (editing) {
+      const spec = p.url ? serverSpec(p) : null;
       const input = document.createElement('input');
       input.className = 'prov-key-input';
       input.dataset.envKey = p.key;
-      input.type = 'password';
+      input.type = p.url ? 'text' : 'password';
       input.autocomplete = 'off';
       input.spellcheck = false;
-      input.placeholder = `Paste your ${p.name} key…`;
+      input.placeholder = p.url ? spec.example
+                              : `Paste your ${p.name} key…`;
+      let keyInput = null;
+      if (p.optKey) {
+        keyInput = document.createElement('input');
+        keyInput.className = 'prov-key-input';
+        keyInput.dataset.envKey = p.optKey;
+        keyInput.type = 'password';
+        keyInput.autocomplete = 'off';
+        keyInput.spellcheck = false;
+        keyInput.placeholder = 'API key — only if the server needs one';
+        keyInput.title = keyStateFor(p.optKey).set
+          ? 'A key is already on the device — blank keeps it'
+          : 'Most LAN servers need no key — blank means none';
+      }
       const save = provBtn('Save', 'primary');
       const cancel = provBtn('Cancel', 'ghost');
+      const badAddr = () => {
+        c.status.hidden = false;
+        c.status.className = 'prov-status err';
+        c.status.title = '';
+        c.status.textContent = 'That doesn’t look like an address — ' +
+          `try ${spec.example}`;
+      };
       const commit = () => {
         const v = input.value.trim();
-        if (v) saveProviderKey(p.key, v);
-        else { editingKey = null; renderProviderKeys(); }
+        if (!v) { editingKey = null; renderProviderKeys(); return; }
+        if (p.url) {
+          const b = spec.normBase(v);
+          if (!b) { badAddr(); return; }
+          const updates = { [p.key]: b };
+          if (keyInput?.value.trim()) updates[p.optKey] = keyInput.value.trim();
+          saveProviderKeys(p, updates);
+          return;
+        }
+        saveProviderKeys(p, { [p.key]: v });
       };
       save.onclick = commit;
       cancel.onclick = () => { editingKey = null; renderProviderKeys(); };
@@ -2398,24 +2720,52 @@ function renderProviderKeys() {
           renderProviderKeys();
         }
       };
-      c.actions.append(input, save, cancel);
+      if (keyInput) keyInput.onkeydown = input.onkeydown;
+      if (p.url) {
+        // Test before saving — probes the typed address.
+        const test = provBtn('Test', 'ghost');
+        test.title = 'Check the server answers before saving';
+        test.onclick = () => {
+          const b = spec.normBase(input.value);
+          if (!b) { badAddr(); return; }
+          // A blank key field means "what the device has" — same as Save.
+          refreshServerStatus(p, c, { force: true, base: b,
+            key: keyInput ? keyInput.value.trim() || undefined : undefined });
+        };
+        c.actions.append(input);
+        if (keyInput) {
+          input.classList.add('wide');
+          keyInput.classList.add('wide');
+          c.actions.append(keyInput);
+        }
+        c.actions.append(test, save, cancel);
+      } else {
+        c.actions.append(input, save, cancel);
+      }
       input.focus();
     } else if (set) {
       const replace = provBtn(source === 'env' ? 'Override' : 'Replace');
       if (source === 'env') {
-        replace.title = 'This key is set on the server itself — pushing ' +
-          'your own overrides it';
+        replace.title = `This ${noun} is set on the server itself — ` +
+          'pushing your own overrides it';
       }
       replace.onclick = () => { editingKey = p.key; renderProviderKeys(); };
       c.actions.append(replace);
+      if (p.url) {
+        const test = provBtn('Test', 'ghost');
+        test.title = 'Re-check the server now';
+        test.onclick = () => refreshServerStatus(p, c, { force: true });
+        c.actions.append(test);
+      }
       if (source !== 'env') {
         const remove = provBtn('Remove', 'danger');
         remove.onclick = () => {
           const where = keyMode === 'local'
             ? 'Its models stop working the next time the local desktop starts.'
             : `Its models stop working on ${keyDev().name || 'the device'}.`;
-          if (confirm(`Remove the ${p.name} key? ${where}`)) {
-            saveProviderKey(p.key, '');
+          if (confirm(`Remove the ${p.name} ${noun}? ${where}`)) {
+            saveProviderKeys(p, { [p.key]: '',
+              ...(p.optKey ? { [p.optKey]: '' } : {}) });
           }
         };
         c.actions.append(remove);
@@ -2423,17 +2773,26 @@ function renderProviderKeys() {
     } else {
       const saved = vault[p.key];
       if (saved) {
-        const use = provBtn('Use saved key');
+        const use = provBtn(p.url ? 'Use saved address' : 'Use saved key');
         use.classList.add('grow');
-        use.title = `Push the ${p.name} key saved on this computer ` +
+        use.title = `Push the ${p.name} ${noun} saved on this computer ` +
           `to ${keyDev().name || keyDev().host}`;
-        use.onclick = () => saveProviderKey(p.key, saved);
+        use.onclick = () => saveProviderKeys(p, { [p.key]: saved,
+          ...(p.optKey && vault[p.optKey] ? { [p.optKey]: vault[p.optKey] }
+                                        : {}) });
         c.actions.append(use);
       }
-      const add = provBtn(saved ? 'Paste a key…' : `Add ${p.name} key`);
+      const add = provBtn(saved ? (p.url ? 'Another address…' : 'Paste a key…')
+                              : `Add ${p.name} ${noun}`);
       add.classList.add(saved ? 'ghost' : 'grow');
       add.onclick = () => { editingKey = p.key; renderProviderKeys(); };
       c.actions.append(add);
+    }
+    // Server cards carry a live "does it work" line once a server is set —
+    // probed from the device when possible.
+    if (p.url) {
+      if (set && !editing) refreshServerStatus(p, c);
+      else if (!editing) c.status.hidden = true;
     }
   }
 }
@@ -2448,11 +2807,13 @@ for (const p of PROVIDERS) {
     `<div class="prov-id"><div class="prov-name">${p.name}</div>` +
     `<div class="prov-models">${p.models}</div></div>` +
     `<span class="prov-state"></span></div>` +
-    `<div class="prov-actions"></div>`;
+    `<div class="prov-actions"></div>` +
+    `<div class="prov-status" hidden></div>`;
   providerGrid.appendChild(card);
   providerCards[p.key] = {
     state: card.querySelector('.prov-state'),
     actions: card.querySelector('.prov-actions'),
+    status: card.querySelector('.prov-status'),
   };
 }
 

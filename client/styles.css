@@ -332,6 +332,50 @@ button.danger:hover { background: var(--bad-bg); }
   border-top: 1px solid var(--line);
 }
 
+/* context meter — a sibling pill reusing .cost/.cost-pop */
+.ctx-wrap { position: relative; }
+.ctx-wrap:hover .ctx-pop,
+.ctx-wrap:focus-within .ctx-pop {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+.ctx-pop { width: 236px; }
+.ctx-bar {
+  position: relative;
+  display: flex;
+  height: 8px;
+  margin: 8px 0 10px;
+  background: var(--surface-3);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.ctx-bar .seg { display: block; height: 100%; min-width: 0; }
+.seg.sys, .dot.sys { background: var(--line-strong); }
+.seg.shot, .dot.shot { background: var(--mint-ink); }
+.seg.tool, .dot.tool { background: var(--clay); }
+.seg.chat, .dot.chat { background: var(--mint); }
+.ctx-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--bad);
+  opacity: 0.7;
+}
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+/* the pill warms as the window fills */
+.cost.ctx-warm, .cost.ctx-warm .ph { color: var(--clay-ink); }
+.cost.ctx-hot, .cost.ctx-hot .ph { color: var(--bad); }
+
 /* ── layout ──────────────────────────────────────────────── */
 main {
   flex: 1;
@@ -1620,6 +1664,7 @@ body.about-open #desktopPane { display: none; }
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
 }
 .prov-actions .grow { flex: 1; }
 .prov-key-input {
@@ -1628,6 +1673,17 @@ body.about-open #desktopPane { display: none; }
   font-family: var(--mono);
   font-size: 12px;
 }
+/* a second field under the address — the compat card's optional API key */
+.prov-key-input.wide { flex: 1 1 100%; }
+/* live "does this server work" line — server provider cards */
+.prov-status {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+.prov-status.ok { color: var(--mint-ink); }
+.prov-status.warn { color: var(--clay-ink); }
+.prov-status.err { color: var(--bad); }
 
 /* the app's own key store — saved locally, pushed to devices on demand */
 .keystore {
@@ -1975,5 +2031,6 @@ button.try:hover {
     resize: none;
   }
   .cost { display: none; }
+  .ctx-wrap { display: none; }
   .dev-cols { grid-template-columns: 1fr; }
 }
