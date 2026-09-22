@@ -69,6 +69,7 @@ CONFIG_GLOBALS = {
     "AGENT_COMPACT_KEEP": "COMPACT_KEEP",
     "AGENT_COMPACT_INPUT_CHARS": "COMPACT_INPUT_MAX_CHARS",
     "AGENT_CYCLE_WINDOW": "CYCLE_WINDOW",
+    "AGENT_RESEARCH_NUDGE": "RESEARCH_NUDGE_STREAK",
     "AGENT_WRAP_UP_STEPS": "WRAP_UP_STEPS",
     "AGENT_VERIFY_MAX_REJECTS": "VERIFY_MAX_REJECTS",
     "AGENT_VERIFY_MIN_CALLS": "VERIFY_MIN_CALLS",
@@ -221,6 +222,10 @@ COMPACT_KEEP = int(os.environ.get("AGENT_COMPACT_KEEP", "6"))
 TODO_REMIND_STEPS = int(os.environ.get("TODO_REMIND_STEPS", "20"))
 TODO_NUDGE_STEPS = int(os.environ.get("TODO_NUDGE_STEPS", "10"))
 TODO_MAX_ITEMS = int(os.environ.get("TODO_MAX_ITEMS", "30"))
+# Consecutive turns of exactly one research call (web_search/fetch_url)
+# before the "parallelize or delegate" nudge rides the next tool result —
+# serial research is how a five-minute job turns into 50 billed turns.
+RESEARCH_NUDGE_STREAK = int(os.environ.get("AGENT_RESEARCH_NUDGE", "5"))
 SCREENSHOT_MAX_EDGE = int(os.environ.get("SCREENSHOT_MAX_EDGE", "1568"))
 SCREENSHOT_MAX_PIXELS = int(os.environ.get("SCREENSHOT_MAX_PIXELS", "1000000"))
 SCREENSHOT_HISTORY = int(os.environ.get("SCREENSHOT_HISTORY", "3"))
@@ -469,9 +474,14 @@ Planning — match the effort to the task:
   and `steps` (your checklist).
   Pass the full `steps` list every call, keep exactly one item
   in_progress, mark steps done as you go — task_complete bounces a
-  stale list back, so it ends the run truthful. When in doubt, post the plan
-  and checklist — they cost little and the user watches both live. If
-  the scope changes, call plan again with a new summary and list.
+  stale list back, so it ends the run truthful. Keep steps small — one
+  verifiable outcome each; a step that takes 15 tool calls was really
+  several steps, so split it when you notice. And update the list the
+  moment you start work that belongs to a different step — a stale
+  checklist triggers forced reposts that spend real turns. When in
+  doubt, post the plan and checklist — they cost little and the user
+  watches both live. If the scope changes, call plan again with a new
+  summary and list.
 - On very long runs your older context gets compacted into a handoff
   summary — the checklist always survives it. Anything else worth keeping
   (paths, URLs, decisions, findings) belongs in the todo text or in files
@@ -496,8 +506,10 @@ Guidelines:
 - A fresh screenshot is attached automatically after each turn's actions; only
   call screenshot when nothing changed or you need an extra look.
 - Batch predictable sequences into one response — emit several tool calls at
-  once (e.g. click field → type → press enter). Split only when the next step
-  depends on what the screen shows after the previous one.
+  once (e.g. click field → type → press enter). Independent web_search and
+  fetch_url calls in one reply run in parallel, and web_search's `queries`
+  list runs several lookups in a single call — N lookups is one call, not
+  N turns. Split only when the next step depends on a result.
 - Prefer desktop_* refs, office_eval, keyboard shortcuts and run_command
   over pixel hunting — raw coordinates are the fallback, not the default.
 - In file chooser dialogs press ctrl+l to open the location bar, type the
@@ -543,9 +555,11 @@ Delegating — spawn_agent runs a helper agent in the background:
   research targets, sources to cross-check, or file/data jobs that need no
   screen, spawn one helper per target and keep the desktop work yourself —
   "research these 5 companies" means five helpers, not five of your own
-  steps. Doing everything serially yourself is the slow path: if a subtask
-  can run headless while you act, it should be a helper. At most {subcap}
-  helpers run at once.
+  steps. A list of lookups (prices for N items, facts about N targets) is
+  the canonical case: one helper per group, or one web_search `queries`
+  batch — never a turn per item. Doing everything serially yourself is the
+  slow path: if a subtask can run headless while you act, it should be a
+  helper. At most {subcap} helpers run at once.
 """
 
 SUBAGENT_PROMPT = """You are '{name}', a background helper spawned by Gut on a Linux desktop.
@@ -642,6 +656,9 @@ class AgentState:
         self.todos: list[dict] = []
         self.plan_shared = False
         self.steps_since_todo = 0
+        # Consecutive turns that were exactly one research call — batched
+        # turns and any other tool reset it. Trips RESEARCH_NUDGE_STREAK.
+        self.solo_research = 0
         # Completion gate: task_complete bounces once while checklist items
         # are unfinished (todo_nudge_done); the reconcile flag pins the
         # bounced call's successor to plan so the list gets a real final
@@ -2183,11 +2200,23 @@ def _openserp_engines(lang: str) -> str:
     return ",".join(engines)
 
 
+def _clean_query(query: str) -> tuple[str, bool]:
+    """Strip control characters from a search query, repairing the mojibake
+    some models emit for non-ASCII — a NUL byte followed by two hex digits
+    stands in for the high-byte char (\\x00f8 = ø). Returns (cleaned,
+    mangled) so the caller can warn the model its query arrived broken."""
+    fixed = re.sub(r"\x00([0-9a-fA-F]{2})",
+                   lambda m: chr(int(m.group(1), 16)), query)
+    fixed = "".join(c for c in fixed if ord(c) >= 32).strip()
+    return fixed, fixed != query.strip()
+
+
 async def web_search(query: str, max_results: int = 8,
                      lang: str = "", region: str = "") -> str:
-    query = query.strip()
+    query, mangled = _clean_query(query)
     if not query:
-        return "empty query"
+        return ("empty or garbled query — if you sent non-ASCII it arrived "
+                "as control characters; resend with plain UTF-8")
     n = max(1, min(int(max_results or 8), 15))
     lang = (lang or SEARCH_LANG).strip().upper()
     region = (region or SEARCH_REGION).strip().upper()
@@ -2220,14 +2249,29 @@ async def web_search(query: str, max_results: int = 8,
             results, backend = await _ddg_search(query, lang, region), \
                 "duckduckgo"
         except Exception as e:
-            return (f"search failed ({e}) — use the browser tools instead")
+            out = f"search failed ({e}) — use the browser tools instead"
+            return _mangled_note(out, mangled)
     if not results:
-        return ("no results — try rephrasing, a different lang/region, or "
-                "the browser tools")
-    lines = [f"{i}. {r['title']}\n   {r['url']}"
-             + (f"\n   {r['snippet']}" if r["snippet"] else "")
-             for i, r in enumerate(results[:n], 1)]
-    return f"results for '{query}' via {backend}:\n" + "\n".join(lines)
+        out = ("no results — try rephrasing, a different lang/region, or "
+               "the browser tools")
+    else:
+        lines = [f"{i}. {r['title']}\n   {r['url']}"
+                 + (f"\n   {r['snippet']}" if r["snippet"] else "")
+                 for i, r in enumerate(results[:n], 1)]
+        out = f"results for '{query}' via {backend}:\n" + "\n".join(lines)
+    return _mangled_note(out, mangled)
+
+
+def _mangled_note(out: str, mangled: bool) -> str:
+    """When a query arrived with control characters, the search ran on the
+    cleaned text — tell the model so it resends proper UTF-8 (æ/ø/å) instead
+    of retrying blind when the results look wrong."""
+    if not mangled:
+        return out
+    return out + ("\n\n[note: your query contained control characters — "
+                  "mangled unicode, likely æ/ø/å. Emit the characters "
+                  "directly in the query; it was cleaned before searching, "
+                  "so resend it correctly if these results look off.]")
 
 
 async def _openserp_extract(url: str, cap: int) -> str | None:
@@ -2364,9 +2408,16 @@ TOOLS = [
         "description": "Search the web — returns numbered results with title, "
                        "URL and snippet. Fast and text-only (no browser, no "
                        "screenshots): always prefer this for finding pages or "
-                       "answers online.",
+                       "answers online. `queries` runs several searches in "
+                       "parallel in a single call — always batch independent "
+                       "lookups this way instead of one call per turn.",
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string"},
+            "query": {"type": "string",
+                      "description": "one search query (or use `queries`)"},
+            "queries": {"type": "array", "items": {"type": "string"},
+                        "description": "up to 8 queries run in parallel in "
+                                       "one call — preferred for independent "
+                                       "lookups"},
             "max_results": {"type": "integer",
                             "description": "results to return, default 8"},
             "lang": {"type": "string",
@@ -2377,8 +2428,7 @@ TOOLS = [
                        "description": "ISO country code for local results, "
                                       "e.g. DK, US — set it when the query is "
                                       "location-specific (defaults to "
-                                      "SEARCH_REGION)"}},
-            "required": ["query"]}}},
+                                      "SEARCH_REGION)"}}}}},
     {"type": "function", "function": {
         "name": "fetch_url",
         "description": "Fetch a URL over HTTP and return the page's text plus "
@@ -3018,10 +3068,23 @@ async def execute_tool(name: str, args: dict,
                 run_command, str(args.get("command", "")),
                 agent is not None, agent or "")
         elif name == "web_search":
-            result = await web_search(str(args.get("query", "")),
-                                      int(args.get("max_results") or 8),
-                                      str(args.get("lang") or ""),
-                                      str(args.get("region") or ""))
+            queries = [str(q) for q in args.get("queries") or []]
+            if str(args.get("query") or "").strip():
+                queries.insert(0, str(args["query"]))
+            queries = list(dict.fromkeys(queries))
+            if not queries:
+                result = "empty query — pass `query` or `queries`"
+            else:
+                over = len(queries) - 8
+                parts = await asyncio.gather(*(
+                    web_search(q, int(args.get("max_results") or 8),
+                               str(args.get("lang") or ""),
+                               str(args.get("region") or ""))
+                    for q in queries[:8]))
+                result = "\n\n".join(parts)
+                if over > 0:
+                    result += (f"\n\n[{over} quer{'ies' if over > 1 else 'y'}"
+                               " dropped — the cap is 8 per call]")
         elif name == "fetch_url":
             result = await fetch_url(str(args.get("url", "")),
                                      int(args.get("max_chars") or 6000))
@@ -3372,6 +3435,25 @@ STUCK_ASK_USER = ("I've brainstormed and tried several different approaches "
 OBSERVE_TOOLS = {"screenshot", "browser_dom", "browser_text", "desktop_tree",
                  "list_windows", "collect_agent"}
 
+# Pure network reads — no screen, no shared state, no ordering between
+# calls. A turn whose calls are all in this set runs them concurrently:
+# a batch of lookups used to cost a full model roundtrip each.
+PARALLEL_TOOLS = {"web_search", "fetch_url"}
+
+_BLOCKED_MSG = ("BLOCKED: this exact call was already repeated with no "
+                "progress and is disabled for the rest of this run — use a "
+                "different tool or different arguments.")
+
+# Appended to the result when the run has spent RESEARCH_NUDGE_STREAK
+# consecutive turns on one-at-a-time research calls.
+RESEARCH_NUDGE_MSG = (
+    "{n} research calls in a row, one per turn — the slow path. "
+    "Parallelize: web_search's `queries` list runs several lookups in one "
+    "call; several independent web_search/fetch_url calls in one reply run "
+    "concurrently; spawn_agent puts a helper on each target while you keep "
+    "working. And if you already have enough for a defensible answer, stop "
+    "researching — flag what's unverified and deliver.")
+
 
 class StallDetector:
     """Loop detection for one run, on tool signatures (name + sorted args).
@@ -3537,7 +3619,12 @@ async def llm_request(http: httpx.AsyncClient, messages: list,
         except httpx.HTTPStatusError as e:
             last_exc = e
             code = e.response.status_code
-            if code not in (408, 409, 429) and code < 500:
+            # 402 earns the backoff too: OpenRouter raises it while
+            # in-flight requests' spend crosses the balance — it settles
+            # once they finish, so an instant raise kills a run a short
+            # wait would have saved. A real empty balance still fails,
+            # just after the retries.
+            if code not in (402, 408, 409, 429) and code < 500:
                 raise
         except httpx.TransportError as e:
             last_exc = e
@@ -3977,19 +4064,37 @@ async def subagent_loop(name: str, task_text: str, model: str,
                     result = reply or result
                     break
                 finished = False
+                parsed: list[tuple[dict, str, dict]] = []
                 for tc in tool_calls:
-                    if state.stop:
-                        break
                     fn = tc.get("function") or {}
-                    tname = fn.get("name", "")
                     try:
                         targs = json.loads(fn.get("arguments") or "{}")
                     except json.JSONDecodeError:
                         targs = {}
-                    await broadcast_conv({"type": "action", "tool": tname,
-                                          "args": targs, "agent": name},
-                                         conv_id)
-                    res, fin = await execute_tool(tname, targs, agent=name)
+                    parsed.append((tc, fn.get("name", ""), targs))
+                # Same rule as the main loop: a turn of nothing-but
+                # PARALLEL_TOOLS calls runs concurrently.
+                pres: list | None = None
+                if len(parsed) > 1 and all(n in PARALLEL_TOOLS
+                                           for _, n, _ in parsed):
+                    for _, tname, targs in parsed:
+                        await broadcast_conv({"type": "action", "tool": tname,
+                                              "args": targs, "agent": name},
+                                             conv_id)
+                    pres = await asyncio.gather(*(
+                        execute_tool(n, a, agent=name)
+                        for _, n, a in parsed))
+                for i, (tc, tname, targs) in enumerate(parsed):
+                    if state.stop:
+                        break
+                    if pres is None:
+                        await broadcast_conv({"type": "action", "tool": tname,
+                                              "args": targs, "agent": name},
+                                             conv_id)
+                        res, fin = await execute_tool(tname, targs,
+                                                      agent=name)
+                    else:
+                        res, fin = pres[i]
                     messages.append({"role": "tool",
                                      "tool_call_id": tc.get("id"),
                                      "content": res})
@@ -4625,6 +4730,7 @@ async def agent_loop(conv_id: str, task_text: str,
         state.steps_since_todo = 0
         state.steps_since_compact = 99
         state.url_fail_streak = 0
+        state.solo_research = 0
         state.dom_seen = False
         state.tree_seen = False
         state.tools_shown = set()
@@ -4799,37 +4905,69 @@ async def agent_loop(conv_id: str, task_text: str,
                 idle_replies = 0
 
                 acted_on_screen = False
+                parsed: list[tuple[dict, str, dict]] = []
                 for tc in tool_calls:
-                    # Honor takeover/stop between calls, not just between turns.
-                    while state.paused and not state.stop:
-                        await asyncio.sleep(0.4)
-                    if state.stop:
-                        break
                     fn = tc.get("function") or {}
-                    name = fn.get("name", "")
                     try:
                         args = json.loads(fn.get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
                     # A resumed context or a model echoing pre-consolidation
                     # names still works — left_click → click, etc.
-                    name, args = legacy_call(name, args)
+                    name, args = legacy_call(fn.get("name", ""), args)
+                    parsed.append((tc, name, args))
+
+                # A turn of nothing-but PARALLEL_TOOLS calls has no ordering
+                # and touches no shared state — run the calls concurrently
+                # instead of paying a serial await for each.
+                pres: list | None = None
+                if len(parsed) > 1 and all(n in PARALLEL_TOOLS
+                                           for _, n, _ in parsed):
+                    for _, name, args in parsed:
+                        await broadcast({"type": "action", "tool": name,
+                                         "args": args})
+
+                    async def _par(n, a):
+                        sig = stall.signature(n, a)
+                        if sig and sig in stall.blocked:
+                            return _BLOCKED_MSG, False
+                        return await execute_tool(n, a)
+                    pres = await asyncio.gather(
+                        *(_par(n, a) for _, n, a in parsed))
+
+                # Exactly-one-research-call turns, over and over, is the
+                # pattern the nudge exists to break; a batched turn (or a
+                # `queries` list) and any non-research call reset it.
+                solo_research = (
+                    len(parsed) == 1 and parsed[0][1] in PARALLEL_TOOLS
+                    and isinstance(parsed[0][2], dict)
+                    and not (isinstance(parsed[0][2].get("queries"), list)
+                             and len(parsed[0][2]["queries"]) > 1))
+                state.solo_research = \
+                    state.solo_research + 1 if solo_research else 0
+
+                for i, (tc, name, args) in enumerate(parsed):
+                    # Honor takeover/stop between calls, not just between turns.
+                    while state.paused and not state.stop:
+                        await asyncio.sleep(0.4)
+                    if state.stop:
+                        break
                     # Back-to-back screen actions in one batch were planned
                     # against the same frame — let the last one's effect
                     # render before the next click lands.
                     if acted_on_screen and name in SCREEN_TOOLS:
                         await asyncio.sleep(INTER_ACTION_DELAY)
-                    await broadcast({"type": "action", "tool": name, "args": args})
-                    # A call that already earned a STUCK note is a proven
-                    # dead-end — refuse to run it again so the model is
-                    # forced to change approach instead of ignoring the note.
+                    if pres is None:
+                        await broadcast({"type": "action", "tool": name,
+                                         "args": args})
                     sig = stall.signature(name, args)
-                    if sig and sig in stall.blocked:
-                        result, finished = (
-                            "BLOCKED: this exact call was already repeated "
-                            "with no progress and is disabled for the rest "
-                            "of this run — use a different tool or different "
-                            "arguments."), False
+                    if pres is not None:
+                        result, finished = pres[i]
+                    elif sig and sig in stall.blocked:
+                        # A call that already earned a STUCK note is a proven
+                        # dead-end — refuse to run it again so the model is
+                        # forced to change approach instead of ignoring the note.
+                        result, finished = _BLOCKED_MSG, False
                     else:
                         result, finished = await execute_tool(name, args)
                         acted_on_screen = acted_on_screen \
@@ -4849,6 +4987,15 @@ async def agent_loop(conv_id: str, task_text: str,
                                 "kept repeating dead-end actions")
                             if note:
                                 result = _note(result, note)
+
+                    # A turn that was a single research call extends the
+                    # serial-research streak — nudge it toward batching or
+                    # delegation once it's clearly a pattern.
+                    if solo_research \
+                            and state.solo_research >= RESEARCH_NUDGE_STREAK:
+                        result = _note(result, RESEARCH_NUDGE_MSG.format(
+                            n=state.solo_research))
+                        state.solo_research = 0
 
                     messages.append({
                         "role": "tool",
