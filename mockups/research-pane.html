@@ -1,0 +1,1051 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gut — research pane mockups</title>
+<link rel="stylesheet" href="../client/styles.css">
+<style>
+  /* ── mock scaffolding (not part of the proposals) ─────────── */
+  body { padding: 30px 34px 70px; }
+  h1 { margin: 0 0 4px; font-size: 26px; font-weight: 300; letter-spacing: -0.015em; }
+  .lede { margin: 0 0 6px; color: var(--text-2); max-width: 88ch; }
+  .keys {
+    margin: 0 0 34px; color: var(--text-3); font-size: 12px;
+    display: flex; align-items: center; gap: 18px;
+  }
+  .keys b {
+    font-family: var(--mono); font-size: 11px; font-weight: 500;
+    color: var(--text-2); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px;
+  }
+  .keys button {
+    font: inherit; color: var(--text-2); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 3px 12px; cursor: pointer;
+  }
+  .keys button:hover { background: var(--surface-2); color: var(--text); }
+  .mock-grid { display: flex; flex-wrap: wrap; gap: 44px 40px; align-items: flex-start; }
+  .mock { flex: none; }
+  .mock > h2 { margin: 0 0 3px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .mock > h2 .tag {
+    margin-left: 7px; padding: 1px 8px; vertical-align: 2px;
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--mint-ink); background: var(--mint-soft);
+    border: 1px solid var(--mint-line); border-radius: 99px;
+  }
+  .mock > h2 .tag.dim { color: var(--text-3); background: var(--surface-2); border-color: var(--line); }
+  .mock > .notes { margin: 0 0 14px; color: var(--text-3); font-size: 12.5px; line-height: 1.5; max-width: 640px; }
+
+  /* the right pane at its real proportions — landscape, framed card */
+  .rpane {
+    width: 640px; height: 560px;
+    display: flex; flex-direction: column;
+    background: var(--surface-3);
+    border: 1px solid var(--mint);
+    border-radius: var(--radius-card);
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* fake desktop stream — the reference pane and the swap-away beat */
+  .mdesk {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(120% 90% at 50% 0%, var(--surface-2), var(--surface-3));
+  }
+  .mwin {
+    width: 74%; height: 64%;
+    background: var(--surface); border-radius: 6px;
+    box-shadow: 0 0 0 1px var(--line), 0 14px 34px rgba(30, 29, 26, .10);
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .mbar {
+    flex: none; height: 26px; display: flex; align-items: center; gap: 5px;
+    padding: 0 10px; background: var(--surface-2); border-bottom: 1px solid var(--line);
+  }
+  .mbar i { width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); }
+  .mbar .murl {
+    flex: 1; margin-left: 8px; height: 14px; border-radius: 7px;
+    background: var(--surface); border: 1px solid var(--line);
+    font-family: var(--mono); font-size: 9px; color: var(--text-3);
+    display: flex; align-items: center; padding: 0 8px;
+    white-space: nowrap; overflow: hidden;
+  }
+  .mbody { flex: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 9px; }
+  .mbody .ml { height: 8px; border-radius: 4px; background: var(--surface-3); }
+  .mbody .ml.hero { height: 64px; border-radius: 6px; background: var(--surface-2); margin-bottom: 4px; }
+  .midle {
+    position: absolute; bottom: 12px; right: 12px;
+    color: var(--text-2); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 5px 10px;
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+  }
+  /* the swap beat — desktop fades in over the research board */
+  .rpane .mdesk.swap { opacity: 0; pointer-events: none; transition: opacity .45s ease; z-index: 6; }
+  .rpane .mdesk.swap.on { opacity: 1; }
+  .midle.swap-note { z-index: 7; }
+
+  /* ══ shared anatomy — every proposal keeps this ═════════════
+     .rhead: eyebrow + live counters + equalizer pulse
+     .rboard: the variant's canvas
+     .rshelf: accumulating source chips + the idle-desktop thumb */
+  .rhead {
+    flex: none; display: flex; align-items: center; gap: 14px;
+    height: 44px; padding: 0 14px;
+    background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  .rlab {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--mint-ink);
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .rlab svg { width: 13px; height: 13px; }
+  /* five-bar equalizer: jolts on each event, decays to a heartbeat */
+  .eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; }
+  .eq i { width: 3px; border-radius: 1.5px; background: var(--mint); height: 3px;
+          transition: height .18s ease; }
+  .rstats { display: flex; gap: 14px; margin-left: auto; }
+  .rstat { text-align: right; line-height: 1.15; }
+  .rstat b { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .rstat span {
+    display: block; font-family: var(--mono); font-size: 8.5px;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--text-3);
+  }
+  .rstat.tick b { animation: cost-tick .7s ease-out; }
+
+  .rboard { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+
+  .rshelf {
+    flex: none; display: flex; align-items: center; gap: 10px;
+    min-height: 46px; padding: 8px 14px;
+    background: var(--surface); border-top: 1px solid var(--line);
+  }
+  .rshelf .slab {
+    flex: none; font-family: var(--mono); font-size: 9.5px; font-weight: 500;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--text-3);
+  }
+  .srcs { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; max-height: 46px; overflow: hidden; }
+  .src {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--text-2);
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 99px; padding: 2px 9px 2px 3px;
+    animation: src-in .3s cubic-bezier(.2,.8,.3,1) both;
+  }
+  .src i {
+    width: 16px; height: 16px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-style: normal; font-family: var(--mono); font-size: 9px; font-weight: 600;
+  }
+  @keyframes src-in {
+    from { opacity: 0; transform: translateY(6px) scale(.8); }
+  }
+  /* the takeover affordance survives the swap — a live mini desktop */
+  .vthumb {
+    margin-left: auto; flex: none; display: flex; align-items: center; gap: 8px;
+    color: var(--text-3); font-family: var(--mono); font-size: 9.5px;
+    letter-spacing: .06em; text-transform: uppercase;
+    cursor: pointer;
+  }
+  .vthumb:hover { color: var(--text-2); }
+  .vthumb .tf {
+    width: 46px; height: 30px; border-radius: 4px;
+    background: var(--surface-2); border: 1px solid var(--line-strong);
+    position: relative; overflow: hidden;
+  }
+  .vthumb .tf::before { /* mini browser bar */
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 7px;
+    background: var(--surface-3); border-bottom: 1px solid var(--line);
+  }
+  .vthumb .tf i {
+    position: absolute; left: 5px; top: 10px; right: 5px; height: 4px;
+    border-radius: 2px; background: var(--surface-3);
+    box-shadow: 0 7px 0 var(--surface-3);
+  }
+  .vthumb.busy .tf { border-color: var(--mint-line); }
+
+  /* agent accents — new tokens; mint stays the main agent, helpers get
+     muted hues that sit inside the paper palette */
+  [data-hue="main"]   { --ac: var(--mint-ink); --ac-mid: var(--mint); --ac-soft: var(--mint-soft); }
+  [data-hue="blue"]   { --ac: #3f5f9e; --ac-mid: #7d9bd8; --ac-soft: #e4eaf7; }
+  [data-hue="violet"] { --ac: #7a5da8; --ac-mid: #ab8fd4; --ac-soft: #eee7f8; }
+  [data-hue="rose"]   { --ac: #a85176; --ac-mid: #d187ab; --ac-soft: #f7e5ee; }
+
+  /* ══ A — command deck ═══════════════════════════════════════
+     One lane per worker; query cards spawn, spin, resolve. */
+  .lanes { height: 100%; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .lane {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius-card); overflow: hidden;
+    animation: lane-in .35s cubic-bezier(.2,.8,.3,1) both;
+  }
+  @keyframes lane-in {
+    from { opacity: 0; transform: translateY(10px) scale(.98); }
+  }
+  .lane.gone { opacity: .55; }
+  .lane-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 11px; border-bottom: 1px solid var(--line);
+  }
+  .adot { width: 8px; height: 8px; border-radius: 50%; background: var(--ac); flex: none; }
+  .aname { font-weight: 600; font-size: 12.5px; }
+  .athought {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-style: italic; color: var(--text-3); font-size: 12px;
+  }
+  .athought.live {
+    background: linear-gradient(100deg, var(--text-3) 38%, var(--ac-mid) 50%, var(--text-3) 62%);
+    background-size: 240% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: status-shimmer 2.8s linear infinite;
+  }
+  .acount {
+    margin-left: auto; flex: none; font-family: var(--mono); font-size: 10px;
+    color: var(--text-3); letter-spacing: .04em;
+  }
+  .lane-done .acount { color: var(--ac); }
+  .lane-body { display: flex; flex-direction: column; }
+  .qc {
+    display: flex; align-items: center; gap: 9px;
+    padding: 7px 11px; border-top: 1px solid transparent;
+    animation: qc-in .3s ease both;
+  }
+  .qc + .qc { border-top-color: var(--line); }
+  @keyframes qc-in { from { opacity: 0; transform: translateX(-8px); } }
+  .qc .qi { flex: none; display: inline-flex; color: var(--ac); }
+  .qc .qi svg { width: 13px; height: 13px; }
+  .qt {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12.5px;
+  }
+  .qc.pend .qt {
+    background: linear-gradient(100deg, var(--text-2) 38%, var(--ac-mid) 50%, var(--text-2) 62%);
+    background-size: 240% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: status-shimmer 2.4s linear infinite;
+  }
+  .qst {
+    margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+  }
+  /* two brand dots gliding — same wait state as the typing row */
+  .qdots { position: relative; width: 11px; height: 7px; }
+  .qdots::before, .qdots::after {
+    content: ""; position: absolute; top: 0; width: 7px; height: 7px; border-radius: 50%;
+    animation: dot-slide 2.4s ease-in-out infinite;
+  }
+  .qdots::before { left: 0; background: var(--ac-mid); }
+  .qdots::after { left: 4px; background: var(--ac-soft); animation-name: dot-slide-back; }
+  .be {
+    font-size: 9px; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--ac); background: var(--ac-soft); border-radius: 3px; padding: 1px 5px;
+  }
+  .qc.done .qst { color: var(--text-2); }
+
+  /* ══ B — constellation ══════════════════════════════════════
+     Agents are satellites feeding a growing core of sources. */
+  .sky { position: absolute; inset: 0; }
+  .core {
+    position: absolute; left: 50%; top: 60%; transform: translate(-50%, -50%);
+    width: 130px; height: 130px; border-radius: 50%;
+    background: radial-gradient(circle, var(--mint-soft) 0%, rgba(220,245,236,0) 68%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    transition: transform .4s cubic-bezier(.2,.8,.3,1.3);
+  }
+  .core.bump { transform: translate(-50%, -50%) scale(1.09); }
+  .core b { font-size: 22px; font-weight: 600; color: var(--mint-ink); font-variant-numeric: tabular-nums; }
+  .core span {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--text-3);
+  }
+  .sat {
+    position: absolute; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    transition: opacity .5s ease;
+    z-index: 3;
+  }
+  .sat .sd {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--ac-mid); box-shadow: 0 0 0 4px var(--ac-soft);
+  }
+  .sat.live .sd { animation: sat-pulse 1.8s ease-out infinite; }
+  @keyframes sat-pulse {
+    0% { box-shadow: 0 0 0 4px var(--ac-soft); }
+    60% { box-shadow: 0 0 0 10px rgba(0,0,0,0); }
+    100% { box-shadow: 0 0 0 4px var(--ac-soft); }
+  }
+  .sat .sn {
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    letter-spacing: .05em; color: var(--ac);
+  }
+  .sat.gone { opacity: .3; }
+  .sat .slist {
+    display: flex; flex-direction: column; gap: 4px; align-items: center;
+    margin-top: 5px;
+  }
+  .sat .sq {
+    white-space: nowrap; font-size: 11px; font-style: italic; color: var(--text-3);
+    background: var(--surface); border: 1px solid var(--line); border-radius: 99px;
+    padding: 2px 9px; animation: qc-in .3s ease both;
+    transition: opacity .35s;
+  }
+  .fly {
+    position: absolute; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--ac-mid); z-index: 4;
+    transition: transform .85s cubic-bezier(.35,.6,.3,1), opacity .3s .7s;
+    transform: translate(-50%, -50%);
+  }
+  .mote {
+    position: absolute; width: 5px; height: 5px; border-radius: 50%;
+    background: var(--ac-mid); opacity: .85; z-index: 2;
+    transform: translate(-50%, -50%);
+    animation: mote-settle .5s ease both;
+  }
+  @keyframes mote-settle { from { transform: translate(-50%,-50%) scale(2.2); opacity: 0; } }
+
+  /* ══ C — waterfall ══════════════════════════════════════════
+     A column per worker; every call is a cell streaming top-down. */
+  .wcols { height: 100%; display: flex; gap: 1px; background: var(--line); }
+  .wcol {
+    flex: 1; min-width: 0; background: var(--surface-3);
+    display: flex; flex-direction: column;
+  }
+  .wcol-h {
+    flex: none; display: flex; align-items: center; gap: 7px;
+    padding: 8px 11px; background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  .wcol-h .aname { font-size: 12px; }
+  .wcol-h .acount { font-size: 9.5px; }
+  .wcol.done .wcol-h { opacity: .5; }
+  .wcells { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .wc {
+    background: var(--surface); border: 1px solid var(--line);
+    border-left: 2px solid var(--ac-mid); border-radius: 4px;
+    padding: 6px 8px; animation: qc-in .3s ease both;
+  }
+  .wc .wq {
+    font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    display: block;
+  }
+  .wc.pend .wq {
+    background: linear-gradient(100deg, var(--text-2) 38%, var(--ac-mid) 50%, var(--text-2) 62%);
+    background-size: 240% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: status-shimmer 2.4s linear infinite;
+  }
+  .wc .wmeta {
+    display: flex; align-items: center; gap: 6px; margin-top: 3px;
+    font-family: var(--mono); font-size: 9.5px; color: var(--text-3);
+  }
+  .wc.done .wmeta { color: var(--ac); }
+  .wsum {
+    margin-top: auto; padding: 8px 11px; font-family: var(--mono);
+    font-size: 9.5px; color: var(--text-3); letter-spacing: .04em;
+    border-top: 1px dashed var(--line-strong);
+  }
+
+  /* ══ shelf-free variants: the idle-desktop thumb floats over the
+     board instead of sitting in the shelf ═══════════════════ */
+  .vthumb.float {
+    position: absolute; right: 12px; bottom: 12px; z-index: 5;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 4px 9px 4px 5px;
+    box-shadow: 0 4px 14px rgba(30, 29, 26, .10);
+  }
+
+  /* ══ D — harvest rows: sources as an overlapping favicon stack
+     inside the resolved card ════════════════════════════════ */
+  .qc { flex-wrap: wrap; }
+  .sstack {
+    flex: 1 1 100%; display: flex; align-items: center;
+    padding: 0 0 5px 22px;
+  }
+  .sdot {
+    width: 18px; height: 18px; border-radius: 50%; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 9px; font-weight: 600;
+    border: 1.5px solid var(--surface); margin-left: -5px;
+    animation: src-in .3s cubic-bezier(.2,.8,.3,1.4) both;
+  }
+  .sdot:first-child { margin-left: 0; }
+  .smore {
+    font-family: var(--mono); font-size: 9.5px; color: var(--text-3);
+    margin-left: 8px;
+  }
+
+  /* ══ E — rain rail: sources drop into a right-edge strip ═══ */
+  .rboard.flex { display: flex; }
+  .lanes.has-rail { flex: 1; min-width: 0; }
+  .rrail {
+    flex: none; width: 96px;
+    border-left: 1px solid var(--line); background: var(--surface);
+    display: flex; flex-direction: column;
+  }
+  .rrail .rlab2 {
+    padding: 9px 10px 6px;
+    font-family: var(--mono); font-size: 9.5px; font-weight: 500;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--text-3);
+    border-bottom: 1px solid var(--line);
+  }
+  .rdots {
+    flex: 1; min-height: 0; overflow: hidden;
+    padding: 9px; display: flex; flex-wrap: wrap; gap: 5px;
+    align-content: flex-start;
+  }
+  .rdot {
+    width: 19px; height: 19px; border-radius: 50%; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 9px; font-weight: 600;
+    border: 1px solid var(--line);
+    animation: rain-in .45s cubic-bezier(.2,.9,.3,1.2) both;
+  }
+  @keyframes rain-in {
+    from { opacity: 0; transform: translateY(-18px) scale(.6); }
+  }
+
+  /* ══ F — pipeline: segmented track per lane, resolved calls
+     collapse to dense single lines ══════════════════════════ */
+  .lane .track {
+    display: flex; flex-wrap: wrap; gap: 3px;
+    padding: 0 11px; max-height: 0; overflow: hidden;
+    transition: max-height .25s ease, padding .25s ease;
+  }
+  .lane .track.live { max-height: 14px; padding: 0 11px 7px; }
+  .tseg {
+    width: 18px; height: 3px; border-radius: 2px;
+    background: var(--ac-soft);
+  }
+  .tseg.pend { animation: tseg-pulse 1.6s ease-in-out infinite; }
+  .tseg.fill { background: var(--ac-mid); }
+  @keyframes tseg-pulse { 50% { opacity: .4 } }
+  .qc { transition: padding .25s ease; }
+  .qc.min { padding: 3px 11px; }
+  .qc.min .qt { font-size: 11.5px; color: var(--text-3); }
+  .qc.min .qi { color: var(--text-3); }
+  .qc.min .qi svg { width: 11px; height: 11px; }
+  .qc.min .qst { font-size: 9.5px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .lane, .qc, .wc, .src, .sdot, .rdot, .sat .sq, .mote, .rpane .mdesk.swap { animation: none !important; transition: none !important; }
+    .athought.live, .qc.pend .qt, .wc.pend .wq { animation: none !important; background: none; color: var(--text-2); }
+    .qdots::before, .qdots::after, .sat.live .sd, .rstat.tick b, .tseg.pend { animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Research pane — mockups</h1>
+<p class="lede">What the right pane could show while the agent is doing API-side
+  research — <code>web_search</code> / <code>fetch_url</code> never touch the
+  desktop, so today the stream is dead air. Every proposal keeps the same
+  anatomy (live counters header · variant canvas · sources shelf + idle-desktop
+  thumb) and replays the <em>same</em> scripted run: the main agent fires two
+  parallel searches, then two helpers spin up and research alongside it. The
+  last beat is a screen action — the board fades back to the desktop, which is
+  how the auto-swap would feel live.</p>
+<p class="keys">
+  <button id="replay">↻ replay all</button>
+  <b>click a pane</b> replays just that one
+</p>
+
+<div class="mock-grid">
+
+  <!-- ── reference ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>Today — dead air <span class="tag dim">reference</span></h2>
+    <p class="notes">The current pane during a research stretch: the stream is
+      live, the status chip even knows a search is running — but the desktop
+      itself has nothing to show. That's the gap.</p>
+    <div class="rpane" data-kind="ref">
+      <div class="mdesk"></div>
+      <span class="midle" data-role="refstatus">agent working · desktop idle</span>
+    </div>
+  </section>
+
+  <!-- ── variant A ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>A — Command deck <span class="tag">proposal</span></h2>
+    <p class="notes">One lane per worker: the main agent on top, helpers slide
+      in with their own accent color and collapse to a summary line when
+      collected. Query cards shimmer while in-flight (same physics as the
+      status line) and resolve to a count + backend badge. Reads as
+      <em>parallel labor</em>, not a log. Kept with the pill-shelf below for
+      contrast — D–F move the sources elsewhere.</p>
+    <div class="rpane v-deck" data-kind="deck"></div>
+  </section>
+
+  <!-- ── variant D ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>D — Harvest rows <span class="tag">proposal</span></h2>
+    <p class="notes">Same deck, but the bottom shelf is gone: when a query
+      resolves, its sources land <em>inside the card</em> as an overlapping
+      favicon stack — the avatar-row pattern. Each result is owned by the
+      query that found it; the idle-desktop thumb floats over the board.</p>
+    <div class="rpane v-deck" data-kind="harvest"></div>
+  </section>
+
+  <!-- ── variant E ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>E — Rain rail <span class="tag">proposal</span></h2>
+    <p class="notes">The deck plus a narrow harvest rail on the right edge:
+      every new source rains in as a bare favicon dot and stacks loosely —
+      abstract, kinetic, zero text. The most ambient way to show yield.</p>
+    <div class="rpane v-deck" data-kind="rail"></div>
+  </section>
+
+  <!-- ── variant F ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>F — Pipeline <span class="tag">proposal</span></h2>
+    <p class="notes">Motion-first: each lane has a segmented track under its
+      header (one tick per call, filling as calls resolve), and done cards
+      collapse to compact single lines after a beat — live work stays big
+      and shimmering, finished work densifies behind it.</p>
+    <div class="rpane v-deck" data-kind="pipe"></div>
+  </section>
+
+  <!-- ── variant B ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>B — Constellation <span class="tag dim">ambient alt</span></h2>
+    <p class="notes">Ambient mode: workers are satellites, results fly from
+      satellite to core, and the core grows with every source gathered. Least
+      literal, most "something is alive in there." The query chips next to each
+      satellite keep it honest.</p>
+    <div class="rpane v-orb" data-kind="orb"></div>
+  </section>
+
+  <!-- ── variant C ────────────────────────────────────────── -->
+  <section class="mock">
+    <h2>C — Waterfall <span class="tag dim">ambient alt</span></h2>
+    <p class="notes">The ops-console take: a column per worker, cells stream
+      top-down, each resolving to a compact count + backend. Densest of the
+      three — scales to many parallel helpers without vertical sprawl, and the
+      most professional in feel.</p>
+    <div class="rpane v-water" data-kind="water"></div>
+  </section>
+
+</div>
+
+<p class="keys" style="margin-top:44px">Data note: every variant consumes the
+  same events — <code>action{tool,args,agent}</code>,
+  <code>search_result{query,backend,results[],agent}</code>,
+  <code>fetch_result{url,title,agent}</code>, plus the existing
+  <code>thought</code>/<code>subagent</code> lifecycle. Helper accent hues are
+  new tokens; everything else rides on existing CSS. All animation honors
+  <code>prefers-reduced-motion</code>.</p>
+
+<script>
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const svgIcon = (inner) =>
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  inner + '</svg>';
+const ICONS = {
+  search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/>',
+  page:   '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-2.7 2.6-4 5.7-4 9s1.3 6.4 4 9c2.7-2.6 4-5.7 4-9s-1.3-6.4-4-9z"/>',
+};
+
+/* agent accents — one entry per scripted worker */
+const AGENTS = {
+  main:   { name: 'main',    hue: 'main'   },
+  scout:  { name: 'scout',   hue: 'blue'   },
+  pricer: { name: 'pricer',  hue: 'violet' },
+};
+
+/* the scripted run every pane replays — parallel research, two helpers,
+   then a screen action that swaps the board back to the desktop */
+const SCRIPT = [
+  [0.1,  { t: 'thought', a: 'main',   x: 'scoping suppliers before the first calls…' }],
+  [0.4,  { t: 'search+', a: 'main',   id: 'q1', q: 'engros keramik leverandør århus' }],
+  [0.4,  { t: 'search+', a: 'main',   id: 'q2', q: 'b2b pottery wholesale denmark' }],
+  [1.1,  { t: 'spawn',   a: 'scout',  x: 'map venue & supplier shortlist' }],
+  [1.5,  { t: 'search+', a: 'scout',  id: 'q3', q: 'ceramic studio wholesale jylland' }],
+  [2.0,  { t: 'done',    a: 'main',   id: 'q1', be: 'tavily',
+           sites: ['keramikengros.dk', 'nordicclay.dk', 'pottemageren.dk',
+                   'tableware.dk', 'bolighandlen.dk', 'engrosguiden.dk'] }],
+  [2.4,  { t: 'search+', a: 'scout',  id: 'q4', q: 'restaurant dinnerware bulk dk' }],
+  [2.9,  { t: 'done',    a: 'main',   id: 'q2', be: 'openserp',
+           sites: ['ceramics-wholesale.eu', 'stelton.com', 'de-design.dk',
+                   'restaurantdepot.dk', 'nordicclay.dk'] }],
+  [3.3,  { t: 'fetch+',  a: 'main',   id: 'f1', q: 'reading keramikengros.dk' }],
+  [3.9,  { t: 'spawn',   a: 'pricer', x: 'pull price lists & MOQs' }],
+  [4.3,  { t: 'done',    a: 'scout',  id: 'q3', be: 'duckduckgo',
+           sites: ['aalborg-keramik.dk', 'clayworks.dk', 'krukkeriet.dk',
+                   'ceramicarts.dk', 'nordicclay.dk', 'engrosguiden.dk',
+                   'pottemageren.dk', 'dansk-keramik.dk', 'studio-line.dk'] }],
+  [4.7,  { t: 'done',    a: 'main',   id: 'f1', fetch: 'Keramik Engros — varekatalog' }],
+  [5.1,  { t: 'search+', a: 'pricer', id: 'q5', q: 'tallerken engros prisliste 2026' }],
+  [5.5,  { t: 'done',    a: 'scout',  id: 'q4', be: 'openserp',
+           sites: ['ikea-pro.dk', 'horeca-magasinet.dk', 'tableware.dk',
+                   'duba-b8.dk', 'engrosguiden.dk', 'creative-table.dk',
+                   'nordicnest.com'] }],
+  [5.9,  { t: 'thought', a: 'pricer', x: 'MOQ under 50 looks unrealistic…' }],
+  [6.3,  { t: 'collect', a: 'scout',  x: '4 queries · 20 sources' }],
+  [6.9,  { t: 'done',    a: 'pricer', id: 'q5', be: 'tavily',
+           sites: ['prisportalen.dk', 'horeca-magasinet.dk', 'billig-engros.dk',
+                   'tableware.dk'] }],
+  [7.4,  { t: 'search+', a: 'main',   id: 'q6', q: 'pop-up ceramics dinner venue aarhus' }],
+  [7.9,  { t: 'collect', a: 'pricer', x: '1 query · 4 sources' }],
+  [8.4,  { t: 'done',    a: 'main',   id: 'q6', be: 'openserp',
+           sites: ['visit-aarhus.dk', 'aarhuscentralfoodmarket.dk',
+                   'dome.dk', 'engrosguiden.dk'] }],
+  [9.0,  { t: 'thought', a: 'main',   x: 'shortlist ready — drafting the comparison' }],
+  [9.8,  { t: 'screen' }],
+];
+
+/* ── shared chrome: header, counters, equalizer, sources home ── */
+function mkThumb() {
+  const t = el('span', 'vthumb');
+  t.innerHTML = '<span class="tf"><i></i></span><span>desktop · idle</span>';
+  return t;
+}
+
+function buildChrome(pane, opts = {}) {
+  const head = el('div', 'rhead');
+  head.innerHTML =
+    `<span class="rlab">${svgIcon(ICONS.search)}research</span>` +
+    '<span class="eq"><i></i><i></i><i></i><i></i><i></i></span>' +
+    '<span class="rstats">' +
+      '<span class="rstat"><b data-k="q">0</b><span>queries</span></span>' +
+      '<span class="rstat"><b data-k="s">0</b><span>sources</span></span>' +
+      '<span class="rstat"><b data-k="w">0</b><span>workers</span></span>' +
+    '</span>';
+  const board = el('div', 'rboard');
+  pane.append(head, board);
+  let srcs = null;
+  const thumb = mkThumb();
+  if (opts.shelf !== false) {
+    const shelf = el('div', 'rshelf');
+    shelf.innerHTML = '<span class="slab">sources</span>';
+    srcs = el('div', 'srcs');
+    shelf.append(srcs, thumb);
+    pane.appendChild(shelf);
+  } else {
+    thumb.classList.add('float');
+    pane.appendChild(thumb);
+  }
+  const st = {
+    board, eq: head.querySelector('.eq'), srcs,
+    q: 0, sites: new Set(), workers: new Set(['main']),
+    bump(k) {
+      const b = head.querySelector(`b[data-k="${k}"]`);
+      b.textContent = k === 'q' ? ++st.q
+                    : k === 's' ? st.sites.size : st.workers.size;
+      const s = b.parentElement;
+      s.classList.remove('tick'); void s.offsetWidth; s.classList.add('tick');
+    },
+    addSite(d) {
+      if (st.sites.has(d)) return false;
+      st.sites.add(d);
+      const h = [...d].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+      const chip = el('span', 'src');
+      chip.innerHTML = `<i style="background:hsl(${h},32%,88%);` +
+        `color:hsl(${h},30%,32%)">${d[0]}</i>${d}`;
+      if (srcs) srcs.appendChild(chip);
+      st.bump('s');
+      return true;
+    },
+    pulse() {
+      for (const bar of st.eq.children)
+        bar.style.height = (3 + Math.random() * 11) + 'px';
+      clearTimeout(st._eqt);
+      st._eqt = setTimeout(() => {
+        for (const bar of st.eq.children) bar.style.height = '3px';
+      }, 260);
+    },
+  };
+  return st;
+}
+
+/* fake desktop used by the reference pane and the swap-away beat */
+function buildDesktop(swapNote) {
+  const d = el('div', 'mdesk');
+  d.innerHTML =
+    '<div class="mwin"><div class="mbar"><i></i><i></i><i></i>' +
+    '<span class="murl">https://www.google.com — new tab</span></div>' +
+    '<div class="mbody"><div class="ml hero"></div>' +
+    '<div class="ml" style="width:62%"></div>' +
+    '<div class="ml" style="width:81%"></div>' +
+    '<div class="ml" style="width:47%"></div>' +
+    '<div class="ml" style="width:70%"></div></div></div>';
+  if (swapNote) d.appendChild(el('span', 'midle swap-note',
+    'screen tools resumed — back to the desktop'));
+  return d;
+}
+
+/* ── variant renderers — each returns {evt, reset} ─────────── */
+
+/* deck family shared core: lanes, query cards, lifecycle. Variants differ
+   only in what "done" leaves behind — h.doneMeta fills the status cell,
+   h.afterDone places the sources. */
+function deckBase(pane, opts = {}) {
+  const st = buildChrome(pane, opts);
+  const lanesEl = el('div', 'lanes');
+  if (opts.rail) { st.board.classList.add('flex'); lanesEl.classList.add('has-rail'); }
+  st.board.appendChild(lanesEl);
+  const lanes = {}, cards = {}, segs = {}, hosts = {};
+  const lane = (a) => lanes[a] || (lanes[a] = (() => {
+    const l = el('div', 'lane');
+    l.dataset.hue = AGENTS[a].hue;
+    l.innerHTML =
+      '<div class="lane-head"><span class="adot"></span>' +
+      `<span class="aname">${a === 'main' ? 'main agent' : a}</span>` +
+      '<span class="athought"></span><span class="acount"></span></div>' +
+      (opts.track ? '<div class="track"></div>' : '') +
+      '<div class="lane-body"></div>';
+    lanesEl.appendChild(l);
+    return l;
+  })());
+  lane('main');
+  const thought = (a, x) => {
+    const L = lanes[a];
+    if (!L) return;
+    const th = L.querySelector('.athought');
+    th.textContent = x; th.classList.add('live');
+  };
+  const card = (a, id, q, icon) => {
+    const c = el('div', 'qc pend');
+    c.innerHTML = `<span class="qi">${svgIcon(icon)}</span>` +
+      `<span class="qt"></span>` +
+      '<span class="qst"><span class="qdots"></span></span>';
+    c.querySelector('.qt').textContent = q;
+    const L = lane(a);
+    L.querySelector('.lane-body').appendChild(c);
+    cards[id] = c;
+    if (opts.track) {
+      L.querySelector('.track').classList.add('live');
+      const s = el('i', 'tseg pend');
+      L.querySelector('.track').appendChild(s);
+      segs[id] = s;
+    }
+    const ac = L.querySelector('.acount');
+    ac.textContent = (parseInt(ac.textContent) || 0) + 1 + ' calls';
+  };
+  const spawn = (a, x) => {
+    lane(a); st.workers.add(a); st.bump('w');
+    if (x) thought(a, x);
+  };
+  const collect = (a, x) => {
+    st.workers.delete(a); st.bump('w');
+    const L = lanes[a];
+    if (!L) return;
+    const th = L.querySelector('.athought');
+    th.textContent = x; th.classList.remove('live');
+    L.classList.add('lane-done', 'gone');
+    L.querySelector('.acount').textContent = 'done';
+  };
+  const common = (e, h) => {
+    st.pulse();
+    switch (e.t) {
+      case 'thought': thought(e.a, e.x); break;
+      case 'spawn':   spawn(e.a, e.x); break;
+      case 'search+': card(e.a, e.id, e.q, ICONS.search); st.bump('q'); break;
+      case 'fetch+':  card(e.a, e.id, e.q, ICONS.page);
+                      hosts[e.id] = e.q.replace('reading ', ''); break;
+      case 'done': {
+        const c = cards[e.id];
+        if (c) {
+          c.classList.replace('pend', 'done');
+          c.querySelector('.qst').innerHTML = h.doneMeta(e);
+          if (e.fetch) c.querySelector('.qt').textContent = e.fetch;
+        }
+        if (segs[e.id]) segs[e.id].classList.replace('pend', 'fill');
+        const sites = e.sites ||
+          (e.fetch && hosts[e.id] ? [hosts[e.id]] : []);
+        const added = sites.filter(s => st.addSite(s));
+        h.afterDone && h.afterDone(e, sites, added, c);
+        break;
+      }
+      case 'collect': collect(e.a, e.x); break;
+    }
+  };
+  return { st, lanes, cards, common };
+}
+
+const META = (e) => e.fetch
+  ? '<b>read</b> <i class="be">fetch</i>'
+  : `<b>${e.sites.length}</b> hits <i class="be">${e.be}</i>`;
+
+const dotStyle = (d) => {
+  const h = [...d].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+  return `background:hsl(${h},32%,88%);color:hsl(${h},30%,32%)`;
+};
+
+/* A — command deck with the pill shelf (the rejected sources home,
+   kept for contrast) */
+function deckRenderer(pane) {
+  const b = deckBase(pane);
+  return {
+    evt: (e) => b.common(e, { doneMeta: META }),
+    reset() { pane.innerHTML = ''; },
+  };
+}
+
+/* D — harvest rows: favicon stacks inside the resolved cards */
+function harvestRenderer(pane) {
+  const b = deckBase(pane, { shelf: false });
+  return {
+    evt: (e) => b.common(e, {
+      doneMeta: META,
+      afterDone(e2, sites, added, c) {
+        if (!c || !sites.length) return;
+        const stack = el('span', 'sstack');
+        sites.slice(0, 6).forEach((d, i) => {
+          const s = el('i', 'sdot', d[0]);
+          s.style.cssText = dotStyle(d) +
+            `;animation-delay:${i * 70}ms`;
+          s.title = d;
+          stack.appendChild(s);
+        });
+        if (sites.length > 6)
+          stack.appendChild(el('span', 'smore', '+' + (sites.length - 6)));
+        c.appendChild(stack);
+      },
+    }),
+    reset() { pane.innerHTML = ''; },
+  };
+}
+
+/* E — rain rail: unique sources drop into a right-edge strip */
+function railRenderer(pane) {
+  const b = deckBase(pane, { shelf: false, rail: true });
+  const rail = el('div', 'rrail');
+  rail.innerHTML = '<div class="rlab2">harvest</div><div class="rdots"></div>';
+  b.st.board.appendChild(rail);
+  const rdots = rail.querySelector('.rdots');
+  const addDot = (d) => {
+    const s = el('i', 'rdot', d[0]);
+    s.style.cssText = dotStyle(d);
+    s.title = d;
+    rdots.appendChild(s);
+    if (rdots.children.length > 48) rdots.firstChild.remove();
+  };
+  return {
+    evt: (e) => b.common(e, {
+      doneMeta: META,
+      afterDone(e2, sites, added) {
+        added.forEach((s, i) => setTimeout(() => addDot(s), i * 90));
+      },
+    }),
+    reset() { pane.innerHTML = ''; },
+  };
+}
+
+/* F — pipeline: segmented track fills, done cards densify */
+function pipeRenderer(pane) {
+  const b = deckBase(pane, { shelf: false, track: true });
+  return {
+    evt: (e) => b.common(e, {
+      doneMeta: (e2) => e2.fetch
+        ? 'read · fetch_url'
+        : `${e2.sites.length} · ${e2.be}`,
+      afterDone(e2, sites, added, c) {
+        setTimeout(() => c && c.classList.add('min'), 1400);
+      },
+    }),
+    reset() { pane.innerHTML = ''; },
+  };
+}
+
+function orbRenderer(pane) {
+  const st = buildChrome(pane);
+  const sky = el('div', 'sky');
+  st.board.appendChild(sky);
+  const core = el('div', 'core');
+  core.innerHTML = '<b>0</b><span>sources</span>';
+  sky.appendChild(core);
+  const POS = { main: [50, 16], scout: [16, 36], pricer: [84, 36] };
+  const sats = {};
+  const sat = (a) => sats[a] || (sats[a] = (() => {
+    const s = el('div', 'sat live');
+    s.dataset.hue = AGENTS[a].hue;
+    const [x, y] = POS[a];
+    s.style.left = x + '%'; s.style.top = y + '%';
+    s.innerHTML = `<span class="sd"></span>` +
+      `<span class="sn">${a === 'main' ? 'main' : a}</span>` +
+      '<span class="slist"></span>';
+    sky.appendChild(s);
+    return s;
+  })());
+  sat('main');
+  const fly = (a) => {
+    const [x, y] = POS[a];
+    const d = el('i', 'fly');
+    d.dataset.hue = AGENTS[a].hue;
+    d.style.left = x + '%'; d.style.top = y + '%';
+    sky.appendChild(d);
+    requestAnimationFrame(() => {
+      const ang = Math.random() * Math.PI * 2, r = Math.random() * 34;
+      const cx = 50 + Math.cos(ang) * r * 0.28;
+      const cy = 60 + Math.sin(ang) * r * 0.28;
+      d.style.transform = `translate(-50%,-50%) ` +
+        `translate(${((cx - x) / 100) * sky.clientWidth}px,` +
+        `${((cy - y) / 100) * sky.clientHeight}px)`;
+      d.style.opacity = '0';
+    });
+    setTimeout(() => {
+      d.remove();
+      const m = el('i', 'mote');
+      const ang = Math.random() * Math.PI * 2, r = Math.random() * 34;
+      m.style.left = (50 + Math.cos(ang) * r * 0.28) + '%';
+      m.style.top = (60 + Math.sin(ang) * r * 0.28) + '%';
+      m.dataset.hue = AGENTS[a].hue;
+      sky.appendChild(m);
+      core.classList.remove('bump'); void core.offsetWidth;
+      core.classList.add('bump');
+      core.querySelector('b').textContent = st.sites.size;
+    }, 900);
+  };
+  const chip = (a, id, q) => {
+    const c = el('span', 'sq pend', '⌕ ' + q);
+    c.dataset.id = id;
+    sat(a).querySelector('.slist').appendChild(c);
+  };
+  return {
+    evt(e) {
+      st.pulse();
+      switch (e.t) {
+        case 'spawn': sat(e.a); st.workers.add(e.a); st.bump('w'); break;
+        case 'search+': chip(e.a, e.id, e.q); st.bump('q'); break;
+        case 'fetch+':  chip(e.a, e.id, e.q.replace('reading ', '⌁ ')); break;
+        case 'done': {
+          const s = sats[e.a];
+          const c = s && s.querySelector(`.sq[data-id="${e.id}"]`);
+          if (c) {
+            c.classList.remove('pend');
+            c.textContent = e.fetch ? '✓ ' + e.fetch : `✓ ${e.sites.length} · ${e.be}`;
+            setTimeout(() => { c.style.opacity = '0';
+              setTimeout(() => c.remove(), 400); }, 1400);
+          }
+          (e.sites || []).forEach(s2 => { st.addSite(s2); fly(e.a); });
+          if (e.fetch) fly(e.a);
+          break;
+        }
+        case 'collect':
+          st.workers.delete(e.a); st.bump('w');
+          sats[e.a] && sats[e.a].classList.replace('live', 'gone');
+          break;
+      }
+    },
+    reset() { pane.innerHTML = ''; },
+  };
+}
+
+function waterRenderer(pane) {
+  const st = buildChrome(pane);
+  const cols = el('div', 'wcols');
+  st.board.appendChild(cols);
+  const colmap = {}, cellmap = {};
+  const col = (a) => colmap[a] || (colmap[a] = (() => {
+    const c = el('div', 'wcol');
+    c.dataset.hue = AGENTS[a].hue;
+    c.innerHTML =
+      '<div class="wcol-h"><span class="adot"></span>' +
+      `<span class="aname">${a === 'main' ? 'main' : a}</span>` +
+      '<span class="acount"></span></div>' +
+      '<div class="wcells"></div>';
+    cols.appendChild(c);
+    return c;
+  })());
+  const cell = (a, id, q, icon) => {
+    const c = el('div', 'wc pend');
+    c.innerHTML = `<span class="wq"></span>` +
+      `<span class="wmeta"><span class="qdots"></span></span>`;
+    c.querySelector('.wq').textContent = q;
+    const cells = col(a).querySelector('.wcells');
+    cells.appendChild(c);
+    cells.scrollTop = cells.scrollHeight;
+    cellmap[id] = c;
+  };
+  const counts = {};
+  col('main');
+  return {
+    evt(e) {
+      st.pulse();
+      switch (e.t) {
+        case 'spawn': col(e.a); st.workers.add(e.a); st.bump('w'); break;
+        case 'search+': cell(e.a, e.id, '⌕ ' + e.q); st.bump('q');
+          counts[e.a] = (counts[e.a] || 0) + 1;
+          colmap[e.a].querySelector('.acount').textContent =
+            counts[e.a] + ' queries';
+          break;
+        case 'fetch+': cell(e.a, e.id, '⌁ ' + e.q); break;
+        case 'done': {
+          const c = cellmap[e.id];
+          if (c) {
+            c.classList.replace('pend', 'done');
+            c.querySelector('.wmeta').innerHTML = e.fetch
+              ? 'read · fetch_url'
+              : `${e.sites.length} results · ${e.be}`;
+          }
+          (e.sites || []).forEach(s => st.addSite(s));
+          break;
+        }
+        case 'collect': {
+          st.workers.delete(e.a); st.bump('w');
+          const c = colmap[e.a];
+          c.classList.add('done');
+          c.appendChild(el('div', 'wsum', 'done — ' + e.x));
+          break;
+        }
+      }
+    },
+    reset() { pane.innerHTML = ''; },
+  };
+}
+
+/* ── driver ───────────────────────────────────────────────── */
+const KINDS = { deck: deckRenderer, harvest: harvestRenderer,
+                rail: railRenderer, pipe: pipeRenderer,
+                orb: orbRenderer, water: waterRenderer };
+
+function run(pane) {
+  const my = (pane._run = (pane._run || 0) + 1);   // stale timers check this
+  const kind = pane.dataset.kind;
+  pane.innerHTML = '';
+  let r = null, swap = null, refStatus = null;
+  if (kind === 'ref') {
+    pane.appendChild(buildDesktop(false));
+    refStatus = el('span', 'midle', 'agent working · desktop idle');
+    pane.appendChild(refStatus);
+  } else {
+    r = KINDS[kind](pane);
+    swap = buildDesktop(true);
+    swap.classList.add('swap');
+    pane.appendChild(swap);
+  }
+  for (const [t, e] of SCRIPT) {
+    setTimeout(() => {
+      if (pane._run !== my) return;
+      if (kind === 'ref') {
+        if (e.t === 'search+')
+          refStatus.textContent = `searching the web — “${e.q.slice(0, 34)}…” · desktop idle`;
+        else if (e.t === 'fetch+')
+          refStatus.textContent = 'reading keramikengros.dk · desktop idle';
+        else if (e.t === 'screen')
+          setTimeout(() => { if (pane._run === my) run(pane); }, 1800);
+      } else if (e.t === 'screen') {
+        swap.classList.add('on');
+        setTimeout(() => { if (pane._run === my) run(pane); }, 2600);
+      } else r.evt(e);
+    }, t * 1000);
+  }
+}
+
+document.querySelectorAll('.rpane').forEach(p => {
+  run(p);
+  p.addEventListener('click', () => run(p));
+});
+document.getElementById('replay').addEventListener('click', () =>
+  document.querySelectorAll('.rpane').forEach(run));
+</script>
+</body>
+</html>

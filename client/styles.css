@@ -1493,6 +1493,290 @@ body.takeover #desktopPane { border-color: var(--clay); }
 }
 .screen-status:empty { display: none; }
 
+/* ── research pane ─────────────────────────────────────────
+   While the agent works API-side (search/fetch/workers) the desktop
+   stream is dead air, so the pane swaps in a live board — one lane per
+   agent, one card per query, resolved cards carry their sources as an
+   overlapping dot stack. A screen tool swaps the desktop back in. */
+.rpane {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  opacity: 0;
+  transition: opacity .35s;
+}
+.rpane.in { opacity: 1; }
+.rpane[hidden] { display: none; }
+
+/* ── shared chrome: header strip, live counters, equalizer ── */
+.rpane .rhead {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.rpane .rlabel {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.rpane .rlabel.live {
+  background: linear-gradient(90deg, var(--text-2) 35%, #ffffff 50%,
+                              var(--text-2) 65%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: status-shimmer 1.5s linear infinite;
+}
+.rpane .rcount {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mint-ink);
+  transition: color .3s;
+}
+.rpane .rcount.hot { color: var(--text); }
+@keyframes status-shimmer {
+  from { background-position: 100% 0; }
+  to   { background-position: -100% 0; }
+}
+.rpane .eq {
+  display: flex;
+  gap: 2px;
+  align-items: flex-end;
+  height: 12px;
+  margin-left: 2px;
+}
+.rpane .eq i {
+  width: 3px;
+  border-radius: 1.5px;
+  background: var(--mint);
+  height: 3px;
+}
+.rpane.live .eq i { animation: eq .9s ease-in-out infinite; }
+.rpane.live .eq i:nth-child(2) { animation-delay: .15s; }
+.rpane.live .eq i:nth-child(3) { animation-delay: .3s; }
+.rpane.live .eq i:nth-child(4) { animation-delay: .45s; }
+@keyframes eq { 0%, 100% { height: 3px; } 50% { height: 11px; } }
+.rpane .rstats {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* ── board ────────────────────────────────────────────────── */
+.rpane .rboard {
+  flex: 1;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 20px;
+  gap: 12px;
+  overflow: hidden;
+}
+.rpane .lanes {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* one lane per agent — the accent strip hue is the row's signature */
+.rpane .lane {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  padding: 10px 12px 10px 20px;
+  position: relative;
+  transition: border-color .3s;
+}
+.rpane .lane::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 8px; bottom: 8px;
+  width: 3px;
+  border-radius: 2px;
+}
+.rpane .lane.mint::before   { background: var(--mint); }
+.rpane .lane.blue::before   { background: #7fa8c9; }
+.rpane .lane.violet::before { background: #b48ead; }
+.rpane .lane.rose::before   { background: #d08f9f; }
+.rpane .lane.done { border-color: var(--line-strong); }
+.rpane .ahead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.rpane .adot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.rpane .lane.mint .adot   { background: var(--mint-ink); }
+.rpane .lane.blue .adot   { background: #4d7ba6; }
+.rpane .lane.violet .adot { background: #8a5f84; }
+.rpane .lane.rose .adot   { background: #a85d72; }
+.rpane .lane:not(.done) .adot { animation: status-pulse 1.6s ease-in-out infinite; }
+.rpane .aname {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+.rpane .acount {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+.rpane .athought {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-3);
+  padding: 2px 0 6px 22px;
+  min-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rpane .athought:empty { display: none; }
+.rpane .asum {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  padding: 6px 0 0 22px;
+}
+.rpane .todo { display: flex; flex-direction: column; gap: 6px; }
+
+/* one row per query — pending rows shimmer, resolved rows carry
+   their sources as an overlapping dot stack on the wrapped line */
+.rpane .qc {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 6px 10px;
+  animation: qc-pop .3s;
+}
+@keyframes qc-pop {
+  from { opacity: 0; transform: translateY(4px); }
+}
+.rpane .qc.done { background: var(--surface); }
+.rpane .qi {
+  flex: none;
+  width: 20px; height: 20px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.rpane .qc[data-kind="search"]  .qi { background: var(--mint-soft); color: var(--mint-ink); }
+.rpane .qc[data-kind="fetch"]   .qi { background: #dbe4ee; color: #4d7ba6; }
+.rpane .qc[data-kind="spawn"]   .qi { background: #e8dff0; color: #8a5f84; }
+.rpane .qc[data-kind="collect"] .qi { background: #f0dfe4; color: #a85d72; }
+.rpane .qc[data-kind="send"]    .qi { background: #eee6d0; color: #8a6d3b; }
+.rpane .qc .qbody { flex: 1; min-width: 0; }
+.rpane .qc .qtext {
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rpane .qc .qmeta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+.rpane .qc.pend .qmeta { animation: status-pulse 1.2s ease-in-out infinite; }
+
+/* the harvest — source dots sit inside the card on the wrapped line */
+.rpane .sstack {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 0 5px 22px;
+}
+.rpane .sstack:empty { display: none; }
+.rpane .sdot {
+  flex: none;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--surface);
+  margin-left: -5px;
+  border: 1.5px solid var(--surface);
+}
+.rpane .sdot:first-child { margin-left: 0; }
+.rpane .smore {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  margin-left: 6px;
+}
+
+/* the desktop is still alive under the board — the floating tile
+   says so and doubles as the way back */
+.rpane .vthumb {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  box-shadow: 0 4px 14px rgba(60, 55, 45, .12);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.rpane .vthumb:hover { border-color: var(--mint); }
+.rpane .vthumb .vdot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--mint-ink);
+  animation: status-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rpane,
+  .rpane .lane { transition: none; }
+  .rpane .rlabel.live { animation: none; -webkit-text-fill-color: var(--text-2); background: none; }
+  .rpane.live .eq i { animation: none; }
+  .rpane .qc { animation: none; }
+  .rpane .lane:not(.done) .adot,
+  .rpane .qc.pend .qmeta,
+  .rpane .vthumb .vdot { animation: none; }
+}
+
 /* takeover notice — a clay band at the foot of the conversation, where
    the resume action lives next to the composer's Stop/Send row */
 #takeoverBanner {

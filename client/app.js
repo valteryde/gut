@@ -1625,6 +1625,293 @@ function handleTranscriptEvent(m) {
   if (m.type === 'done') scheduleConvReload();
 }
 
+/* ── research pane ─────────────────────────────────────────────────
+   While the agent works API-side (searches, page reads, workers) the
+   desktop stream is dead air, so #desktopPane swaps in this board —
+   variant D "harvest rows": one lane per agent, one card per query,
+   and a resolved card carries its sources as an overlapping dot stack
+   on the wrapped line. A visible-screen action swaps back. */
+const researchPaneEl = document.getElementById('researchPane');
+// Mirror of the daemon's VISUAL_TOOLS — a call here means the desktop
+// is live again, so the board gives the stream back.
+const VISUAL_ACTION_TOOLS = new Set([
+  'click', 'mouse_move', 'scroll', 'type_text', 'key',
+  'browser_click', 'browser_type', 'open_url', 'focus_window',
+  'desktop_act', 'desktop_click', 'desktop_type',
+]);
+const WORKER_HUES = ['blue', 'violet', 'rose'];
+const SITE_HUES = ['#7fa8c9', '#b48ead', '#8fbb8f', '#d0a86f',
+                   '#8e9ec9', '#c98f8f'];
+const KIND_ICON = { search: '⌕', fetch: '⌁', spawn: '⟶',
+                    collect: '◌', send: '↑' };
+const RESULT_URL_RE = /https?:\/\/[^\s)\]'"]+/g;
+
+const research = {
+  conv: null,          // the conversation this board is tracking
+  usd: 0,
+  workers: 0,          // worker lanes ever spawned
+  queries: 0,          // search/fetch cards issued
+  sites: new Map(),    // domain → dot color
+  lanes: new Map(),    // agent → lane record
+  shown: false,
+  hideTimer: null,
+  headEl: null, lanesEl: null, countEl: null, statsEl: null,
+};
+
+function rel(tag, cls, text) {
+  const d = document.createElement(tag);
+  if (cls) d.className = cls;
+  if (text != null) d.textContent = text;
+  return d;
+}
+
+function researchChrome() {
+  if (research.headEl) return;
+  const head = rel('div', 'rhead');
+  research.labelEl = rel('span', 'rlabel live', 'research');
+  research.countEl = rel('span', 'rcount', '0 workers · 0 queries');
+  const eq = rel('span', 'eq');
+  for (let i = 0; i < 4; i++) eq.appendChild(rel('i'));
+  research.statsEl = rel('span', 'rstats', '0 sites');
+  head.append(research.labelEl, research.countEl, eq, research.statsEl);
+  research.boardEl = rel('div', 'rboard');
+  research.lanesEl = rel('div', 'lanes');
+  const thumb = rel('div', 'vthumb');
+  thumb.setAttribute('role', 'button');
+  thumb.title = 'back to the desktop';
+  thumb.append(rel('span', 'vdot'),
+               document.createTextNode('desktop · idle'));
+  thumb.addEventListener('click', researchHide);
+  research.boardEl.appendChild(research.lanesEl);
+  researchPaneEl.append(head, research.boardEl, thumb);
+  research.headEl = head;
+}
+
+function researchStats() {
+  if (!research.statsEl) return;
+  const cost = research.usd ? `$${Number(research.usd).toFixed(2)} · ` : '';
+  research.statsEl.textContent = `${cost}${research.sites.size} sites`;
+}
+
+function researchCounts() {
+  if (!research.countEl) return;
+  research.countEl.textContent =
+    `${research.workers} workers · ${research.queries} queries`;
+  research.countEl.classList.add('hot');
+  setTimeout(() => research.countEl &&
+             research.countEl.classList.remove('hot'), 500);
+}
+
+function researchReset() {
+  research.conv = null;
+  research.usd = 0;
+  research.workers = 0;
+  research.queries = 0;
+  research.sites.clear();
+  research.lanes.clear();
+  researchPaneEl.innerHTML = '';
+  research.headEl = research.lanesEl =
+    research.countEl = research.statsEl = null;
+}
+
+function researchShow() {
+  clearTimeout(research.hideTimer);
+  research.shown = true;
+  researchPaneEl.hidden = false;
+  requestAnimationFrame(() =>
+    researchPaneEl.classList.add('in', 'live'));
+}
+
+function researchHide() {  // fade out; the DOM stays for a later re-show
+  research.shown = false;
+  researchPaneEl.classList.remove('in', 'live');
+  clearTimeout(research.hideTimer);
+  research.hideTimer = setTimeout(() => {
+    if (!research.shown) researchPaneEl.hidden = true;
+  }, 400);
+}
+
+function researchLane(agent, task) {
+  let l = research.lanes.get(agent);
+  if (l) return l;
+  researchChrome();
+  const workerIx = [...research.lanes.keys()]
+    .filter(a => a !== 'main').length;
+  const hue = agent === 'main'
+    ? 'mint' : WORKER_HUES[workerIx % WORKER_HUES.length];
+  const el = rel('div', `lane ${hue}`);
+  const ahead = rel('div', 'ahead');
+  const count = rel('span', 'acount');
+  ahead.append(rel('span', 'adot'), rel('span', 'aname', agent), count);
+  const thought = rel('div', 'athought', task ? clip(task, 110) : '');
+  const todo = rel('div', 'todo');
+  el.append(ahead, thought, todo);
+  research.lanesEl.appendChild(el);
+  l = { el, countEl: count, thoughtEl: thought, todoEl: todo,
+        count: 0, pend: [] };
+  research.lanes.set(agent, l);
+  return l;
+}
+
+function researchCard(agent, kind, text, meta, counts) {
+  const l = researchLane(agent);
+  const c = rel('div', 'qc pend');
+  c.dataset.kind = kind;
+  const body = rel('span', 'qbody');
+  body.append(rel('div', 'qtext', text), rel('div', 'qmeta', meta));
+  c.append(rel('span', 'qi', KIND_ICON[kind]), body);
+  l.todoEl.appendChild(c);
+  research.lanesEl.scrollTop = research.lanesEl.scrollHeight;
+  if (counts) {
+    l.count++;
+    l.countEl.textContent = `${l.count} quer${l.count > 1 ? 'ies' : 'y'}`;
+    research.queries++;
+    researchCounts();
+  }
+  return c;
+}
+
+function researchDot(dom) {
+  if (!research.sites.has(dom))
+    research.sites.set(dom, SITE_HUES[research.sites.size % SITE_HUES.length]);
+  const s = rel('span', 'sdot', dom[0] || '·');
+  s.style.background = research.sites.get(dom);
+  s.title = dom;
+  return s;
+}
+
+// Resolves the oldest pending group of this kind on the agent's lane —
+// tool calls run in order, so a result always pairs with the oldest open
+// group. Batched queries split the harvest round-robin across their cards.
+function researchResolve(agent, kind, meta, doms) {
+  const l = research.lanes.get(agent);
+  if (!l) return;
+  const g = l.pend.find(x => x.kind === kind && !x.done);
+  if (!g) return;
+  g.done = true;
+  const sites = [...new Set(doms || [])];
+  g.cards.forEach((c, i) => {
+    c.classList.replace('pend', 'done');
+    c.querySelector('.qmeta').textContent = meta;
+    const mine = g.cards.length > 1
+      ? sites.filter((_, j) => j % g.cards.length === i) : sites;
+    if (!mine.length) return;
+    const stack = rel('span', 'sstack');
+    mine.slice(0, 8).forEach(d => stack.appendChild(researchDot(d)));
+    if (mine.length > 8)
+      stack.appendChild(rel('span', 'smore', `+${mine.length - 8}`));
+    c.appendChild(stack);
+  });
+  researchStats();
+}
+
+function researchFeed(m) {
+  if (m.type === 'hello') {
+    researchHide();
+    researchReset();
+    research.conv = m.running_conversation || null;
+    return;
+  }
+  if (m.type === 'status') {
+    if (m.state === 'idle') { researchHide(); researchReset(); }
+    return;
+  }
+  if (m.type === 'cost') {
+    if (m.conversation_id === research.conv) {
+      research.usd = m.conversation_usd || m.session_usd || 0;
+      researchStats();
+    }
+    return;
+  }
+  // The board mirrors the live run only — history lives in the transcript.
+  if (!m.conversation_id || m.conversation_id !== runningConvId) return;
+  if (research.conv !== m.conversation_id) {
+    researchReset();
+    research.conv = m.conversation_id;
+  }
+  const agent = m.agent || 'main';
+  switch (m.type) {
+    case 'action': {
+      const tool = m.tool, a = m.args || {};
+      if (VISUAL_ACTION_TOOLS.has(tool)) { researchHide(); return; }
+      if (tool === 'web_search') {
+        const qs = Array.isArray(a.queries) && a.queries.length
+          ? a.queries : [a.query || 'search'];
+        const g = { kind: 'search', done: false, cards: [] };
+        for (const q of qs)
+          g.cards.push(researchCard(agent, 'search', clip(q, 90),
+                                    'searching · web_search', true));
+        researchLane(agent).pend.push(g);
+        researchShow();
+      } else if (tool === 'fetch_url') {
+        const g = { kind: 'fetch', done: false, cards: [
+          researchCard(agent, 'fetch',
+                       clip(hostOf(a.url) || a.url, 90),
+                       'fetching · fetch_url', true)] };
+        researchLane(agent).pend.push(g);
+        researchShow();
+      } else if (tool === 'spawn_agent' || tool === 'collect_agent') {
+        const kind = tool === 'spawn_agent' ? 'spawn' : 'collect';
+        const g = { kind, done: false, cards: [
+          researchCard(agent, kind, `${kind} ${a.name || 'worker'}`,
+                       kind === 'spawn' ? 'delegating'
+                                        : 'waiting on report')] };
+        researchLane(agent).pend.push(g);
+        researchShow();
+      } else if (tool === 'send_file') {
+        const c = researchCard(agent, 'send', fileBase(a.path), 'sent');
+        c.classList.replace('pend', 'done');
+        researchShow();
+      }
+      return;
+    }
+    case 'action_result': {
+      const res = String(m.result || '');
+      const doms = [...new Set(
+        ((m.urls && m.urls.length ? m.urls
+                                  : res.match(RESULT_URL_RE) || [])
+        ).map(hostOf).filter(Boolean))];
+      if (m.tool === 'web_search') {
+        const backend = (res.match(/via (\w+)/) || [])[1] || 'web';
+        researchResolve(agent, 'search',
+                        `${doms.length} sources · ${backend}`, doms);
+      } else if (m.tool === 'fetch_url') {
+        researchResolve(agent, 'fetch', 'read · fetch_url', doms);
+      } else if (m.tool === 'spawn_agent') {
+        researchResolve(agent, 'spawn', 'spawned');
+      } else if (m.tool === 'collect_agent') {
+        researchResolve(agent, 'collect', 'report in');
+      }
+      return;
+    }
+    case 'subagent': {
+      const l = researchLane(m.name, m.state === 'running' ? m.task : '');
+      if (m.state === 'running') {
+        research.workers++;
+        researchCounts();
+        researchShow();
+      } else {
+        l.el.classList.add('done');
+        const bits = [m.state];
+        if (m.steps != null) bits.push(`${m.steps} steps`);
+        if (m.usd) bits.push(`$${Number(m.usd).toFixed(4)}`);
+        l.el.appendChild(rel('div', 'asum', bits.join(' · ')));
+      }
+      return;
+    }
+    case 'thought':
+    case 'thinking': {
+      const l = research.lanes.get(agent);
+      if (l && m.text) l.thoughtEl.textContent = clip(m.text, 110);
+      return;
+    }
+    case 'done':
+      researchHide();
+      researchReset();
+      return;
+  }
+}
+
 // ── agent websocket ─────────────────────────────────────────────────────
 function connectChat() {
   const d = activeDev();
@@ -1644,6 +1931,7 @@ function connectChat() {
 
   chatWs.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
+    researchFeed(m);
     if (m.conversation_id && TRANSCRIPT_TYPES.has(m.type)) {
       handleTranscriptEvent(m);
       return;

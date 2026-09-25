@@ -2952,6 +2952,26 @@ async def fetch_url(url: str, max_chars: int = 6000) -> str:
             "open it in the browser")
 
 
+# Source URLs harvested from a research result ride its action_result event
+# so the client's research pane can stack sources without re-parsing the
+# 500-char preview it ships in `result`.
+_RESULT_URL_RE = re.compile(r"https?://[^\s)\]'\"<>]+")
+
+
+def _result_urls(tool: str, text: str) -> list[str]:
+    if tool not in PARALLEL_TOOLS or not text:
+        return []
+    out, seen = [], set()
+    for u in _RESULT_URL_RE.findall(text):
+        u = u.rstrip(".,;:'\"")
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+            if len(out) >= 12:
+                break
+    return out
+
+
 # Screen-mutating tools trigger one fresh screenshot per turn, attached to the
 # last tool result (skipped when the frame is unchanged). See agent_loop.
 SCREEN_TOOLS = {
@@ -5197,10 +5217,12 @@ async def subagent_loop(name: str, task_text: str, model: str,
                     elif tname == "fetch_url" and \
                             not _TOOL_ERR_RE.search(prev):
                         fetches += 1
-                    await broadcast_conv({"type": "action_result",
-                                          "tool": tname,
-                                          "result": prev.strip()[:500],
-                                          "agent": name}, conv_id)
+                    ev = {"type": "action_result", "tool": tname,
+                          "result": prev.strip()[:500], "agent": name}
+                    urls = _result_urls(tname, prev)
+                    if urls:
+                        ev["urls"] = urls
+                    await broadcast_conv(ev, conv_id)
                     if fin:  # task_complete — the summary is the report
                         result = res if isinstance(res, str) else prev
                         finished = True
@@ -6152,8 +6174,12 @@ async def agent_loop(conv_id: str, task_text: str,
                     preview = result if isinstance(result, str) else next(
                         (b.get("text", "") for b in result
                          if b.get("type") == "text"), "")
-                    await broadcast({"type": "action_result", "tool": name,
-                                     "result": preview.strip()[:500]})
+                    ev = {"type": "action_result", "tool": name,
+                          "result": preview.strip()[:500]}
+                    urls = _result_urls(name, preview)
+                    if urls:
+                        ev["urls"] = urls
+                    await broadcast(ev)
                     if finished and name == "task_complete":
                         critique = await verify_wrap_up(
                             http, conv_id, str(result), messages)
