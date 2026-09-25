@@ -3570,6 +3570,12 @@ async def ask_user(question: str) -> str:
         await push_status()
 
 
+# Intermediates the agent writes to *produce* deliverables — listing them
+# as "unsent" just invites shipping build tooling nobody asked for.
+_UNSENT_SKIP_EXT = {".py", ".sh", ".js", ".ts", ".rb", ".pl", ".ps1", ".r",
+                    ".sql", ".ipynb"}
+
+
 def unsent_outputs() -> list[Path]:
     """Files changed since the run started that were never sent back — the
     backstop for "agent saved a file but only told the user the path".
@@ -3594,7 +3600,7 @@ def unsent_outputs() -> list[Path]:
                 continue
             try:
                 rp = p.resolve()
-                if not rp.is_file():
+                if not rp.is_file() or rp.suffix.lower() in _UNSENT_SKIP_EXT:
                     continue
                 mtime = rp.stat().st_mtime
             except OSError:
@@ -4730,7 +4736,9 @@ The wrap-up PASSES when:
 
 Claims the agent itself flags as unverified, estimated or approximate are fine — flagged doubt is honest. Fail ONLY for material claims stated as fact that the log doesn't support or directly contradicts — never over omissions, tone, or hedged language.
 
-Ledger lines ending "… [truncated]" had their tails cut for length — a claim needing the cut part counts as unsupported.
+Ledger lines ending "… [truncated]" had their tails cut for length — a claim needing the cut part counts as unsupported, and prefer the digests over guessing what a cut page said.
+
+A delivered file's digest (bytes, paragraphs, filled rows) is authoritative that it exists and is nonempty — fail missing, empty or wrong-type deliverables. The wrap-up describing its own document loosely ("two-paragraph summary" while the digest counts heading and caption lines too) is style, not an unsupported claim.
 
 Reply with exactly one line:
 PASS
@@ -4738,6 +4746,14 @@ or
 FAIL
 - <unsupported claim> — what the log shows instead (or "nothing in the log supports this")
 - … one short bullet per problem."""
+
+
+# Ledger slice multiplier per tool (× VERIFY_RESULT_CHARS): worker reports
+# and the searches/fetches behind them carry the run's evidence — numbers
+# and source URLs the wrap-up repeats — while a screenshot result or a
+# screen action needs only its head.
+_LEDGER_CAP_MULT = {"collect_agent": 10, "fetch_url": 4, "web_search": 4,
+                    "run_command": 2, "send_file": 4}
 
 
 def run_ledger(messages: list) -> list[str]:
@@ -4761,18 +4777,22 @@ def run_ledger(messages: list) -> list[str]:
                 res = " ".join(str(b.get("text", "")) for b in res
                                if b.get("type") == "text")
             res = " ".join(str(res or "").split())
-            # Worker reports are the run's findings — keep them whole
-            # enough for the checker to match figures and footers.
-            cap = (VERIFY_RESULT_CHARS * 6 if name == "collect_agent"
-                   else VERIFY_RESULT_CHARS)
-            entries.append(f"{name}({argstr}) → {res[:cap]}")
+            # Evidence-heavy results get a bigger slice — the checker fails
+            # claims whose only support fell past the cap, and research
+            # figures live inside worker reports and fetched pages. Mark
+            # cut tails so truncation reads as truncation, not absence.
+            cap = VERIFY_RESULT_CHARS * _LEDGER_CAP_MULT.get(name, 1)
+            entries.append(f"{name}({argstr}) → {res[:cap]}"
+                           + (" … [truncated]" if len(res) > cap else ""))
         elif role == "user" and isinstance(msg.get("content"), str) \
                 and msg["content"].startswith("[subagent '"):
             # Reports auto-delivered between steps ride user turns, not
             # tool results — without this line the checker never sees
             # the evidence behind a delegated finding.
             res = " ".join(msg["content"].split())
-            entries.append(f"subagent report → {res[:VERIFY_RESULT_CHARS * 6]}")
+            cap = VERIFY_RESULT_CHARS * _LEDGER_CAP_MULT["collect_agent"]
+            entries.append(f"subagent report → {res[:cap]}"
+                           + (" … [truncated]" if len(res) > cap else ""))
     return entries
 
 

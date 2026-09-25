@@ -10,3 +10,5 @@ websockets>=12,<16
 # pip-install at runtime.
 openpyxl==3.1.*
 python-docx==1.*
+matplotlib>=3.9,<4
+pandas>=2,<4
