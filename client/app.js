@@ -4012,6 +4012,7 @@ const CFG_FIELDS = [
   ['cfgCtxLimits', 'MODEL_CONTEXT_LIMITS'],
   ['cfgSearchLang', 'SEARCH_LANG'],
   ['cfgSearchRegion', 'SEARCH_REGION'],
+  ['cfgWsDays', 'WORKSPACE_TTL_DAYS'],
 ];
 const devCfgHint = $('devCfgHint'), devCfgForm = $('devCfgForm'),
       devCfgNote = $('devCfgNote'), devCfgTarget = $('devCfgTarget'),

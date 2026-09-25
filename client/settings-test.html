@@ -220,11 +220,19 @@
                 <label>Search region
                   <input id="cfgSearchRegion" type="text" maxlength="8" placeholder="e.g. DK">
                 </label>
+                <label>Workspace retention (days)
+                  <small>Each conversation keeps a folder of its files on
+                    the desktop — folders untouched this long are swept.
+                    0 keeps them forever.</small>
+                  <input id="cfgWsDays" type="number" min="0" step="1" placeholder="14">
+                </label>
               </div>
               <label class="check">
                 <input type="checkbox" id="cfgCleanup">
-                <span>Clean up after each run
-                  <small>Close the apps, windows and browser tabs the run opened</small>
+                <span>Desktop cleanup
+                  <small>Let the agent call the janitor to close leftover
+                    windows and tabs mid-task; a crashed run's leftovers
+                    are swept at start</small>
                 </span>
               </label>
               <datalist id="cfgModelList"></datalist>

@@ -186,9 +186,11 @@ check("remember: missing conv loads empty",
 
 # ── build-step data-flow nudge ──────────────────────────────────────────
 # A build step going in_progress on researched data gets pointed at files:
-# worker scratch files when they exist, else "write the data file first".
+# worker files in the conversation's workspace when they exist, else
+# "write the data file first".
 ad.state = ad.AgentState()
-ad.SCRATCH_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
+ad.state.conversation_id = "testconv123"
+ad.WORKSPACES_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
 ad.state.evidence["research"] = 1
 out = todos([{"content": "Research carrot prices", "status": "done",
               "kind": "research"},
@@ -198,9 +200,10 @@ check("build nudge: no files → write data file",
       "Never type figures from memory" in out, out[-120:])
 
 ad.state = ad.AgentState()
+ad.state.conversation_id = "testconv123"
 ad.state.evidence["research"] = 1
-ad.SCRATCH_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
-wd = ad.SCRATCH_DIR / "price-worker"
+ad.WORKSPACES_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
+wd = ad.worker_dir("price-worker")
 wd.mkdir(parents=True, exist_ok=True)
 (wd / "findings.json").write_text('[{"value": 42, "unit": "kr"}]')
 out = todos([{"content": "Build the comparison spreadsheet",
@@ -210,7 +213,8 @@ check("build nudge: worker files listed",
 
 # no research evidence and no files → no nudge
 ad.state = ad.AgentState()
-ad.SCRATCH_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
+ad.state.conversation_id = "testconv123"
+ad.WORKSPACES_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
 out = todos([{"content": "Build the comparison spreadsheet",
               "status": "in_progress", "kind": "build"}])
 check("build nudge: quiet without research",

@@ -49,7 +49,7 @@ HEADLESS_TOOLS = {
     "key", "open_url", "browser_text", "browser_dom", "browser_click",
     "browser_type", "browser_eval", "desktop_tree", "desktop_act",
     "desktop_click", "desktop_type", "office_eval", "list_windows",
-    "focus_window", "send_image",
+    "focus_window", "send_image", "janitor",
 }
 
 
@@ -131,10 +131,6 @@ def patch_headless(ad, events: list, verbose: bool) -> None:
     ad.capture_frame = _no_frame
     ad.capture_baseline = lambda: {}
 
-    async def _no_cleanup(*a, **k):
-        return None
-    ad.cleanup_after_run = _no_cleanup
-
     async def _no_spend():
         return None
     ad.litellm_spend = _no_spend
@@ -200,11 +196,11 @@ async def run_task(ad, task: dict, mode: str, args, events: list,
     ad.AGENT_ORCHESTRATE = mode == "orchestrate"
     ad.MAX_STEPS = args.max_steps
     ad.SUBAGENT_MAX_STEPS = args.worker_steps
-    for d in ("scratch", "uploads", "Desktop", "Downloads"):
+    for d in ("workspaces", "uploads", "Desktop", "Downloads"):
         (home / d).mkdir(parents=True, exist_ok=True)
     os.environ["HOME"] = str(home)
     ad.HOME_DIR = home
-    ad.SCRATCH_DIR = home / "scratch"
+    ad.WORKSPACES_DIR = home / "workspaces"
     ad.UPLOAD_DIR = home / "uploads"
     events.clear()
     ad.eval_calls.update(total=0, main=0)
@@ -476,9 +472,10 @@ async def main() -> int:
                 for p in home.iterdir():
                     if p.is_file() and not p.name.startswith("."):
                         shutil.copy(p, keep / p.name)
-                sc = home / "scratch"
+                sc = home / "workspaces"
                 if sc.is_dir():
-                    shutil.copytree(sc, keep / "scratch", dirs_exist_ok=True)
+                    shutil.copytree(sc, keep / "workspaces",
+                                    dirs_exist_ok=True)
                 for sp in m.get("sent_paths", []):
                     p = Path(sp)
                     if p.is_file() and keep not in p.parents:

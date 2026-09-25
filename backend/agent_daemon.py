@@ -94,7 +94,8 @@ CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "CLICK_A11Y", "CLICK_SNAP_PX", "NORMALIZED_COORD_MODELS",
     "LLM_MAX_RETRIES", "ASK_USER_TIMEOUT", "COMMAND_TIMEOUT",
     "SEND_FILE_MAX_BYTES", "ATTACH_TOTAL_MAX_BYTES",
-    "GUT_CLEANUP", "JANITOR_MAX_STEPS", "OPENSERP_URL", "OPENSERP_ENGINES",
+    "GUT_CLEANUP", "JANITOR_MAX_STEPS", "WORKSPACE_TTL_DAYS",
+    "OPENSERP_URL", "OPENSERP_ENGINES",
     "OPENSERP_MAX_CONCURRENT", "SEARCH_LANG", "SEARCH_REGION",
     # Boot-time settings — persisted here, applied by start.sh next boot.
     "RESOLUTION", "UI_SCALE", "DEVICE_NAME", "WALLPAPER_HUE", "CDP_PORT",
@@ -147,10 +148,11 @@ LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5")
 RESOLUTION = os.environ.get("RESOLUTION", "1920x1080")
 MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "150"))
-# Consecutive text-only replies (no tool calls) before the run is ended with
-# the model's last reply as the wrap-up. Weaker models answer in prose instead
-# of calling task_complete; without a cap the "continue" nudge loops to
-# MAX_STEPS paying full input cost every turn.
+# Consecutive replies that did no work — no tool calls at all, or nothing
+# but send_message — before the run is ended with the last reply as the
+# wrap-up. Weaker models answer in prose, or chat away on send_message
+# (which doesn't end the turn), instead of calling task_complete; without
+# a cap the "continue" nudge loops to MAX_STEPS paying full input cost.
 IDLE_REPLY_LIMIT = int(os.environ.get("AGENT_IDLE_REPLY_LIMIT", "3"))
 ASK_USER_TIMEOUT = int(os.environ.get("ASK_USER_TIMEOUT", "600"))
 COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "60"))
@@ -418,13 +420,20 @@ TLS_ERR = None  # why TLS is down, when it is — surfaced via /api/hello
 # the agent's file/shell tools can read them (paths are relative to home).
 UPLOAD_DIR = Path(os.environ.get("GUT_UPLOAD_DIR") or HOME_DIR / "uploads")
 MAX_ATTACHMENTS = 8
-# Per-run cleanup: a deterministic sweep (close tabs/windows/processes the
-# run created, wipe ~/scratch) followed by a short janitor LLM pass for
-# residue the sweep can't see. GUT_CLEANUP=off disables both.
+# Cleanup is never automatic at run end: windows, tabs and files stay as
+# the agent left them so a follow-up turn inherits a live desktop. What
+# remains: the janitor tool — an on-demand LLM pass the agent calls when
+# residue gets in its way — and the boot sweep of a crashed run's
+# leftovers. GUT_CLEANUP=off disables both.
 GUT_CLEANUP = os.environ.get("GUT_CLEANUP", "on").lower() not in (
     "off", "0", "false", "no")
 JANITOR_MAX_STEPS = int(os.environ.get("JANITOR_MAX_STEPS", "10"))
-SCRATCH_DIR = HOME_DIR / "scratch"
+# Each conversation gets a workspace on the desktop that survives between
+# tasks — worker findings, build intermediates and deliverables live there.
+# The only file deletion is the workspace janitor: dirs whose conversation
+# has been idle longer than WORKSPACE_TTL_DAYS are swept. 0 = keep forever.
+WORKSPACES_DIR = HOME_DIR / "workspaces"
+WORKSPACE_TTL_DAYS = int(float(os.environ.get("WORKSPACE_TTL_DAYS", "14")))
 # Baseline of what was running when a task started, persisted so a daemon
 # restart mid-run still lets the next boot sweep that run's leftovers.
 RUN_STATE_FILE = GUT_DATA_DIR / "run_state.json"
@@ -489,8 +498,11 @@ Environment:
   pick an installed one — never a reason to abandon code for a GUI or
   echo workaround. Launch GUI apps in the background so the command
   returns, e.g. `google-chrome &`.
-- {home}/scratch is wiped when the task ends — use it for temp and
-  intermediate files. Keep anything needed later elsewhere in {home}.
+- {work} is this conversation's workspace — it survives between tasks,
+  so a follow-up finds its files where you left them. Keep working files,
+  intermediate results and downloads there (workers get their own
+  subdirs under {work}/workers/). Nothing on disk is deleted when a task
+  ends — tidy it yourself when it fills up.
 - {coords}
 - Older screenshots are dropped from context — only recent frames are kept.
   The text log of your actions stays; call screenshot for a fresh look.
@@ -608,9 +620,12 @@ Guidelines:
   desktop_tree to work them.
 - If a login, 2FA, CAPTCHA or genuinely ambiguous decision blocks you, call
   ask_user — the human can click into the live screen to help, then resume you.
-- When your task ends the system closes the apps, windows and browser tabs
-  you opened and stops leftover processes. Logins and cookies persist across
-  tasks — never log out or wipe browser data as "cleanup".
+- Nothing is cleaned up when a task ends — windows, tabs and apps stay
+  open, files stay on disk, and the next task (this or another
+  conversation's) inherits the desktop as it was left. When leftover
+  windows, dialogs or tabs get in your way, call janitor for a cleanup
+  pass instead of closing them one by one. Logins and cookies persist —
+  never log out or wipe browser data as "cleanup".
 
 {delegate}"""
 
@@ -648,13 +663,13 @@ DELEGATE_ORCHESTRATOR = """Workers — spawn_agent runs a focused helper in the 
   English, with the unit, locale and time frame you need — the worker sees
   only that text, never your conversation. The daemon wraps it in a fixed
   contract: verify through tools, write findings to
-  {home}/scratch/<name>/, report values + sources + an UNVERIFIED list.
+  {work}/workers/<name>/, report values + sources + an UNVERIFIED list.
 - Spawn every independent research step at once (up to {subcap} run
   concurrently), then collect_agent — its report arrives as a message
   either way. Keep the desktop work and the user yourself; a worker has
   no screen, no browser and cannot ask anyone anything.
 - Assemble, don't transcribe: build the deliverable with one script that
-  reads the workers' files (JSON/CSV under {home}/scratch/) so every
+  reads the workers' files (JSON/CSV under {work}/workers/) so every
   number in it has a single source. Retyping figures from reports into a
   file is how numbers drift. Then verify the artifact — reload it, print
   a check total — before send_file.
@@ -670,7 +685,7 @@ DELEGATE_CLASSIC = """Delegating — spawn_agent runs a helper agent in the back
   files, crunching data with run_command. It has no screen, no browser and
   no way to reach the user — anything needing eyes, clicks or logins is yours.
 - Its final report arrives as a message mid-run; collect_agent(name) blocks
-  until it (or any helper) reports. Share artifacts through files under {home}.
+  until it (or any helper) reports. Share artifacts through files under {work}.
 - Delegate aggressively. The moment a task has two or more independent
   research targets, sources to cross-check, or file/data jobs that need no
   screen, spawn one helper per target and keep the desktop work yourself —
@@ -683,11 +698,12 @@ DELEGATE_CLASSIC = """Delegating — spawn_agent runs a helper agent in the back
 """
 
 
-def system_prompt(res: str, coords: str) -> str:
+def system_prompt(res: str, coords: str, cid: str = "") -> str:
     """The main agent's system prompt for the active mode."""
     orch = AGENT_ORCHESTRATE
+    work = workspace_dir(cid)
     return SYSTEM_PROMPT.format(
-        res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR,
+        res=res, cdp=CDP_PORT, coords=coords, home=HOME_DIR, work=work,
         role=ROLE_ORCHESTRATOR if orch else ROLE_CLASSIC,
         web=WEB_ORCHESTRATOR if orch else WEB_CLASSIC,
         textalt="a worker" if orch else "the text tools",
@@ -717,7 +733,8 @@ def system_prompt(res: str, coords: str) -> str:
                 "targets (a request in Danish asking for Danish prices → "
                 "DA/DK); never assume the server's locale."),
         delegate=(DELEGATE_ORCHESTRATOR if orch else DELEGATE_CLASSIC).format(
-            home=HOME_DIR, subcap=SUBAGENT_MAX_CONCURRENT,
+            home=HOME_DIR, work=work,
+            subcap=SUBAGENT_MAX_CONCURRENT,
             subtotal=SUBAGENT_MAX_TOTAL))
 
 
@@ -868,7 +885,7 @@ class AgentState:
         # ones a tool returned.
         self.url_fail_streak = 0
         # Tabs open before the run started — the user's; open_url never
-        # navigates those away (the cleanup sweep leaves them alone too).
+        # navigates those away.
         self.baseline_tabs: set[str] = set()
         # Last desktop_tree ref map: ref -> a11y path ("app|i,j,...").
         # Stale after any UI change — desktop_tree refreshes it.
@@ -911,8 +928,8 @@ class AgentState:
         # User messages sent while a run is active: {conv, text, files,
         # mode, seq}. "steer" entries inject into the running
         # conversation's context at the next step; "queue" entries are
-        # picked up when the run ends — same-conversation ones even before
-        # the end-of-run cleanup sweep.
+        # picked up when the run ends — same-conversation ones become the
+        # next turn while the desktop is still as the run left it.
         self.user_msgs = deque()
         # The running conversation's `plan` checklist (persisted at
         # <cid>.todos.json) and the long-horizon bookkeeping for reminders
@@ -1029,6 +1046,10 @@ def conv_create(model: str, title: str = "") -> dict:
             "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0}
     _write_meta(meta)
     _conv_paths(cid)[1].touch()
+    try:
+        workspace_dir(cid).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     return meta
 
 
@@ -1072,6 +1093,7 @@ def conv_delete(cid: str) -> bool:
         _todo_path(cid).unlink(missing_ok=True)
     except ValueError:
         pass
+    shutil.rmtree(workspace_dir(cid), ignore_errors=True)
     return True
 
 
@@ -2025,8 +2047,9 @@ def _run_command(command: str, headless: bool = False,
     if headless:
         # Subagent shell: no display, so GUI launches fail fast instead of
         # silently hijacking the screen the main agent is using. GUT_HELPER
-        # tags the whole process tree so the end-of-run sweep doesn't kill
-        # a still-working helper's processes (see _helper_claimed).
+        # tags the whole process tree so the boot sweep of a crashed run
+        # doesn't kill a still-working helper's processes (see
+        # _helper_claimed).
         env = {k: v for k, v in os.environ.items()
                if k not in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY")}
         if helper:
@@ -3099,6 +3122,7 @@ SCREEN_TOOLS = {
     "click", "mouse_move", "scroll", "type_text", "key", "run_command",
     "wait", "browser_click", "browser_type", "open_url", "focus_window",
     "desktop_act", "desktop_click", "desktop_type", "office_eval",
+    "janitor",
 }
 # The subset whose whole point is a visible effect. A run_command or
 # office_eval that leaves the screen as it was did its job in a file — an
@@ -3245,6 +3269,20 @@ TOOLS = [
                        "report. With no name, waits for the next one done.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "janitor",
+        "description": "Run a cleanup pass on the desktop — a helper that "
+                       "closes leftover windows, dialogs and browser tabs "
+                       "while you wait (it never deletes files, touches "
+                       "browser data, or logs out). Nothing is cleaned up "
+                       "for you between tasks, so call this when residue "
+                       "from earlier work is in your way. `focus` aims it, "
+                       "e.g. 'close every browser window'. Stray processes "
+                       "are yours — kill them with run_command.",
+        "parameters": {"type": "object", "properties": {
+            "focus": {"type": "string",
+                      "description": "what to close; empty = general "
+                                     "declutter"}}}}},
     {"type": "function", "function": {
         "name": "open_url",
         "description": "Open a URL in Chrome (launches it if needed) in your "
@@ -3416,7 +3454,8 @@ TOOLS = [
         "name": "send_message",
         "description": "Send a chat message to the user. Like a teammate: "
                        "milestones, blockers, things worth interrupting for — "
-                       "not step-by-step narration.",
+                       "not step-by-step narration. Doesn't end the task — "
+                       "call task_complete when done.",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"}}, "required": ["text"]}}},
     {"type": "function", "function": {
@@ -3739,15 +3778,21 @@ _UNSENT_SKIP_EXT = {".py", ".sh", ".js", ".ts", ".rb", ".pl", ".ps1", ".r",
 def unsent_outputs() -> list[Path]:
     """Files changed since the run started that were never sent back — the
     backstop for "agent saved a file but only told the user the path".
-    Uploads are scanned recursively; home, Desktop and Downloads only
-    shallowly so caches and app dirs don't count. Hidden names are skipped.
+    Uploads and the conversation's workspace are scanned recursively;
+    home, Desktop and Downloads only shallowly so caches and app dirs
+    don't count. Hidden names and worker dirs are skipped.
     """
     if not state.run_start:
         return []
+    ws = workspace_dir(state.conversation_id) \
+        if state.conversation_id else None
+    roots = [(UPLOAD_DIR, True), (HOME_DIR, False),
+             (HOME_DIR / "Desktop", False),
+             (HOME_DIR / "Downloads", False)]
+    if ws is not None:
+        roots.append((ws, True))
     seen, out = set(), []
-    for root, deep in ((UPLOAD_DIR, True), (HOME_DIR, False),
-                     (HOME_DIR / "Desktop", False),
-                     (HOME_DIR / "Downloads", False)):
+    for root, deep in roots:
         if not root.is_dir():
             continue
         try:
@@ -3755,9 +3800,12 @@ def unsent_outputs() -> list[Path]:
         except OSError:
             continue
         for p in paths:
-            if any(part.startswith(".")
-                   for part in p.relative_to(root).parts):
+            rel = p.relative_to(root)
+            if any(part.startswith(".") for part in rel.parts):
                 continue
+            if ws is not None and root == ws \
+                    and rel.parts and rel.parts[0] == "workers":
+                continue  # worker findings are intermediates, not output
             try:
                 rp = p.resolve()
                 if not rp.is_file() or rp.suffix.lower() in _UNSENT_SKIP_EXT:
@@ -3931,19 +3979,20 @@ async def update_todos(raw_items) -> str:
     # the workers' files when they exist, else a data file it must write
     # first so the deliverable's numbers have a single source.
     if build_started:
-        files = scratch_listing()
+        files = workspace_listing()
         if files:
             listing = "\n".join(f"  {f}" for f in files[:12])
             notes.append(
-                "→ build the deliverable from the workers' files, not "
-                "from reports or memory — have the build script read "
+                "→ build the deliverable from the files in the workspace, "
+                "not from reports or memory — have the build script read "
                 f"them:\n{listing}\nFigures typed from recall are how "
                 "invented values reach the deliverable.")
         elif state.evidence.get("research", 0):
             notes.append(
                 "→ this step builds on research that lives only in this "
                 "conversation — write the data the deliverable needs to a "
-                f"file first (JSON/CSV under {HOME_DIR}), then build from "
+                "file first (JSON/CSV under "
+                f"{workspace_dir(state.conversation_id)}), then build from "
                 "that file. Never type figures from memory.")
     out = ("checklist updated:\n"
            + (render_todos(state.todos) or "(empty — all steps done?)"))
@@ -4169,6 +4218,13 @@ async def execute_tool(name: str, args: dict,
                                  str(args.get("model", "")))
         elif name == "collect_agent":
             result = await collect_agent(str(args.get("name", "")))
+        elif name == "janitor":
+            if not GUT_CLEANUP:
+                result = "janitor is disabled (GUT_CLEANUP=off) — close " \
+                         "leftover windows yourself"
+            else:
+                result = await janitor_pass(
+                    state.conversation_id, str(args.get("focus") or ""))
         elif name == "ask_user":
             return await ask_user(str(args.get("question", ""))), False
         elif name == "plan":
@@ -4218,14 +4274,15 @@ async def execute_tool(name: str, args: dict,
                 # how URLs and decimals get dropped. Bounce once so the
                 # worker writes the records it already found.
                 entry = state.subagents.get(agent)
+                wdir = worker_dir(agent, (entry or {}).get("conv"))
                 summary = str(args.get("summary") or "")
                 if entry is not None and not entry.get("findings_nudge") \
                         and _REPORT_CLAIM_RE.search(summary) \
-                        and _findings_empty(worker_dir(agent)):
+                        and _findings_empty(wdir):
                     entry["findings_nudge"] = True
                     return ("your report cites figures/URLs but no "
                             "substantive findings file exists under "
-                            f"{worker_dir(agent)} — the file is the record "
+                            f"{wdir} — the file is the record "
                             "the orchestrator builds from, your report only "
                             "summarizes it. Write each finding to "
                             "findings.json as a JSON object (value, unit, "
@@ -5263,7 +5320,7 @@ def worker_footer(messages: list, workdir: Path, report: str = "") -> str:
     try:
         for p in sorted(workdir.iterdir()) if workdir.is_dir() else []:
             if p.is_file():
-                files.append(f"{p.relative_to(SCRATCH_DIR)} — "
+                files.append(f"{p.relative_to(HOME_DIR)} — "
                              f"{file_digest(p)}")
     except OSError:
         pass
@@ -5280,26 +5337,83 @@ def worker_footer(messages: list, workdir: Path, report: str = "") -> str:
     return foot
 
 
-def worker_dir(name: str) -> Path:
-    """Where a worker writes its findings — one dir per worker under
-    scratch, so the orchestrator's assembly script has a known place to
-    read from and the footer has a known place to list."""
-    return SCRATCH_DIR / name
+def workspace_dir(cid: str) -> Path:
+    """A conversation's persistent directory on the desktop — files here
+    survive between its tasks until the TTL janitor expires them."""
+    cid = re.sub(r"[^A-Za-z0-9_-]", "", str(cid or "")) or "shared"
+    return WORKSPACES_DIR / cid
 
 
-def scratch_listing() -> list[str]:
-    """Files workers left under ~/scratch — the on-disk record a build
-    step should assemble from rather than recalling figures."""
+def worker_dir(name: str, conv: str | None = None) -> Path:
+    """Where a worker writes its findings — one dir per worker under the
+    conversation's workspace, so the orchestrator's assembly script has a
+    known place to read from and the footer has a known place to list."""
+    return workspace_dir(conv or state.conversation_id) / "workers" / name
+
+
+def workspace_listing() -> list[str]:
+    """Files under the running conversation's workspace — the on-disk
+    record a build step should assemble from rather than recalling
+    figures."""
+    ws = workspace_dir(state.conversation_id)
     out = []
     try:
-        dirs = sorted(SCRATCH_DIR.iterdir()) if SCRATCH_DIR.is_dir() else []
-        for d in dirs:
-            if d.is_dir():
-                out += [str(p.relative_to(HOME_DIR))
-                        for p in sorted(d.iterdir()) if p.is_file()]
+        paths = sorted(ws.rglob("*")) if ws.is_dir() else []
     except OSError:
-        pass
+        return []
+    for p in paths:
+        rel = p.relative_to(ws)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if p.is_file():
+            out.append(str(p.relative_to(HOME_DIR)))
+        if len(out) >= 40:
+            break
     return out
+
+
+def sweep_old_workspaces() -> list[str]:
+    """Delete workspaces of conversations idle longer than the TTL — the
+    only place files are ever removed. A dir whose conversation meta is
+    gone ages by its own mtime; 0 days keeps everything forever."""
+    if WORKSPACE_TTL_DAYS <= 0:
+        return []
+    try:
+        dirs = [d for d in WORKSPACES_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return []
+    cutoff = time.time() - WORKSPACE_TTL_DAYS * 86400
+    dropped = []
+    for d in dirs:
+        if d.is_symlink():
+            continue
+        try:
+            meta = _read_meta(d.name)
+        except ValueError:
+            meta = None
+        try:
+            touched = float(meta.get("updated_at") or 0) if meta \
+                else d.stat().st_mtime
+        except (OSError, TypeError, ValueError):
+            continue
+        if touched < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+            dropped.append(d.name)
+    return dropped
+
+
+async def workspace_janitor() -> None:
+    """Hourly TTL sweep of per-conversation workspaces — an immediate pass
+    at boot catches dirs that expired while the daemon was down."""
+    while True:
+        try:
+            dropped = await asyncio.to_thread(sweep_old_workspaces)
+            if dropped:
+                print(f"[gut] workspace janitor expired {len(dropped)} "
+                      f"workspace(s): {', '.join(dropped)}")
+        except Exception as e:
+            print(f"[gut] workspace janitor failed: {e}")
+        await asyncio.sleep(3600)
 
 
 def spawn_agent(task: str, name: str = "", model: str = "") -> str:
@@ -5331,7 +5445,7 @@ def spawn_agent(task: str, name: str = "", model: str = "") -> str:
     model = model.strip() or SUBAGENT_MODEL or state.model
     # The goal rides inside the daemon's contract (SUBAGENT_TASK) — what
     # the worker must deliver and where is never left to the caller.
-    wd = worker_dir(name)
+    wd = worker_dir(name, state.conversation_id)
     prompt = SUBAGENT_TASK.format(goal=task, workdir=wd)
     state.spawned += 1
     entry = {"name": name, "desc": task[:200], "conv": state.conversation_id,
@@ -5380,7 +5494,7 @@ async def subagent_loop(name: str, task_text: str, model: str,
     usd0 = state.session_usd
     messages = [
         {"role": "system", "content": SUBAGENT_PROMPT.format(
-            home=HOME_DIR, name=name, workdir=worker_dir(name))},
+            home=HOME_DIR, name=name, workdir=worker_dir(name, conv_id))},
         {"role": "user", "content": task_text}]
     status, result = "done", "(ended without a report)"
     await broadcast_conv({"type": "subagent", "name": name,
@@ -5518,7 +5632,8 @@ async def subagent_loop(name: str, task_text: str, model: str,
         status, result = "error", f"helper error: {e}"
     entry["usd"] = round(state.session_usd - usd0, 6)
     if status == "done":
-        footer = worker_footer(messages, worker_dir(name), str(result))
+        footer = worker_footer(messages, worker_dir(name, conv_id),
+                               str(result))
         entry["footer"] = footer
         result = f"{result}\n{footer}"
     _wait_tick()  # the interval up to here was still spent on a live helper
@@ -5587,7 +5702,7 @@ async def drain_user_msgs(conv_id: str, messages: list, mode: str) -> bool:
     "steer" entries land mid-run at the next step boundary; "queue"
     entries are delivered when the run would otherwise finish — a
     follow-up the user typed while the agent was still working, picked up
-    before the end-of-run cleanup tears down what the run left behind.
+    while the desktop is still as the run left it.
     """
     delivered, kept = [], []
     while state.user_msgs:
@@ -5622,15 +5737,15 @@ async def drain_user_msgs(conv_id: str, messages: list, mode: str) -> bool:
     return True
 
 
-# ── Run cleanup ──────────────────────────────────────────────────────────────
-# End-of-run teardown — daemon-driven, never model-invoked. First a
-# deterministic sweep of whatever the run created: browser tabs (CDP target
-# diff), windows (wmctrl id diff) and processes (pid+starttime diff), plus a
-# wipe of ~/scratch. Then a bounded janitor LLM pass with a fresh context
-# cleans up residue the sweep can't enumerate (modal dialogs, wedged apps).
-# Cookies and logins persist — tabs are closed, the profile is never touched.
-# The baseline is persisted at run start so a daemon restart mid-run still
-# lets the next boot sweep that run's leftovers.
+# ── Run residue ────────────────────────────────────────────────────────────
+# Nothing is torn down when a run ends: windows, tabs, processes and files
+# stay as the agent left them — a follow-up turn (or a later conversation)
+# inherits the live desktop, and each conversation's workspace keeps its
+# files until the TTL janitor expires them. The baseline is still captured
+# and persisted at run start: the browser reuses non-baseline tabs, and a
+# daemon that dies mid-run lets the next boot sweep that run's leftovers.
+# Mid-run clutter is the agent's call — the janitor tool runs the cleanup
+# pass on demand. Cookies and logins always persist.
 
 def _snapshot_procs() -> dict[str, str]:
     """pid -> starttime for every process. Starttime (jiffies since boot)
@@ -5686,10 +5801,6 @@ def _boot_key() -> str:
 
 
 def capture_baseline() -> dict:
-    try:
-        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
     return {"started": time.time(), "boot": _boot_key(),
             "pids": _snapshot_procs(),
             "windows": _snapshot_windows(),
@@ -5774,8 +5885,9 @@ def _window_owners() -> dict[str, int]:
 
 def sweep_desktop(baseline: dict) -> dict:
     """Close tabs/windows and kill processes created since baseline — never
-    anything that predates the run or is desktop infrastructure."""
-    stats = {"tabs": 0, "windows": 0, "procs": 0, "scratch": 0}
+    anything that predates the run or is desktop infrastructure. Files are
+    never touched: this only runs for a crashed run's leftovers at boot."""
+    stats = {"tabs": 0, "windows": 0, "procs": 0}
 
     # Closing a tab never logs anyone out — cookies live in the profile.
     old_tabs = set(baseline.get("tabs") or [])
@@ -5828,17 +5940,6 @@ def sweep_desktop(baseline: dict) -> dict:
         for pid in new_procs():
             try:
                 os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-
-    if SCRATCH_DIR.is_dir():
-        for child in SCRATCH_DIR.iterdir():
-            try:
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
-                stats["scratch"] += 1
             except OSError:
                 pass
     return stats
@@ -5917,8 +6018,9 @@ def heal_desktop() -> list[str]:
 
 
 # The janitor gets desktop tools only — no run_command (too broad for an
-# unsupervised pass), no browser_* (tabs were just closed), no ask_user
-# (cleanup must never block) and no send_* (the wrap-up already went out).
+# unsupervised pass), no browser_* (it closes windows, not tabs in place),
+# no ask_user (cleanup must never block) and no send_* (the caller owns
+# the conversation).
 JANITOR_NAME = "janitor"
 JANITOR_TOOL_NAMES = {
     "screenshot", "wait", "list_windows", "focus_window", "click",
@@ -5928,14 +6030,16 @@ JANITOR_TOOL_NAMES = {
 JANITOR_TOOLS = [t for t in TOOLS
                  if t["function"]["name"] in JANITOR_TOOL_NAMES]
 
-JANITOR_PROMPT = """You are the cleanup pass on a Gut Linux desktop ({res}). \
-The task that was running just ended; an automatic sweep already closed the \
-apps, windows and browser tabs it tracked. Look at the screen and the window \
-list — if something the task left behind is still open (dialogs, save or \
-discard prompts, stray windows), close it. Escape or alt-F4 for dialogs.
+JANITOR_PROMPT = """You are the cleanup janitor on a Gut Linux desktop ({res}). \
+The main agent called you to declutter the screen while it waits — it keeps \
+working after you finish, so close only what is leftover residue, never \
+apps that look in use. Look at the screen and the window list: stray \
+windows, dialogs, save/discard prompts, browser windows nobody needs. \
+Escape or alt-F4 for dialogs.
 
 Rules:
-- Discard unsaved work when asked — deliverables were already sent to the user.
+- When a closing app asks about unsaved work, discard — anything that \
+matters is already on disk.
 - Never delete files, clear browser data, or log out of anything.
 - Leave the panels, wallpaper and desktop icons alone — never click power,
   session, "Log Out" or "Shut Down" controls (including the panel's corner
@@ -5946,23 +6050,19 @@ task_complete with a one-line summary of what you closed.
 """
 
 
-async def janitor_pass(conv_id: str) -> str:
-    """Bounded post-sweep tidy with a fresh context — its chatter never
+async def janitor_pass(conv_id: str, focus: str = "") -> str:
+    """Bounded on-demand tidy with a fresh context — its chatter never
     touches the conversation's model context."""
-    # JANITOR_MODEL runs cleanup on a cheaper vision model: swap state.model
-    # for the pass so cache_friendly() and the coordinate convention match
-    # the model actually answering. cleanup_after_run restores it.
-    prev_model = state.model
-    if JANITOR_MODEL:
-        state.model = JANITOR_MODEL
     try:
         res = "%dx%d" % tuple(pyautogui.size())
     except Exception:
         res = RESOLUTION
     wins = await asyncio.to_thread(list_windows)
     content = [{"type": "text", "text":
-                f"Open windows:\n{wins}\n\nClose whatever is left, then call "
-                "task_complete."}]
+                (f"The caller asked for this specifically: {focus} — "
+                 "close only that.\n\n" if focus else "")
+                + f"Open windows:\n{wins}\n\nClose whatever is residue, "
+                  "then call task_complete."}]
     try:
         shot = screenshot_block(force=True)
     except Exception:
@@ -5972,6 +6072,12 @@ async def janitor_pass(conv_id: str) -> str:
     messages = [
         {"role": "system", "content": JANITOR_PROMPT.format(res=res)},
         {"role": "user", "content": content}]
+    # JANITOR_MODEL runs cleanup on a cheaper vision model: swap state.model
+    # for the pass so cache_friendly() and the coordinate convention match
+    # the model actually answering. The finally restores it even on a crash.
+    prev_model = state.model
+    if JANITOR_MODEL:
+        state.model = JANITOR_MODEL
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(300, connect=30)) as http:
@@ -6044,50 +6150,9 @@ async def janitor_pass(conv_id: str) -> str:
                         c.append(shot)
     except Exception as e:
         return f"janitor error: {e}"
-    return f"hit the {JANITOR_MAX_STEPS}-step cap"
-
-
-async def cleanup_after_run(conv_id: str, baseline: dict | None,
-                            janitor: bool = True) -> None:
-    """Sweep what the run created, then let the janitor handle residue, then
-    sweep once more for anything the janitor itself opened."""
-    try:
-        if not GUT_CLEANUP:
-            return
-        stats = (await asyncio.to_thread(sweep_desktop, baseline)
-                 if baseline else
-                 {"tabs": 0, "windows": 0, "procs": 0, "scratch": 0})
-        parts = [f"{stats[k]} {label}" for k, label in (
-            ("tabs", "tabs"), ("windows", "windows"),
-            ("procs", "processes"), ("scratch", "scratch items"))
-            if stats[k]]
-        report = ""
-        if janitor:
-            await broadcast({"type": "status", "state": "cleanup",
-                             "model": state.model,
-                             "run_started": state.run_start,
-                             "conversation_id": conv_id})
-            # janitor_pass swaps state.model to JANITOR_MODEL for the pass;
-            # restore whatever the conversation was using.
-            prev_model = state.model
-            report = await janitor_pass(conv_id)
-            state.model = prev_model
-            if baseline:
-                await asyncio.to_thread(sweep_desktop, baseline)
-        revived = await asyncio.to_thread(heal_desktop)
-        text = "tidy-up"
-        if parts:
-            text += ": closed " + ", ".join(parts)
-        if report:
-            text += f" — janitor: {report}"
-        if revived:
-            text += " — restarted " + ", ".join(revived)
-        if parts or report or revived:
-            await broadcast({"type": "cleanup", "text": text})
-    except Exception as e:
-        print(f"[gut] cleanup failed: {e}")
     finally:
-        _persist_baseline(None)
+        state.model = prev_model
+    return f"hit the {JANITOR_MAX_STEPS}-step cap"
 
 
 async def agent_loop(conv_id: str, task_text: str,
@@ -6109,26 +6174,30 @@ async def agent_loop(conv_id: str, task_text: str,
     state.escalated = False
     run_usd0 = state.session_usd  # session spend baseline for AGENT_MAX_USD
     # One try wraps setup AND the step loop: a crash anywhere in the run is
-    # reported by the except below, then the finally cleans up and drops
-    # status to idle. A failed task must never just go quiet — or sit on
-    # "running" — with no explanation for the user.
+    # reported by the except below, then the finally drops status to idle.
+    # A failed task must never just go quiet — or sit on "running" — with
+    # no explanation for the user.
     baseline = None
     messages: list[dict] = []
     try:
-        # Snapshot the desktop before the run touches it — the end-of-run
-        # sweep only removes what appears after this point, so user-opened
-        # windows and tabs survive. Persisted so a crash mid-run still
-        # cleans up at boot.
+        # Snapshot the desktop before the run touches it — the browser only
+        # reuses non-baseline tabs, and the persisted baseline lets the next
+        # boot sweep this run's leftovers if the daemon dies mid-run.
         baseline = await asyncio.to_thread(capture_baseline)
         state.baseline_tabs = set(baseline.get("tabs") or [])
         if GUT_CLEANUP:
             await asyncio.to_thread(_persist_baseline, baseline)
+        try:
+            workspace_dir(conv_id).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         await broadcast({"type": "status", "state": "running",
                          "model": state.model,
                          "run_started": state.run_start,
                          "conversation_id": conv_id})
-        # A revisited conversation resumes its own stored context; a fresh
-        # one starts from just the system prompt.
+        # A revisited conversation resumes its own stored context — but its
+        # system prompt is regenerated every run, so the workspace path,
+        # screen size and tool notes always reflect now, not the first run.
         # The client resizes the display to fit its pane, so RESOLUTION (the
         # Xvfb startup size / max) may be stale — report the live screen size.
         try:
@@ -6136,8 +6205,13 @@ async def agent_loop(conv_id: str, task_text: str,
         except Exception:
             res = RESOLUTION
         coords = coord_prompt_for(state.model)
-        messages = conv_load_context(conv_id) or [
-            {"role": "system", "content": system_prompt(res, coords)}]
+        messages = conv_load_context(conv_id) or []
+        sysmsg = {"role": "system",
+                  "content": system_prompt(res, coords, conv_id)}
+        if messages and messages[0].get("role") == "system":
+            messages[0] = sysmsg
+        else:
+            messages.insert(0, sysmsg)
         sanitize_context(messages)
         content = [{"type": "text", "text": task_text}]
         # Attached images go inline so the model sees them directly; other
@@ -6179,8 +6253,8 @@ async def agent_loop(conv_id: str, task_text: str,
                     break
                 if done:
                     # A follow-up the user queued while the agent worked
-                    # becomes the next turn here — ahead of the end-of-run
-                    # cleanup, so the desktop is still as the run left it.
+                    # becomes the next turn here — the desktop is still as
+                    # the run left it, nothing was torn down.
                     if await drain_user_msgs(conv_id, messages, "queue"):
                         done = False
                         continue
@@ -6629,9 +6703,18 @@ async def agent_loop(conv_id: str, task_text: str,
                 await asyncio.to_thread(conv_save_context, conv_id, messages)
             except Exception as e:
                 print(f"[gut] context save failed: {e}")
-        # The sweep runs on every exit path; the janitor only on natural
-        # endings — an explicit stop hands the desktop back as-is.
-        await cleanup_after_run(conv_id, baseline, janitor=not state.stop)
+        # Nothing is torn down at run end — the next turn inherits the
+        # desktop as-is. Clear the persisted baseline so the boot sweep
+        # doesn't mistake a finished run's leftovers for a crash's, and
+        # heal any desktop component the run managed to kill.
+        await asyncio.to_thread(_persist_baseline, None)
+        try:
+            revived = await asyncio.to_thread(heal_desktop)
+            if revived:
+                await broadcast({"type": "cleanup",
+                                 "text": "restarted " + ", ".join(revived)})
+        except Exception as e:
+            print(f"[gut] desktop heal failed: {e}")
         await broadcast({"type": "status", "state": "idle",
                          "model": state.model, "conversation_id": None})
         await push_cost()
@@ -6686,7 +6769,7 @@ async def handle_client_msg(ws: WebSocket, msg: dict) -> None:
             # queues instead of starting. "steer" is injected into the
             # running conversation's context at the next step; anything
             # else is picked up when the run ends — same-conversation
-            # entries even before the cleanup sweep.
+            # entries become the next turn with the desktop untouched.
             steer = bool(msg.get("steer")) and cid == state.conversation_id
             seq = conv_append_event(cid, event)
             await broadcast({**event, "conversation_id": cid, "seq": seq,
@@ -6895,8 +6978,9 @@ async def lifespan(_app: FastAPI):
         CONV_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         print(f"[gut] conversation dir {CONV_DIR} unavailable: {e}")
-    # A leftover run-state file means the previous run died before its
-    # end-of-run cleanup — sweep what it left before taking new work.
+    # A leftover run-state file means the daemon died mid-run — sweep the
+    # dead run's windows, tabs and processes (never files) before taking
+    # new work.
     try:
         stale = json.loads(RUN_STATE_FILE.read_text())
     except (OSError, json.JSONDecodeError):
@@ -6936,11 +7020,13 @@ async def lifespan(_app: FastAPI):
             mux_srvs = []
     state.litellm_key = await provision_key()
     sync_task = asyncio.create_task(model_sync_loop())
+    janitor_task = asyncio.create_task(workspace_janitor())
     print(f"[gut] agent ready, model={state.model}")
     try:
         yield
     finally:
         sync_task.cancel()
+        janitor_task.cancel()
         if tls_srv:
             tls_srv.close()
         for srv in mux_srvs:
