@@ -76,6 +76,7 @@ CONFIG_GLOBALS = {
     "AGENT_VERIFY_MIN_CALLS": "VERIFY_MIN_CALLS",
     "AGENT_VERIFY_INPUT_CHARS": "VERIFY_INPUT_CHARS",
     "AGENT_VERIFY_RESULT_CHARS": "VERIFY_RESULT_CHARS",
+    "AGENT_VERIFY_REPORT_CHARS": "VERIFY_REPORT_CHARS",
     "SCREENSHOT_AUTO_PIXELS": "SHOT_AUTO_PIXELS",
     "GUT_UNO_PORT": "UNO_PORT",
 }
@@ -88,6 +89,7 @@ CONFIG_KEYS = frozenset(CONFIG_GLOBALS) | frozenset({
     "AGENT_MAX_USD", "TOOL_RESULT_HISTORY", "TOOL_RESULT_STUB_CHARS",
     "SCREENSHOT_MAX_EDGE", "SCREENSHOT_MAX_PIXELS", "SCREENSHOT_HISTORY",
     "TODO_REMIND_STEPS", "TODO_NUDGE_STEPS", "TODO_MAX_ITEMS",
+    "AGENT_NOTES_MAX", "AGENT_NOTE_CHARS", "AGENT_NOTES_REMIND",
     "ACTION_SETTLE_SECS", "INTER_ACTION_DELAY",
     "CLICK_A11Y", "CLICK_SNAP_PX", "NORMALIZED_COORD_MODELS",
     "LLM_MAX_RETRIES", "ASK_USER_TIMEOUT", "COMMAND_TIMEOUT",
@@ -223,6 +225,12 @@ VERIFY_MIN_CALLS = int(os.environ.get("AGENT_VERIFY_MIN_CALLS", "4"))
 # the claims under review gather at both ends (early research, late writes).
 VERIFY_INPUT_CHARS = int(os.environ.get("AGENT_VERIFY_INPUT_CHARS", "120000"))
 VERIFY_RESULT_CHARS = int(os.environ.get("AGENT_VERIFY_RESULT_CHARS", "400"))
+# Worker reports reach the checker verbatim under their own budget —
+# their transcript copies get stubbed by pruning or sliced by the
+# ledger's per-line cap, and a report's figures and source URLs tend
+# to sit in the tail, so claims resting on them were unverifiable.
+VERIFY_REPORT_CHARS = int(os.environ.get("AGENT_VERIFY_REPORT_CHARS",
+                                         "40000"))
 # Long-horizon support. When a request's prompt_tokens exceed
 # AGENT_COMPACT_RATIO of the model's usable context window (max_input_tokens
 # from LiteLLM's /model/info, capped by MODEL_CONTEXT_LIMITS;
@@ -246,6 +254,18 @@ MODEL_CONTEXT_LIMITS = os.environ.get("MODEL_CONTEXT_LIMITS", "")
 TODO_REMIND_STEPS = int(os.environ.get("TODO_REMIND_STEPS", "20"))
 TODO_NUDGE_STEPS = int(os.environ.get("TODO_NUDGE_STEPS", "10"))
 TODO_MAX_ITEMS = int(os.environ.get("TODO_MAX_ITEMS", "30"))
+# The `remember` store: short facts the model must not lose, persisted per
+# conversation and replayed into the compaction handoff verbatim — the
+# channel for "jot this down" that a file under ~ can't guarantee (the
+# model has to remember the file exists; notes get re-injected). Caps keep
+# it a fact list, not a data dump — bulk data belongs in files.
+NOTES_MAX = int(os.environ.get("AGENT_NOTES_MAX", "40"))
+NOTE_MAX_CHARS = int(os.environ.get("AGENT_NOTE_CHARS", "400"))
+# Steps between re-injections of the remembered-notes list — the tool
+# results that created them get stubbed by prune_tool_results, so a long
+# run recaps them periodically rather than leaving recall to the next
+# compaction (the handoff replays them after).
+NOTES_REMIND_STEPS = int(os.environ.get("AGENT_NOTES_REMIND", "30"))
 # Consecutive turns of exactly one research call (web_search/fetch_url)
 # before the "parallelize or delegate" nudge rides the next tool result —
 # serial research is how a five-minute job turns into 50 billed turns.
@@ -532,9 +552,11 @@ Planning — match the effort to the task:
   user watches both live. If the scope changes, call plan again with a
   new summary and list.
 - On very long runs your older context gets compacted into a handoff
-  summary — the checklist always survives it. Anything else worth keeping
-  (paths, URLs, decisions, findings) belongs in the todo text or in files
-  under {home}.
+  summary — the checklist and your remembered notes always survive it.
+  When you learn something the rest of the task needs (a path, URL,
+  decision, key figure), call remember the moment you learn it — don't
+  trust it to survive in scrollback. Anything else worth keeping belongs
+  in the todo text or in files under {home}.
 
 Accuracy — never fabricate:
 - Facts that end up in a deliverable (prices, dates, names, statistics,
@@ -858,6 +880,18 @@ class AgentState:
         self.session_usd = 0.0
         self.tokens_in = 0
         self.tokens_out = 0
+        self.tok_out0 = 0  # output-token baseline at run start (run tok/s)
+        # Wait-time partition for the end-of-run stats line: in-flight
+        # call counts, and the run's wall clock split into what it was
+        # waiting on — a model reply (any agent's — helpers included), a
+        # web_search, or a still-running helper while nothing else is in
+        # flight (the main loop blocked in collect_agent). Everything else
+        # — tool exec, pauses, waiting on the user — lands in "other".
+        self.llm_inflight = 0
+        self.search_inflight = 0
+        self.wait_parts = {"model": 0.0, "search": 0.0,
+                           "helper": 0.0, "other": 0.0}
+        self.wait_since = 0.0  # monotonic clock of the last transition
         self.models_synced = False  # provider keys pushed into LiteLLM
         self.escalated = False  # run already switched to ESCALATION_MODEL
         # Background helpers: name -> {task, desc, conv, status, result,
@@ -865,6 +899,12 @@ class AgentState:
         # subagent_inbox for injection into their conversation's context.
         self.subagents: dict[str, dict] = {}
         self.subagent_inbox = deque()
+        # Full worker report text for the wrap-up audit: the copies that
+        # reach the transcript get stubbed by prune_tool_results or
+        # sliced by the ledger's per-line cap, and spawn_agent's GC drops
+        # delivered entries — so the checker's evidence lives here.
+        # name -> {conv, text}; FIFO-bounded.
+        self.subagent_reports: dict[str, dict] = {}
         # User messages sent while a run is active: {conv, text, files,
         # mode, seq}. "steer" entries inject into the running
         # conversation's context at the next step; "queue" entries are
@@ -875,6 +915,10 @@ class AgentState:
         # <cid>.todos.json) and the long-horizon bookkeeping for reminders
         # and compaction.
         self.todos: list[dict] = []
+        # The `remember` store — facts the model jotted down (persisted at
+        # <cid>.notes.json, replayed into the compaction handoff).
+        self.notes: list[str] = []
+        self.steps_since_notes = 0  # steps since the list was last shown
         self.plan_shared = False
         self.steps_since_todo = 0
         # Consecutive turns that were exactly one research call — batched
@@ -1012,7 +1056,8 @@ def conv_get(cid: str) -> dict | None:
                 events.append(json.loads(line))
     except (OSError, json.JSONDecodeError):
         pass
-    return {"meta": meta, "events": events, "todos": conv_load_todos(cid)}
+    return {"meta": meta, "events": events, "todos": conv_load_todos(cid),
+            "notes": conv_load_notes(cid)}
 
 
 def conv_delete(cid: str) -> bool:
@@ -1136,6 +1181,31 @@ def conv_save_todos(cid: str, items: list[dict]) -> None:
         tmp.replace(p)
     except (OSError, ValueError) as e:
         print(f"[gut] todos save failed for {cid}: {e}")
+
+
+def _notes_path(cid: str) -> Path:
+    if not _CID_RE.fullmatch(cid or ""):
+        raise ValueError(f"bad conversation id: {cid!r}")
+    return CONV_DIR / f"{cid}.notes.json"
+
+
+def conv_load_notes(cid: str) -> list[str]:
+    try:
+        items = json.loads(_notes_path(cid).read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    return [str(i) for i in items if str(i).strip()] \
+        if isinstance(items, list) else []
+
+
+def conv_save_notes(cid: str, items: list[str]) -> None:
+    try:
+        p = _notes_path(cid)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items))
+        tmp.replace(p)
+    except (OSError, ValueError) as e:
+        print(f"[gut] notes save failed for {cid}: {e}")
 
 
 def conv_ctx_estimate(cid: str, meta: dict) -> dict:
@@ -1308,6 +1378,48 @@ async def push_cost() -> None:
     await broadcast(msg)
 
 
+# ── Run-time accounting ──────────────────────────────────────────────────────
+# The stats footer under a finished run splits its wall clock into what it
+# spent waiting on. _wait_tick() runs just BEFORE every in-flight transition
+# (a model call or search starting/ending, a helper starting/finishing) and
+# banks the elapsed interval under whichever wait owned it — model first,
+# then search, then a still-running helper, else "other".
+
+def _wait_tick() -> None:
+    now = time.monotonic()
+    since, state.wait_since = state.wait_since, now
+    if not since:  # first tick ever — no interval to attribute
+        return
+    dt = now - since
+    if dt <= 0:
+        return
+    if state.llm_inflight:
+        bucket = "model"
+    elif state.search_inflight:
+        bucket = "search"
+    elif any(e["status"] == "running" for e in state.subagents.values()):
+        bucket = "helper"
+    else:
+        bucket = "other"
+    state.wait_parts[bucket] += dt
+
+
+def run_stats() -> dict:
+    """Snapshot the run's wait split for the `done` footer: tok/s over
+    model-generating seconds only — wall time waiting on searches, helpers
+    or the user doesn't dilute it — plus the four buckets the bar shows.
+    Helpers' calls and tokens count: while they run, agents are running."""
+    _wait_tick()
+    parts = {k: round(v, 1) for k, v in state.wait_parts.items()}
+    model_s = state.wait_parts["model"]
+    out = max(0, state.tokens_out - state.tok_out0)
+    return {"tok_s": round(out / model_s, 1) if model_s > 0.05 else 0.0,
+            "tokens_out": out,
+            "model_s": parts["model"], "search_s": parts["search"],
+            "helper_s": parts["helper"], "other_s": parts["other"],
+            "total_s": round(sum(state.wait_parts.values()), 1)}
+
+
 # ── Provider keys (BYOK) ─────────────────────────────────────────────────────
 # Model provider keys reach the daemon two ways:
 #   * env vars on this process — compose's shared .env, or the deb's
@@ -1399,7 +1511,7 @@ def effective_provider_keys() -> dict:
 # signal is 'clip' in details.families (the vision encoder it bundles into
 # multimodal models); an OpenAI-compatible /models has no such field.
 VISION_NAME_RE = re.compile(
-    r"llava|moondream|minicpm-v|qwen[\d.]*-?vl|vision|gemma3|"
+    r"llava|moondream|minicpm-v|qwen[\d.]*-?vl|vision|gemma[ -]?[3-9](?![ -]?1b)|"
     r"mistral-small|granite|bakllava", re.I)
 
 
@@ -1648,7 +1760,7 @@ async def model_sync_loop() -> None:
 TRANSCRIPT_TYPES = frozenset({
     "user", "agent_msg", "done", "file", "image",
     "thought", "action", "action_result", "question", "error",
-    "subagent", "cleanup", "plan", "compact"})
+    "subagent", "cleanup", "plan", "compact", "verify"})
 
 
 def record_event(msg: dict) -> None:
@@ -2775,78 +2887,84 @@ async def web_search(query: str, max_results: int = 8,
     if not query:
         return ("empty or garbled query — if you sent non-ASCII it arrived "
                 "as control characters; resend with plain UTF-8")
-    n = max(1, min(int(max_results or 8), 15))
-    lang = (lang or SEARCH_LANG).strip().upper()
-    region = (region or SEARCH_REGION).strip().upper()
-    results, backend = [], ""
-    openserp_failed = False
+    _wait_tick()
+    state.search_inflight += 1
     try:
-        results, backend = await _api_search(query, n, lang, region)
-    except Exception as e:
-        print(f"[gut] api search failed: {type(e).__name__} {e}")
-    if not results and OPENSERP_URL:
-        # /mega/search fans out to the listed engines and merges+dedupes
-        # — per-engine blocks (CAPTCHA, rate limits) don't sink the query.
-        # A 502 means every engine failed at once (usually transient
-        # rate-limiting), so retry once before falling back to DDG — the
-        # caller's own requery with different terms is the better retry.
-        # The semaphore bounds daemon-wide concurrency: openserp spawns a
-        # Chrome per query, and a batch of workers each firing multi-query
-        # searches at once is exactly what 502s a small instance.
-        params: dict = {"text": query, "limit": n,
-                        "engines": _openserp_engines(lang)}
-        if lang:
-            params["lang"] = lang
-        if region:
-            params["region"] = region
-        for attempt in range(2):
-            try:
-                async with _search_sem():
-                    async with httpx.AsyncClient(timeout=25) as c:
-                        r = await c.get(f"{OPENSERP_URL}/mega/search",
-                                        params=params)
-                if r.status_code == 200:
-                    results = [{"title": str(it.get("title", "")),
-                                "url": str(it.get("url", "")),
-                                "snippet": str(it.get("snippet") or "")}
-                               for it in r.json().get("results", [])]
-                    backend = "openserp"
-                    break
-                openserp_failed = True
-                print(f"[gut] openserp search HTTP {r.status_code}: "
-                      f"{r.text[:200]}")
-            except Exception as e:
-                openserp_failed = True
-                # httpx timeout exceptions stringify to "" — log the class
-                # so a hung openserp isn't indistinguishable from a 502.
-                print(f"[gut] openserp search failed: "
-                      f"{type(e).__name__} {e}")
-            if attempt == 0:
-                await asyncio.sleep(2)
-    if not results:
+        n = max(1, min(int(max_results or 8), 15))
+        lang = (lang or SEARCH_LANG).strip().upper()
+        region = (region or SEARCH_REGION).strip().upper()
+        results, backend = [], ""
+        openserp_failed = False
         try:
-            results, backend = await _ddg_search(query, lang, region), \
-                "duckduckgo"
-        except _SearchBlocked:
-            print(f"[gut] duckduckgo anti-bot challenge — query '{query}'")
-            out = ("search is blocked: duckduckgo served an anti-bot "
-                   "challenge"
-                   + (" and openserp is failing" if openserp_failed else "")
-                   + " — rephrasing won't help; fetch known pages directly "
-                     "with fetch_url (browser tools if you have them)")
-            return _mangled_note(out, mangled)
+            results, backend = await _api_search(query, n, lang, region)
         except Exception as e:
-            out = f"search failed ({e}) — use the browser tools instead"
-            return _mangled_note(out, mangled)
-    if not results:
-        out = ("no results — try rephrasing, a different lang/region, or "
-               "fetch a known page directly with fetch_url")
-    else:
-        lines = [f"{i}. {r['title']}\n   {r['url']}"
-                 + (f"\n   {r['snippet']}" if r["snippet"] else "")
-                 for i, r in enumerate(results[:n], 1)]
-        out = f"results for '{query}' via {backend}:\n" + "\n".join(lines)
-    return _mangled_note(out, mangled)
+            print(f"[gut] api search failed: {type(e).__name__} {e}")
+        if not results and OPENSERP_URL:
+            # /mega/search fans out to the listed engines and merges+dedupes
+            # — per-engine blocks (CAPTCHA, rate limits) don't sink the query.
+            # A 502 means every engine failed at once (usually transient
+            # rate-limiting), so retry once before falling back to DDG — the
+            # caller's own requery with different terms is the better retry.
+            # The semaphore bounds daemon-wide concurrency: openserp spawns a
+            # Chrome per query, and a batch of workers each firing multi-query
+            # searches at once is exactly what 502s a small instance.
+            params: dict = {"text": query, "limit": n,
+                            "engines": _openserp_engines(lang)}
+            if lang:
+                params["lang"] = lang
+            if region:
+                params["region"] = region
+            for attempt in range(2):
+                try:
+                    async with _search_sem():
+                        async with httpx.AsyncClient(timeout=25) as c:
+                            r = await c.get(f"{OPENSERP_URL}/mega/search",
+                                            params=params)
+                    if r.status_code == 200:
+                        results = [{"title": str(it.get("title", "")),
+                                    "url": str(it.get("url", "")),
+                                    "snippet": str(it.get("snippet") or "")}
+                                   for it in r.json().get("results", [])]
+                        backend = "openserp"
+                        break
+                    openserp_failed = True
+                    print(f"[gut] openserp search HTTP {r.status_code}: "
+                          f"{r.text[:200]}")
+                except Exception as e:
+                    openserp_failed = True
+                    # httpx timeout exceptions stringify to "" — log the class
+                    # so a hung openserp isn't indistinguishable from a 502.
+                    print(f"[gut] openserp search failed: "
+                          f"{type(e).__name__} {e}")
+                if attempt == 0:
+                    await asyncio.sleep(2)
+        if not results:
+            try:
+                results, backend = await _ddg_search(query, lang, region), \
+                    "duckduckgo"
+            except _SearchBlocked:
+                print(f"[gut] duckduckgo anti-bot challenge — query '{query}'")
+                out = ("search is blocked: duckduckgo served an anti-bot "
+                       "challenge"
+                       + (" and openserp is failing" if openserp_failed else "")
+                       + " — rephrasing won't help; fetch known pages directly "
+                         "with fetch_url (browser tools if you have them)")
+                return _mangled_note(out, mangled)
+            except Exception as e:
+                out = f"search failed ({e}) — use the browser tools instead"
+                return _mangled_note(out, mangled)
+        if not results:
+            out = ("no results — try rephrasing, a different lang/region, or "
+                   "fetch a known page directly with fetch_url")
+        else:
+            lines = [f"{i}. {r['title']}\n   {r['url']}"
+                     + (f"\n   {r['snippet']}" if r["snippet"] else "")
+                     for i, r in enumerate(results[:n], 1)]
+            out = f"results for '{query}' via {backend}:\n" + "\n".join(lines)
+        return _mangled_note(out, mangled)
+    finally:
+        _wait_tick()
+        state.search_inflight -= 1
 
 
 def _mangled_note(out: str, mangled: bool) -> str:
@@ -3033,6 +3151,25 @@ TOOLS = [
                                             "call needing no tool"}},
                 "required": ["content", "status"]}}},
             "required": ["steps"]}}},
+    {"type": "function", "function": {
+        "name": "remember",
+        "description": "Jot down a fact you must not lose — a path, URL, "
+                       "decision, credential location, key figure the rest "
+                       "of the task needs. Notes are stored verbatim, "
+                       "survive context compaction (replayed into the "
+                       "handoff) and last the whole conversation — "
+                       "anything important goes here the moment you learn "
+                       "it, not when context runs out. One line per fact, "
+                       "self-contained. For bulk data (tables, research "
+                       "records) write a file instead — this is a fact "
+                       "list, not a dataset. `forget` drops notes "
+                       "containing its text (corrections, stale facts).",
+        "parameters": {"type": "object", "properties": {
+            "note": {"type": "string",
+                     "description": "the fact to store"},
+            "forget": {"type": "string",
+                       "description": "remove stored notes containing "
+                                      "this text"}}}}},
     {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the web — returns numbered results with title, "
@@ -3741,6 +3878,7 @@ async def update_todos(raw_items) -> str:
     # a reworded or new step counts from the last plan call.
     prev = {_norm_step(i["content"]): i for i in state.todos}
     held: list[dict] = []
+    build_started = False
     for it in items:
         key = _norm_step(it["content"])
         before = prev.get(key)
@@ -3752,6 +3890,7 @@ async def update_todos(raw_items) -> str:
                 held.append(it)
         if it["status"] == "in_progress" and was != "in_progress":
             state.step_marks[key] = dict(state.evidence)
+            build_started = build_started or it["kind"] == "build"
     if held:
         state.gate_bounces += 1
         for it in held:
@@ -3783,9 +3922,84 @@ async def update_todos(raw_items) -> str:
                      "running: spawn_agent one now with that step's target "
                      "as its goal (several independent research steps → "
                      "several workers at once), then collect_agent.")
+    # A build step starting on researched data: the figures it needs are
+    # the easiest thing for the model to "recall" instead of read back —
+    # that's the invented-values failure. Point it at the on-disk record:
+    # the workers' files when they exist, else a data file it must write
+    # first so the deliverable's numbers have a single source.
+    if build_started:
+        files = scratch_listing()
+        if files:
+            listing = "\n".join(f"  {f}" for f in files[:12])
+            notes.append(
+                "→ build the deliverable from the workers' files, not "
+                "from reports or memory — have the build script read "
+                f"them:\n{listing}\nFigures typed from recall are how "
+                "invented values reach the deliverable.")
+        elif state.evidence.get("research", 0):
+            notes.append(
+                "→ this step builds on research that lives only in this "
+                "conversation — write the data the deliverable needs to a "
+                f"file first (JSON/CSV under {HOME_DIR}), then build from "
+                "that file. Never type figures from memory.")
     out = ("checklist updated:\n"
            + (render_todos(state.todos) or "(empty — all steps done?)"))
     return out + ("\n" + "\n".join(notes) if notes else "")
+
+
+def render_notes() -> str:
+    return "\n".join(f"{i}. {n}" for i, n in enumerate(state.notes, 1))
+
+
+def update_notes(args: dict) -> str:
+    """Add to / prune the conversation's remembered facts — the `remember`
+    store. Kept verbatim in `state.notes`, persisted next to the context
+    and replayed into the compaction handoff, so unlike a file the model
+    can't lose track of it and unlike context it can't be summarized away.
+    """
+    note = str(args.get("note") or "").strip()
+    forget = str(args.get("forget") or "").strip()
+    if not note and not forget:
+        return ("nothing to do — pass `note` to store a fact or `forget` "
+                "to remove one" +
+                (f"\n\nremembered ({len(state.notes)}):\n{render_notes()}"
+                 if state.notes else ""))
+    if forget:
+        before = len(state.notes)
+        state.notes = [n for n in state.notes
+                       if forget.lower() not in n.lower()]
+        dropped = before - len(state.notes)
+    else:
+        dropped = 0
+    err = None
+    if note:
+        if len(note) > NOTE_MAX_CHARS:
+            err = (f"note too long ({len(note)} chars, max "
+                   f"{NOTE_MAX_CHARS}) — keep it to one self-contained "
+                   "fact; bulk data goes in a file")
+        elif len(state.notes) >= NOTES_MAX:
+            err = (f"the note list is full ({NOTES_MAX}) — `forget` "
+                   "something stale first")
+        elif any(note.lower() == n.lower() for n in state.notes):
+            err = "already noted"
+        else:
+            state.notes.append(note)
+            state.steps_since_notes = 0  # the result just showed the list
+    if state.conversation_id:
+        conv_save_notes(state.conversation_id, state.notes)
+    out = []
+    if dropped:
+        out.append(f"forgot {dropped} note(s)")
+    if note and not err:
+        out.append("remembered")
+    if err:
+        out.append(err)
+    if state.notes:
+        out.append(f"remembered notes ({len(state.notes)}):\n"
+                   + render_notes())
+    else:
+        out.append("no notes stored")
+    return "\n".join(out)
 
 
 async def execute_tool(name: str, args: dict,
@@ -3967,6 +4181,8 @@ async def execute_tool(name: str, args: dict,
                 return "empty plan — pass `steps` (and `summary`)", False
             if summary:
                 result = "plan shared with the user; " + result
+        elif name == "remember":
+            result = update_notes(args)
         elif name == "task_complete":
             undone = ([i for i in state.todos if i.get("status") != "done"]
                       if agent is None else [])
@@ -4505,35 +4721,41 @@ async def llm_request(http: httpx.AsyncClient, messages: list,
         del payload["tools"]  # no tools wanted (compaction) — an empty
                               # array is rejected by some providers
     delay, last_exc = 2.0, None
-    for attempt in range(LLM_MAX_RETRIES):
-        try:
-            r = await http.post(
-                f"{LITELLM_URL}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {state.litellm_key}"},
-                json=payload)
-            r.raise_for_status()
-            return r
-        except httpx.HTTPStatusError as e:
-            last_exc = e
-            code = e.response.status_code
-            # 402 earns the backoff too: OpenRouter raises it while
-            # in-flight requests' spend crosses the balance — it settles
-            # once they finish, so an instant raise kills a run a short
-            # wait would have saved. A real empty balance still fails,
-            # just after the retries.
-            if code not in (402, 408, 409, 429) and code < 500:
-                raise
-        except httpx.TransportError as e:
-            last_exc = e
-        if attempt + 1 < LLM_MAX_RETRIES:
-            await broadcast({"type": "agent_msg",
-                             "text": f"(model request failed, retrying in "
-                                     f"{delay:.0f}s: {last_exc})"})
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30)
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("llm_request exhausted retries without a response")
+    _wait_tick()  # bank the pre-call interval, then mark the model in flight
+    state.llm_inflight += 1
+    try:
+        for attempt in range(LLM_MAX_RETRIES):
+            try:
+                r = await http.post(
+                    f"{LITELLM_URL}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {state.litellm_key}"},
+                    json=payload)
+                r.raise_for_status()
+                return r
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                code = e.response.status_code
+                # 402 earns the backoff too: OpenRouter raises it while
+                # in-flight requests' spend crosses the balance — it settles
+                # once they finish, so an instant raise kills a run a short
+                # wait would have saved. A real empty balance still fails,
+                # just after the retries.
+                if code not in (402, 408, 409, 429) and code < 500:
+                    raise
+            except httpx.TransportError as e:
+                last_exc = e
+            if attempt + 1 < LLM_MAX_RETRIES:
+                await broadcast({"type": "agent_msg",
+                                 "text": f"(model request failed, retrying in "
+                                         f"{delay:.0f}s: {last_exc})"})
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("llm_request exhausted retries without a response")
+    finally:
+        _wait_tick()  # the call's whole duration banks as model wait
+        state.llm_inflight -= 1
 
 
 # ── Context compaction ─────────────────────────────────────────────────────
@@ -4712,6 +4934,10 @@ async def compact_context(http: httpx.AsyncClient, conv_id: str,
                + summary)
     if checklist and state.todos:
         handoff += "\n\nCurrent checklist:\n" + render_todos(state.todos)
+    if checklist and state.notes:
+        handoff += ("\n\nRemembered notes (stored verbatim — still "
+                    "accurate):\n"
+                    + "\n".join(f"- {n}" for n in state.notes))
     messages[1:] = [{"role": "user", "content": handoff}, *tail]
     sanitize_context(messages)
     state.steps_since_compact = 0
@@ -4756,7 +4982,7 @@ The wrap-up PASSES when:
 
 Claims the agent itself flags as unverified, estimated or approximate are fine — flagged doubt is honest. Fail ONLY for material claims stated as fact that the log doesn't support or directly contradicts — never over omissions, tone, or hedged language.
 
-Ledger lines ending "… [truncated]" had their tails cut for length — a claim needing the cut part counts as unsupported, and prefer the digests over guessing what a cut page said.
+Ledger lines ending "… [truncated]" had their tails cut for length — a claim needing the cut part counts as unsupported, and prefer the digests over guessing what a cut page said. Reports in the WORKER REPORTS section are verbatim and complete: a claim backed by that text is supported even when the report's ledger line ends "[truncated]".
 
 A delivered file's digest (bytes, paragraphs, filled rows) is authoritative that it exists and is nonempty — fail missing, empty or wrong-type deliverables. The wrap-up describing its own document loosely ("two-paragraph summary" while the digest counts heading and caption lines too) is style, not an unsupported claim.
 
@@ -4816,12 +5042,13 @@ def run_ledger(messages: list) -> list[str]:
     return entries
 
 
-def _ledger_window(entries: list[str]) -> str:
-    """Fit the ledger under VERIFY_INPUT_CHARS — keep the run's start and
+def _ledger_window(entries: list[str],
+                   budget: int = VERIFY_INPUT_CHARS) -> str:
+    """Fit the ledger under `budget` — keep the run's start and
     the recent tail, drop the middle."""
-    if sum(len(e) + 1 for e in entries) <= VERIFY_INPUT_CHARS:
+    if sum(len(e) + 1 for e in entries) <= budget:
         return "\n".join(entries)
-    half = VERIFY_INPUT_CHARS // 2
+    half = budget // 2
     head, tail, size = [], [], 0
     for e in entries:
         if size + len(e) + 1 > half:
@@ -4853,7 +5080,10 @@ async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
     if len(entries) < VERIFY_MIN_CALLS:
         return None
     if state.verify_rejects >= VERIFY_MAX_REJECTS:
-        return None  # cap spent — the stored caveat rides the done text
+        # cap spent — the stored caveat rides the done text
+        await broadcast({"type": "verify", "state": "waived",
+                         "text": "reject cap spent — accepted unchecked"})
+        return None
     # Real user turns are block lists; daemon nudges are plain strings.
     user_texts = []
     for m in messages:
@@ -4874,6 +5104,18 @@ async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
                          for p in list(paths)[:15]) or "(none)"
     sent_d, unsent_d = await asyncio.to_thread(
         lambda: (_digests(sorted(state.sent_files)), _digests(unsent)))
+    reports = "\n\n".join(
+        f"── {n} ──\n{r['text']}"
+        for n, r in state.subagent_reports.items()
+        if r.get("conv") == conv_id)
+    if len(reports) > VERIFY_REPORT_CHARS:
+        reports = reports[:VERIFY_REPORT_CHARS] + "\n[… reports cut]"
+    report_sec = (
+        "WORKER REPORTS (authoritative full text — a report's ledger "
+        "line may still end \"[truncated]\"; trust this section):\n"
+        + reports + "\n\n") if reports else ""
+    ledger_budget = max(VERIFY_INPUT_CHARS - len(report_sec),
+                        VERIFY_INPUT_CHARS // 2)
     prompt = (
         "USER MESSAGES (oldest→newest):\n" + (users or "(none)") + "\n\n"
         "CHECKLIST STATE:\n" + (render_todos(state.todos) or "(none)")
@@ -4881,7 +5123,12 @@ async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
         "send_file DELIVERED (with actual contents):\n" + sent_d + "\n"
         "files changed this run, NOT delivered:\n" + unsent_d + "\n\n"
         "WRAP-UP UNDER REVIEW:\n" + summary + "\n\n"
-        "TOOL LEDGER (oldest→newest):\n" + _ledger_window(entries))
+        + report_sec +
+        "TOOL LEDGER (oldest→newest):\n" + _ledger_window(entries,
+                                                         ledger_budget))
+    # The audit reads as a transcript card — checking lands it, the
+    # verdict resolves it in place.
+    await broadcast({"type": "verify", "state": "checking"})
     try:
         r = await llm_request(
             http,
@@ -4890,6 +5137,9 @@ async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
             model=VERIFY_MODEL or COMPACT_MODEL or None, tools=[])
     except Exception as e:
         print(f"[gut] verifier call failed, accepting wrap-up: {e}")
+        await broadcast({"type": "verify", "state": "waived",
+                         "text": "checker call failed — accepted "
+                                 "unchecked"})
         return None
     usd, tin, tout = track_cost(r)
     if conv_id and (usd or tin or tout):
@@ -4898,11 +5148,14 @@ async def verify_wrap_up(http: httpx.AsyncClient, conv_id: str,
     verdict = message_text(r.json()["choices"][0]["message"]).lstrip()
     if verdict[:4].upper() != "FAIL":
         state.verify_caveat = None
+        await broadcast({"type": "verify", "state": "pass"})
         return None
     state.verify_rejects += 1
     critique = re.sub(r"^FAIL\w*\s*[:\-]?\s*", "", verdict).strip() or \
         "claims not supported by the tool log"
     state.verify_caveat = critique[:1500]
+    await broadcast({"type": "verify", "state": "fail",
+                     "text": critique})
     return ("VERIFICATION FAILED — the wrap-up states things the tool log "
             "doesn't back up:\n" + critique[:4000] +
             "\nFix the flagged claims — re-check them with tools or mark "
@@ -5022,6 +5275,21 @@ def worker_dir(name: str) -> Path:
     return SCRATCH_DIR / name
 
 
+def scratch_listing() -> list[str]:
+    """Files workers left under ~/scratch — the on-disk record a build
+    step should assemble from rather than recalling figures."""
+    out = []
+    try:
+        dirs = sorted(SCRATCH_DIR.iterdir()) if SCRATCH_DIR.is_dir() else []
+        for d in dirs:
+            if d.is_dir():
+                out += [str(p.relative_to(HOME_DIR))
+                        for p in sorted(d.iterdir()) if p.is_file()]
+    except OSError:
+        pass
+    return out
+
+
 def spawn_agent(task: str, name: str = "", model: str = "") -> str:
     task = task.strip()
     if not task:
@@ -5057,6 +5325,7 @@ def spawn_agent(task: str, name: str = "", model: str = "") -> str:
     entry = {"name": name, "desc": task[:200], "conv": state.conversation_id,
              "status": "running", "result": None, "model": model,
              "usd": 0.0, "steps": 0, "delivered": False, "workdir": str(wd)}
+    _wait_tick()  # bank the pre-spawn interval before a helper is running
     entry["task"] = asyncio.create_task(
         subagent_loop(name, prompt, model, entry))
     state.subagents[name] = entry
@@ -5240,7 +5509,14 @@ async def subagent_loop(name: str, task_text: str, model: str,
         footer = worker_footer(messages, worker_dir(name), str(result))
         entry["footer"] = footer
         result = f"{result}\n{footer}"
+    _wait_tick()  # the interval up to here was still spent on a live helper
     entry.update(status=status, result=result)
+    # Retain the report for verify_wrap_up — the transcript copies are
+    # stubbed by pruning or capped by the ledger, and spawn_agent's GC
+    # drops delivered entries before the audit runs.
+    state.subagent_reports[name] = {"conv": conv_id, "text": str(result)}
+    while len(state.subagent_reports) > 24:
+        del state.subagent_reports[next(iter(state.subagent_reports))]
     # Even a stopped helper's report is queued — if the run was stopped the
     # drained-on-resume message tells the parent the helper died with it.
     state.subagent_inbox.append(entry)
@@ -5807,6 +6083,11 @@ async def agent_loop(conv_id: str, task_text: str,
     state.stop = False
     state.paused = False
     state.run_start = time.time()
+    # Fresh wait partition + output-token baseline for this run's stats.
+    state.wait_parts = {"model": 0.0, "search": 0.0,
+                        "helper": 0.0, "other": 0.0}
+    state.wait_since = time.monotonic()
+    state.tok_out0 = state.tokens_out
     state.sent_files = {}
     state.output_nudge_done = False
     state.todo_nudge_done = False
@@ -5859,6 +6140,8 @@ async def agent_loop(conv_id: str, task_text: str,
         stall, unchanged_streak = StallDetector(), 0
         idle_replies = 0
         state.todos = conv_load_todos(conv_id)
+        state.notes = conv_load_notes(conv_id)
+        state.steps_since_notes = 0
         for t in state.todos:  # lists stored before kinds existed
             t.setdefault("kind", infer_step_kind(t.get("content", "")))
         state.plan_shared = False
@@ -5951,6 +6234,18 @@ async def agent_loop(conv_id: str, task_text: str,
                 if state.todo_reconcile:
                     state.todo_reconcile = False
                     force = "plan"
+
+                # Recap remembered notes on a slow cadence — the remember
+                # results that hold them get stubbed by pruning, and the
+                # handoff only replays them at compaction.
+                state.steps_since_notes += 1
+                if (state.notes
+                        and state.steps_since_notes >= NOTES_REMIND_STEPS
+                        and messages):
+                    state.steps_since_notes = 0
+                    _inject_note(messages,
+                                 "your remembered notes (still valid — "
+                                 "`forget` stale ones):\n" + render_notes())
 
                 # Step-cap countdown: one heads-up to switch from exploring
                 # to delivering, then task_complete pinned on the last step
@@ -6059,7 +6354,8 @@ async def agent_loop(conv_id: str, task_text: str,
                         # reply as the wrap-up so it reaches the user.
                         done = True
                         await broadcast({"type": "done",
-                                         "text": (reply_text or "done")[:8000]})
+                                         "text": (reply_text or "done")[:8000],
+                                         "stats": run_stats()})
                         break
                     nudge = ("Continue with tool calls, or call task_complete "
                              "when done.") if idle_replies == 1 else (
@@ -6187,10 +6483,9 @@ async def agent_loop(conv_id: str, task_text: str,
                             result, finished = critique, False
                             # The just-appended tool result holds the
                             # rejected summary — swap it for the critique
-                            # or the model thinks it completed.
+                            # or the model thinks it completed. The user
+                            # sees the same critique on the verify card.
                             messages[-1]["content"] = critique
-                            await broadcast({"type": "agent_msg",
-                                             "text": critique[:600]})
                     if finished:
                         done = True
                         text = str(result)
@@ -6202,7 +6497,8 @@ async def agent_loop(conv_id: str, task_text: str,
                                     "claims it couldn't verify in the "
                                     "tool log:\n" + state.verify_caveat)
                         await broadcast({"type": "done",
-                                         "text": text[:8000]})
+                                         "text": text[:8000],
+                                         "stats": run_stats()})
                         break
 
                 # One fresh screenshot per turn on the last tool result —

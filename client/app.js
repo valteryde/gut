@@ -285,8 +285,14 @@ let lastSeq = 0;                 // highest seq rendered in the transcript
 const queuedSeqs = new Map();    // "conv:seq" -> mode, mirrors the daemon
 const queuedEls = new Map();     // "conv:seq" -> badge element
 const helperCards = new Map();   // helper name -> lifecycle card refs
+// Delivered files (send_file/send_image payloads, b64 included) by
+// lowercase basename — a filename the agent writes in prose resolves
+// against this into a clickable chip. Cleared with the transcript.
+const sentFiles = new Map();
 let planBody = null;             // the live plan card's body — plan
                                  // updates rewrite it instead of reposting
+let verifyEl = null;             // the open wrap-up check's card refs —
+                                 // the verdict resolves it in place
 const qkey = (conv, seq) => `${conv}:${seq}`;
 let convFetchId = null;          // conversation currently being refetched
 let pendingLive = [];            // live events arrived during a refetch
@@ -387,6 +393,71 @@ function addMsg(cls, text, who = '') {
   entry(cls, who).body.textContent = text;
 }
 
+// Agent-authored prose — send_message, task_complete, ask_user, helper
+// reports — arrives as markdown; render the same safe subset as the plan
+// card. (Daemon errors stay textContent: they're log lines, not prose.)
+// Returns the body so the caller can append extras (the run-stats footer).
+function addAgentMsg(cls, text, who = '') {
+  const { body } = entry(cls, who);
+  const md = document.createElement('div');
+  md.className = 'md';
+  md.innerHTML = mdRender(text);
+  resolveFileRefs(md);
+  body.appendChild(md);
+  return body;
+}
+
+// The done footer's "straight donut": one line — output tok/s over
+// model-generating seconds, then a segmented bar of where the run's wall
+// clock went (model / search / helpers / other) with the same buckets as
+// text. Bar segments without a legend label are still exact: hover it.
+const RS_PARTS = [['model', 'agent'], ['helper', 'helpers'],
+                  ['search', 'search'], ['other', 'other']];
+
+function fmtDur(s) {
+  s = Math.max(0, s || 0);
+  return s >= 60
+    ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+    : `${s.toFixed(s < 10 ? 1 : 0)}s`;
+}
+
+function runStatsEl(s) {
+  const el = document.createElement('div');
+  el.className = 'runstats';
+  const tok = document.createElement('span');
+  tok.className = 'rs-tok';
+  tok.textContent = `${s.tok_s || 0} tok/s`;
+  tok.title = `${fmtTok(s.tokens_out || 0)} output tokens over ` +
+    `${fmtDur(s.model_s)} of model time`;
+  el.appendChild(tok);
+  const total = Math.max(0.001, s.total_s ||
+    (s.model_s + s.search_s + s.helper_s + s.other_s) || 0);
+  const bar = document.createElement('span');
+  bar.className = 'rs-bar';
+  const legend = document.createElement('span');
+  legend.className = 'rs-parts';
+  for (const [key, label] of RS_PARTS) {
+    const v = s[`${key}_s`] || 0;
+    if (v <= 0) continue;
+    const seg = document.createElement('i');
+    seg.className = `rs-seg ${key}`;
+    seg.style.width = `${(v / total * 100).toFixed(1)}%`;
+    seg.title = `${label} ${fmtDur(v)}`;
+    bar.appendChild(seg);
+    if (key !== 'other') {
+      const p = document.createElement('span');
+      p.className = 'rs-part';
+      p.innerHTML = `<i class="rs-dot ${key}"></i>${label} ${fmtDur(v)}`;
+      legend.appendChild(p);
+    }
+  }
+  el.append(bar, legend);
+  el.title = `run ${fmtDur(total)} — agent ${fmtDur(s.model_s)} · ` +
+    `helpers ${fmtDur(s.helper_s)} · search ${fmtDur(s.search_s)} · ` +
+    `other ${fmtDur(s.other_s)}`;
+  return el;
+}
+
 // Working-log entries (thoughts, tool calls, results) — only rendered when
 // the verbose toggle is on.
 function addVerbose(cls, text) {
@@ -413,22 +484,58 @@ function helperCard(m) {
     status.className = 'helper-status';
     head.append(icon, name, status);
     const task = document.createElement('div');
-    task.className = 'helper-task';
+    task.className = 'helper-task md';
     const report = document.createElement('div');
-    report.className = 'helper-report';
+    report.className = 'helper-report md';
     body.append(head, task, report);
     c = { div, status, task, report };
     helperCards.set(m.name, c);
   }
   c.div.dataset.state = m.state;
-  if (m.task) c.task.textContent = m.task;
+  if (m.task) { c.task.innerHTML = mdRender(m.task); resolveFileRefs(c.task); }
   if (m.state === 'running') c.report.textContent = '';  // reused name, new run
-  if (m.result) c.report.textContent = String(m.result).trim();
+  if (m.result) {
+    c.report.innerHTML = mdRender(String(m.result).trim());
+    resolveFileRefs(c.report);
+  }
   const bits = [m.state === 'running' ? 'working' : m.state];
   if (m.state === 'running' && m.model) bits.push(m.model);
   if (m.steps != null) bits.push(`${m.steps} steps`);
   if (m.usd) bits.push(`$${Number(m.usd).toFixed(4)}`);
   c.status.textContent = bits.join(' · ');
+}
+
+// The wrap-up audit as one card per check: "checking" lands it, the
+// verdict resolves it in place. A resolution with no open check (the
+// waived paths never opened one) still gets a card so the transcript
+// shows the audit happened — replaying history rebuilds the same end
+// state from the stored checking/verdict pairs.
+const VERIFY_STATUS = {
+  checking: 'auditing claims',
+  pass: 'passed',
+  fail: 'rejected',
+  waived: 'skipped',
+};
+
+function verifyCard(m) {
+  if (m.state === 'checking' || !verifyEl) {
+    const { div, body } = entry('verify', agentName);
+    const head = document.createElement('div');
+    head.className = 'vhead';
+    head.innerHTML =
+      `<span class="vico">${svgIcon(TICONS.shield)}</span>` +
+      '<span class="vlab">wrap-up check</span>' +
+      '<span class="vstatus"></span>';
+    const det = document.createElement('div');
+    det.className = 'vdet md';
+    body.append(head, det);
+    verifyEl = { div, status: head.querySelector('.vstatus'), det };
+  }
+  const c = verifyEl;
+  c.div.dataset.state = m.state;
+  c.status.textContent = VERIFY_STATUS[m.state] || m.state;
+  if (m.text) { c.det.innerHTML = mdRender(m.text); resolveFileRefs(c.det); }
+  if (m.state !== 'checking') verifyEl = null;
 }
 
 function b64ToBlobUrl(b64, mime) {
@@ -459,20 +566,32 @@ const mdEsc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
 
 function mdInline(s) {
   let t = mdEsc(s);
-  const codes = [];
+  const codes = [], links = [];
   // stash code spans first so `*` or `_` inside them never parses
   t = t.replace(/`([^`]+)`/g, (_, c) => {
     codes.push(c);
     return `\x00${codes.length - 1}\x00`;
   });
-  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, href) =>
-    /^(https?:|mailto:)/i.test(href)
-      ? `<a href="${href}" target="_blank" rel="noopener">${txt}</a>`
-      : txt);
-  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  // links go into the same stash — emphasis inside link text still
+  // resolves, and a bare URL inside the text can't nest a second <a>
+  const em = (x) => x.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
        .replace(/(^|\W)\*([^*\n]+)\*/g, '$1<em>$2</em>')
        .replace(/(^|\W)_([^_\n]+)_/g, '$1<em>$2</em>');
-  return t.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[i]}</code>`);
+  const stash = (html) => `\x01${links.push(html) - 1}\x01`;
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, href) =>
+    /^(https?:|mailto:)/i.test(href)
+      ? stash(`<a href="${href}" target="_blank" rel="noopener">` +
+              `${em(txt)}</a>`)
+      : txt);
+  // bare URLs — a report's "pages fetched: https://…" list — linkify too
+  t = t.replace(/https?:\/\/[^\s<>'"]+/g, (u) => {
+    const clean = u.replace(/[.,;:!?)\]]+$/, '');
+    return stash(`<a href="${clean}" target="_blank" rel="noopener">` +
+                 `${clean}</a>`) + u.slice(clean.length);
+  });
+  t = em(t);
+  return t.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[i]}</code>`)
+          .replace(/\x01(\d+)\x01/g, (_, i) => links[i]);
 }
 
 const MD_NUMISH = /^[-–—]?\s*[\d.,]+(?:\s*[a-zA-Z%$€£/]+)?$/;
@@ -835,10 +954,11 @@ function addFileMsg(m) {
   if (m.note) {
     const p = document.createElement('p');
     p.className = 'file-note';
-    p.textContent = m.note;
+    p.innerHTML = mdInline(m.note);
     body.appendChild(p);
   }
   body.appendChild(fileCard(m));
+  registerSentFile(m);
 }
 
 function addImageMsg(m) {
@@ -871,9 +991,89 @@ function addImageMsg(m) {
   if (m.caption) {
     const p = document.createElement('p');
     p.className = 'img-caption';
-    p.textContent = m.caption;
+    p.innerHTML = mdInline(m.caption);
     body.appendChild(p);
   }
+  registerSentFile(m);
+}
+
+// ── file references in agent prose ─────────────────────────────────────
+// A delivered file mentioned by name — "attached as `report.pdf`", or a
+// bare report.pdf — resolves into a chip that saves the file on click,
+// like the file card's download button. registerSentFile re-scans the
+// transcript so a mention that arrived *before* its file upgrades too.
+function fileRefPill(f) {
+  const chip = attachChip(f, false);
+  chip.classList.add('ref');
+  chip.setAttribute('role', 'button');
+  chip.tabIndex = 0;
+  chip.title = `Save ${f.name} to Downloads`;
+  const activate = async () => {
+    const r = await saveDelivery(sentFiles.get(refBase(f.name)) || f);
+    if (r?.ok) {
+      chip.classList.add('got');
+      chip.title = r.path ? `saved to ${r.display}` : 'saved to Downloads';
+    }
+  };
+  chip.onclick = activate;
+  chip.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      activate();
+    }
+  };
+  return chip;
+}
+
+const refBase = (s) => String(s || '').split(/[\\/]/).pop().toLowerCase();
+// Elements a filename mention never upgrades inside — the file card's own
+// name, fenced code, existing pills/links. REF_SKIP_CODE drops `code`
+// itself (closest() self-matches); a code span's ancestors matter, not it.
+const REF_SKIP = 'a,button,pre,code,.att,.fcard,.who';
+const REF_SKIP_CODE = 'a,button,pre,.att,.fcard,.who';
+
+function resolveFileRefs(root) {
+  if (!root || !sentFiles.size) return;
+  for (const code of root.querySelectorAll('code')) {
+    if (code.closest(REF_SKIP_CODE)) continue;
+    const t = code.textContent.trim();
+    const f = !/\s/.test(t) && sentFiles.get(refBase(t));
+    if (f) code.replaceWith(fileRefPill(f));
+  }
+  const names = [...sentFiles.keys()]
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const inText = new RegExp(`\\b(?:${names.join('|')})\\b`, 'i');
+  const re = new RegExp(inText.source, 'gi');
+  const hits = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) =>
+      (n.parentElement?.closest(REF_SKIP) || !inText.test(n.nodeValue))
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+  });
+  while (walker.nextNode()) hits.push(walker.currentNode);
+  for (const node of hits) {
+    const frag = document.createDocumentFragment();
+    const text = node.nodeValue;
+    let last = 0, m, hit = false;
+    re.lastIndex = 0;
+    while ((m = re.exec(text))) {
+      const f = sentFiles.get(m[0].toLowerCase());
+      if (!f) continue;
+      frag.append(text.slice(last, m.index), fileRefPill(f));
+      last = m.index + m[0].length;
+      hit = true;
+    }
+    if (hit) {
+      frag.append(text.slice(last));
+      node.replaceWith(frag);
+    }
+  }
+}
+
+function registerSentFile(m) {
+  const key = refBase(m.name);
+  if (key && m.data) sentFiles.set(key, m);
+  resolveFileRefs(messagesEl);
 }
 
 // Human-readable one-liner for a tool call — lands in the activity line and
@@ -960,6 +1160,7 @@ const TICONS = {
   helper: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/>',
   plan:   '<path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
   check:  '<path d="M4 12.5l5 5L20 6.5"/>',
+  shield: '<path d="M12 3l7 2.6V11c0 4.6-3 8.3-7 9.8-4-1.5-7-5.2-7-9.8V5.6z"/><path d="M9 11.8l2.2 2.2 4-4.4"/>',
   dot:    '<circle cx="12" cy="12" r="4"/>',
 };
 
@@ -986,15 +1187,18 @@ function renderEvent(m, live) {
   switch (m.type) {
     case 'user':
       planBody = null;  // a new task starts a new plan card
+      verifyEl = null;  // …and a stale open check belongs to the last run
       addUserMsg(m);
       break;
     case 'agent_msg':
-      addMsg('agent', m.text, agentName);
+      addAgentMsg('agent', m.text, agentName);
       break;
-    case 'done':
-      addMsg('agent', m.text, agentName);
+    case 'done': {
+      const body = addAgentMsg('agent', m.text, agentName);
+      if (m.stats) body.appendChild(runStatsEl(m.stats));
       if (live) notify(`${agentName} finished`, m.text || '');
       break;
+    }
     case 'file':
       addFileMsg(m);
       break;
@@ -1035,7 +1239,11 @@ function renderEvent(m, live) {
       const text = (m.text || '').trim();
       if (planBody && planBody.isConnected) {
         const pb = planBody.querySelector('.pbody');
-        if (pb) { pb.innerHTML = mdRender(text); pb.hidden = !text; }
+        if (pb) {
+          pb.innerHTML = mdRender(text);
+          resolveFileRefs(pb);
+          pb.hidden = !text;
+        }
         const meta = planBody.querySelector('.pmeta');
         if (meta) meta.textContent = 'updated';
         if (live) {
@@ -1056,6 +1264,7 @@ function renderEvent(m, live) {
         const pb = document.createElement('div');
         pb.className = 'pbody md';
         pb.innerHTML = mdRender(text);
+        resolveFileRefs(pb);
         body.appendChild(pb);
       }
       planBody = body;
@@ -1065,8 +1274,13 @@ function renderEvent(m, live) {
     case 'compact':
       entry('compact').body.textContent = m.text || 'context compacted';
       break;
+    case 'verify':
+      verifyCard(m);
+      if (live && m.state === 'checking')
+        setLiveStatus('auditing the wrap-up', 'action', 'shield');
+      break;
     case 'question':
-      addMsg('question', m.text, agentName);
+      addAgentMsg('question', m.text, agentName);
       if (live) {
         notify(`${agentName} needs you`, m.text || '');
         awaitingAnswer = true;
@@ -1479,7 +1693,9 @@ function clearTranscript(title) {
   lastEntryKey = null;
   lastSeq = 0;
   helperCards.clear();
+  sentFiles.clear();
   planBody = null;
+  verifyEl = null;
   convModel = null;
   ctxInfo = { tokens: 0, limit: 0, parts: null, compactAt: 0,
               estimated: true };
@@ -1598,7 +1814,7 @@ async function deleteConversation(id) {
 const TRANSCRIPT_TYPES = new Set([
   'user', 'agent_msg', 'done', 'file', 'image',
   'thought', 'action', 'action_result', 'question', 'error', 'cleanup',
-  'subagent', 'plan', 'compact',
+  'subagent', 'plan', 'compact', 'verify',
 ]);
 
 // A transcript event arrives tagged with (conversation_id, seq). Render it
@@ -1627,35 +1843,36 @@ function handleTranscriptEvent(m) {
 
 /* ── research pane ─────────────────────────────────────────────────
    While the agent works API-side (searches, page reads, workers) the
-   desktop stream is dead air, so #desktopPane swaps in this board —
-   variant D "harvest rows": one lane per agent, one card per query,
-   and a resolved card carries its sources as an overlapping dot stack
-   on the wrapped line. A visible-screen action swaps back. */
+   desktop stream is dead air, so #desktopPane swaps in a night field:
+   aurora curtains overhead, one glowing orb per agent, a spark rising
+   for every call, and a constellation of source-stars accumulating
+   below. A visible-screen action swaps the desktop back in. */
 const researchPaneEl = document.getElementById('researchPane');
 // Mirror of the daemon's VISUAL_TOOLS — a call here means the desktop
-// is live again, so the board gives the stream back.
+// is live again, so the field gives the stream back.
 const VISUAL_ACTION_TOOLS = new Set([
   'click', 'mouse_move', 'scroll', 'type_text', 'key',
   'browser_click', 'browser_type', 'open_url', 'focus_window',
   'desktop_act', 'desktop_click', 'desktop_type',
 ]);
 const WORKER_HUES = ['blue', 'violet', 'rose'];
-const SITE_HUES = ['#7fa8c9', '#b48ead', '#8fbb8f', '#d0a86f',
-                   '#8e9ec9', '#c98f8f'];
+// Fallback chip colors when a site has no reachable favicon.
+const FAV_HUES = ['#2d2560', '#4a3d7a', '#21574c', '#6b3a5e',
+                  '#274b63', '#5e4a2d'];
 const KIND_ICON = { search: '⌕', fetch: '⌁', spawn: '⟶',
                     collect: '◌', send: '↑' };
 const RESULT_URL_RE = /https?:\/\/[^\s)\]'"]+/g;
 
 const research = {
-  conv: null,          // the conversation this board is tracking
+  conv: null,          // the conversation this field is tracking
   usd: 0,
-  workers: 0,          // worker lanes ever spawned
-  queries: 0,          // search/fetch cards issued
-  sites: new Map(),    // domain → dot color
-  lanes: new Map(),    // agent → lane record
+  workers: 0,          // worker orbs ever spawned
+  queries: 0,          // search/fetch calls seen
+  sites: new Set(),    // domains already in the constellation
+  lanes: new Map(),    // agent → { el, orbEl, linesEl, pend[] }
   shown: false,
   hideTimer: null,
-  headEl: null, lanesEl: null, countEl: null, statsEl: null,
+  headEl: null, orbsEl: null, countEl: null, statsEl: null,
 };
 
 function rel(tag, cls, text) {
@@ -1667,6 +1884,15 @@ function rel(tag, cls, text) {
 
 function researchChrome() {
   if (research.headEl) return;
+  // SVG turbulence gives the pigment its ink-in-water edges; animating
+  // baseFrequency makes the veining writhe slowly on its own.
+  const defs = rel('div');
+  defs.innerHTML =
+    '<svg width="0" height="0" style="position:absolute"><defs>' +
+    '<filter id="inkA"><feTurbulence type="fractalNoise" baseFrequency="0.012 0.02" numOctaves="3" seed="3" result="n"><animate attributeName="baseFrequency" dur="22s" values="0.012 0.02;0.017 0.013;0.012 0.02" repeatCount="indefinite"/></feTurbulence><feDisplacementMap in="SourceGraphic" in2="n" scale="46"/></filter>' +
+    '<filter id="inkB"><feTurbulence type="fractalNoise" baseFrequency="0.015 0.018" numOctaves="3" seed="7" result="n"><animate attributeName="baseFrequency" dur="27s" values="0.015 0.018;0.011 0.023;0.015 0.018" repeatCount="indefinite"/></feTurbulence><feDisplacementMap in="SourceGraphic" in2="n" scale="38"/></filter>' +
+    '<filter id="inkC"><feTurbulence type="fractalNoise" baseFrequency="0.02 0.014" numOctaves="2" seed="11" result="n"><animate attributeName="baseFrequency" dur="19s" values="0.02 0.014;0.014 0.021;0.02 0.014" repeatCount="indefinite"/></feTurbulence><feDisplacementMap in="SourceGraphic" in2="n" scale="30"/></filter>' +
+    '</defs></svg>';
   const head = rel('div', 'rhead');
   research.labelEl = rel('span', 'rlabel live', 'research');
   research.countEl = rel('span', 'rcount', '0 workers · 0 queries');
@@ -1675,15 +1901,16 @@ function researchChrome() {
   research.statsEl = rel('span', 'rstats', '0 sites');
   head.append(research.labelEl, research.countEl, eq, research.statsEl);
   research.boardEl = rel('div', 'rboard');
-  research.lanesEl = rel('div', 'lanes');
+  research.orbsEl = rel('div', 'orbs');
+  research.boardEl.appendChild(research.orbsEl);
   const thumb = rel('div', 'vthumb');
   thumb.setAttribute('role', 'button');
   thumb.title = 'back to the desktop';
   thumb.append(rel('span', 'vdot'),
                document.createTextNode('desktop · idle'));
   thumb.addEventListener('click', researchHide);
-  research.boardEl.appendChild(research.lanesEl);
-  researchPaneEl.append(head, research.boardEl, thumb);
+  researchPaneEl.append(defs, rel('div', 'halo'), head,
+                        research.boardEl, thumb);
   research.headEl = head;
 }
 
@@ -1710,7 +1937,7 @@ function researchReset() {
   research.sites.clear();
   research.lanes.clear();
   researchPaneEl.innerHTML = '';
-  research.headEl = research.lanesEl =
+  research.headEl = research.orbsEl =
     research.countEl = research.statsEl = null;
 }
 
@@ -1739,69 +1966,100 @@ function researchLane(agent, task) {
     .filter(a => a !== 'main').length;
   const hue = agent === 'main'
     ? 'mint' : WORKER_HUES[workerIx % WORKER_HUES.length];
-  const el = rel('div', `lane ${hue}`);
-  const ahead = rel('div', 'ahead');
-  const count = rel('span', 'acount');
-  ahead.append(rel('span', 'adot'), rel('span', 'aname', agent), count);
-  const thought = rel('div', 'athought', task ? clip(task, 110) : '');
-  const todo = rel('div', 'todo');
-  el.append(ahead, thought, todo);
-  research.lanesEl.appendChild(el);
-  l = { el, countEl: count, thoughtEl: thought, todoEl: todo,
-        count: 0, pend: [] };
+  const wrap = rel('div', `orbwrap ${hue}`);
+  const orb = rel('div', 'orb');
+  orb.style.animationDelay = `-${(((workerIx + 1) * 1.7) % 7).toFixed(1)}s`;
+  const favs = rel('div', 'favs');
+  const lines = rel('div', 'olines');
+  wrap.append(orb, rel('div', 'oname', agent), favs, lines);
+  research.orbsEl.appendChild(wrap);
+  l = { el: wrap, orbEl: orb, favsEl: favs, linesEl: lines,
+        pend: [], sites: new Set(), moreEl: null };
   research.lanes.set(agent, l);
+  if (task) researchLine(l, clip(task, 60), true);
   return l;
 }
 
-function researchCard(agent, kind, text, meta, counts) {
+// The last few things an agent touched, newest on top — presence, not
+// a ledger: they dim as they age and slide off entirely.
+function researchLine(l, text, thought) {
+  const line = rel('div', `wline${thought ? ' thought' : ''}`, text);
+  l.linesEl.prepend(line);
+  while (l.linesEl.children.length > 3)
+    l.linesEl.lastElementChild.remove();
+}
+
+// A spark lifts off the orb — the field moves because the agent moved.
+function researchMote(l) {
+  const mote = rel('i', 'mote');
+  mote.style.setProperty('--mx', `${Math.round(Math.random() * 44 - 22)}px`);
+  l.orbEl.appendChild(mote);
+  setTimeout(() => mote.remove(), 1900);
+}
+
+// tracked calls keep the orb bright until their result lands — one
+// group per call, one line per query (a batched search is one call)
+function researchAct(agent, kind, texts, tracked) {
   const l = researchLane(agent);
-  const c = rel('div', 'qc pend');
-  c.dataset.kind = kind;
-  const body = rel('span', 'qbody');
-  body.append(rel('div', 'qtext', text), rel('div', 'qmeta', meta));
-  c.append(rel('span', 'qi', KIND_ICON[kind]), body);
-  l.todoEl.appendChild(c);
-  research.lanesEl.scrollTop = research.lanesEl.scrollHeight;
-  if (counts) {
-    l.count++;
-    l.countEl.textContent = `${l.count} quer${l.count > 1 ? 'ies' : 'y'}`;
-    research.queries++;
+  for (const t of texts)
+    researchLine(l, `${KIND_ICON[kind]} ${clip(t, 42)}`);
+  researchMote(l);
+  if (tracked) {
+    l.pend.push({ kind, done: false });
+    l.el.classList.add('act');
+  }
+  if (kind === 'search' || kind === 'fetch') {
+    research.queries += texts.length;
     researchCounts();
   }
-  return c;
+  return l;
 }
 
-function researchDot(dom) {
-  if (!research.sites.has(dom))
-    research.sites.set(dom, SITE_HUES[research.sites.size % SITE_HUES.length]);
-  const s = rel('span', 'sdot', dom[0] || '·');
-  s.style.background = research.sites.get(dom);
-  s.title = dom;
-  return s;
+// A source lands under its agent's name as a favicon — real icon when
+// reachable, hashed-letter chip when not. Deduped per lane; past a
+// dozen the row folds into a "+n" chip.
+function researchSource(l, dom) {
+  if (!dom) return;
+  research.sites.add(dom);
+  if (l.sites.has(dom)) return;
+  l.sites.add(dom);
+  if (l.sites.size > 13) {
+    if (!l.moreEl) {
+      l.moreEl = rel('span', 'fav more');
+      l.favsEl.appendChild(l.moreEl);
+    }
+    l.moreEl.textContent = `+${l.sites.size - 13}`;
+    return;
+  }
+  const f = rel('span', 'fav');
+  f.title = dom;
+  const img = document.createElement('img');
+  img.alt = '';
+  img.referrerPolicy = 'no-referrer';
+  img.src = 'https://www.google.com/s2/favicons?sz=32&domain=' +
+            encodeURIComponent(dom);
+  img.onerror = () => {
+    img.remove();
+    f.textContent = (dom[0] || '·').toUpperCase();
+    let h = 0;
+    for (const c of dom) h = (h * 31 + c.charCodeAt(0)) % 997;
+    f.style.background = FAV_HUES[h % FAV_HUES.length];
+  };
+  f.appendChild(img);
+  l.favsEl.appendChild(f);
 }
 
-// Resolves the oldest pending group of this kind on the agent's lane —
-// tool calls run in order, so a result always pairs with the oldest open
-// group. Batched queries split the harvest round-robin across their cards.
-function researchResolve(agent, kind, meta, doms) {
+// A result lands: the call's spark goes out, the bloom settles unless
+// more calls are still in flight, and its sources favicon in under
+// the agent's name.
+function researchResolve(agent, kind, doms) {
   const l = research.lanes.get(agent);
   if (!l) return;
   const g = l.pend.find(x => x.kind === kind && !x.done);
-  if (!g) return;
-  g.done = true;
-  const sites = [...new Set(doms || [])];
-  g.cards.forEach((c, i) => {
-    c.classList.replace('pend', 'done');
-    c.querySelector('.qmeta').textContent = meta;
-    const mine = g.cards.length > 1
-      ? sites.filter((_, j) => j % g.cards.length === i) : sites;
-    if (!mine.length) return;
-    const stack = rel('span', 'sstack');
-    mine.slice(0, 8).forEach(d => stack.appendChild(researchDot(d)));
-    if (mine.length > 8)
-      stack.appendChild(rel('span', 'smore', `+${mine.length - 8}`));
-    c.appendChild(stack);
-  });
+  if (g) g.done = true;
+  if (!l.pend.some(x => !x.done)) l.el.classList.remove('act');
+  researchMote(l);
+  (doms || []).forEach(d => researchSource(l, d));
   researchStats();
 }
 
@@ -1823,7 +2081,7 @@ function researchFeed(m) {
     }
     return;
   }
-  // The board mirrors the live run only — history lives in the transcript.
+  // The field mirrors the live run only — history lives in the transcript.
   if (!m.conversation_id || m.conversation_id !== runningConvId) return;
   if (research.conv !== m.conversation_id) {
     researchReset();
@@ -1837,30 +2095,17 @@ function researchFeed(m) {
       if (tool === 'web_search') {
         const qs = Array.isArray(a.queries) && a.queries.length
           ? a.queries : [a.query || 'search'];
-        const g = { kind: 'search', done: false, cards: [] };
-        for (const q of qs)
-          g.cards.push(researchCard(agent, 'search', clip(q, 90),
-                                    'searching · web_search', true));
-        researchLane(agent).pend.push(g);
+        researchAct(agent, 'search', qs, true);
         researchShow();
       } else if (tool === 'fetch_url') {
-        const g = { kind: 'fetch', done: false, cards: [
-          researchCard(agent, 'fetch',
-                       clip(hostOf(a.url) || a.url, 90),
-                       'fetching · fetch_url', true)] };
-        researchLane(agent).pend.push(g);
+        researchAct(agent, 'fetch', [hostOf(a.url) || a.url], true);
         researchShow();
       } else if (tool === 'spawn_agent' || tool === 'collect_agent') {
         const kind = tool === 'spawn_agent' ? 'spawn' : 'collect';
-        const g = { kind, done: false, cards: [
-          researchCard(agent, kind, `${kind} ${a.name || 'worker'}`,
-                       kind === 'spawn' ? 'delegating'
-                                        : 'waiting on report')] };
-        researchLane(agent).pend.push(g);
+        researchAct(agent, kind, [`${kind} ${a.name || 'worker'}`], true);
         researchShow();
       } else if (tool === 'send_file') {
-        const c = researchCard(agent, 'send', fileBase(a.path), 'sent');
-        c.classList.replace('pend', 'done');
+        researchAct(agent, 'send', [fileBase(a.path)]);
         researchShow();
       }
       return;
@@ -1871,17 +2116,11 @@ function researchFeed(m) {
         ((m.urls && m.urls.length ? m.urls
                                   : res.match(RESULT_URL_RE) || [])
         ).map(hostOf).filter(Boolean))];
-      if (m.tool === 'web_search') {
-        const backend = (res.match(/via (\w+)/) || [])[1] || 'web';
-        researchResolve(agent, 'search',
-                        `${doms.length} sources · ${backend}`, doms);
-      } else if (m.tool === 'fetch_url') {
-        researchResolve(agent, 'fetch', 'read · fetch_url', doms);
-      } else if (m.tool === 'spawn_agent') {
-        researchResolve(agent, 'spawn', 'spawned');
-      } else if (m.tool === 'collect_agent') {
-        researchResolve(agent, 'collect', 'report in');
-      }
+      const kind = m.tool === 'web_search' ? 'search'
+                 : m.tool === 'fetch_url' ? 'fetch'
+                 : m.tool === 'spawn_agent' ? 'spawn'
+                 : m.tool === 'collect_agent' ? 'collect' : null;
+      if (kind) researchResolve(agent, kind, doms);
       return;
     }
     case 'subagent': {
@@ -1891,18 +2130,18 @@ function researchFeed(m) {
         researchCounts();
         researchShow();
       } else {
+        l.el.classList.remove('act');
         l.el.classList.add('done');
         const bits = [m.state];
         if (m.steps != null) bits.push(`${m.steps} steps`);
-        if (m.usd) bits.push(`$${Number(m.usd).toFixed(4)}`);
-        l.el.appendChild(rel('div', 'asum', bits.join(' · ')));
+        researchLine(l, bits.join(' · '));
       }
       return;
     }
     case 'thought':
     case 'thinking': {
       const l = research.lanes.get(agent);
-      if (l && m.text) l.thoughtEl.textContent = clip(m.text, 110);
+      if (l && m.text) researchLine(l, clip(m.text, 60), true);
       return;
     }
     case 'done':
@@ -2762,7 +3001,7 @@ keystorePush.onclick = async () => {
 // — stack stopped, old backend — the app tries the address itself: a LAN
 // server answers this machine just as well.
 const LOCAL_VISION =
-  /llava|moondream|minicpm-v|qwen[\d.]*-?vl|vision|gemma3|mistral-small|granite|bakllava/i;
+  /llava|moondream|minicpm-v|qwen[\d.]*-?vl|vision|gemma[ -]?[3-9](?![ -]?1b)|mistral-small|granite|bakllava/i;
 let serverCache = { key: null, at: 0, res: null };
 
 const sigTimeout = (ms) =>

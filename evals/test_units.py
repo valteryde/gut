@@ -147,5 +147,74 @@ try:
 except AttributeError:
     check("orchestrate: tool hiding", False, "tools_for_run not found")
 
+# ── remember store ──────────────────────────────────────────────────────
+ad.state = ad.AgentState()
+out = ad.update_notes({"note": "API base is https://api.example.dk/v2"})
+check("remember: stores a note",
+      "remembered" in out
+      and ad.state.notes == ["API base is https://api.example.dk/v2"],
+      out[:80])
+out = ad.update_notes({"note": "api base is https://api.example.dk/v2"})
+check("remember: dedupes case-insensitively",
+      "already noted" in out and len(ad.state.notes) == 1)
+out = ad.update_notes({"note": "x" * (ad.NOTE_MAX_CHARS + 1)})
+check("remember: oversized note rejected",
+      "too long" in out and len(ad.state.notes) == 1)
+out = ad.update_notes({})
+check("remember: empty call lists state",
+      "nothing to do" in out and "api.example.dk" in out)
+out = ad.update_notes({"forget": "api.example"})
+check("remember: forget removes",
+      "forgot 1" in out and not ad.state.notes)
+
+# cap: the list refuses note NOTES_MAX+1
+ad.state = ad.AgentState()
+ad.state.notes = [f"fact {i}" for i in range(ad.NOTES_MAX)]
+out = ad.update_notes({"note": "one more"})
+check("remember: full list rejects", "full" in out
+      and len(ad.state.notes) == ad.NOTES_MAX)
+
+# persistence: notes round-trip through <cid>.notes.json
+ad.CONV_DIR = Path(tempfile.mkdtemp())
+ad.state = ad.AgentState()
+ad.state.conversation_id = "testconv123"
+ad.update_notes({"note": "remember the milk"})
+check("remember: persisted to disk",
+      ad.conv_load_notes("testconv123") == ["remember the milk"])
+check("remember: missing conv loads empty",
+      ad.conv_load_notes("nope404") == [])
+
+# ── build-step data-flow nudge ──────────────────────────────────────────
+# A build step going in_progress on researched data gets pointed at files:
+# worker scratch files when they exist, else "write the data file first".
+ad.state = ad.AgentState()
+ad.SCRATCH_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
+ad.state.evidence["research"] = 1
+out = todos([{"content": "Research carrot prices", "status": "done",
+              "kind": "research"},
+             {"content": "Build the comparison spreadsheet",
+              "status": "in_progress", "kind": "build"}])
+check("build nudge: no files → write data file",
+      "Never type figures from memory" in out, out[-120:])
+
+ad.state = ad.AgentState()
+ad.state.evidence["research"] = 1
+ad.SCRATCH_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
+wd = ad.SCRATCH_DIR / "price-worker"
+wd.mkdir(parents=True, exist_ok=True)
+(wd / "findings.json").write_text('[{"value": 42, "unit": "kr"}]')
+out = todos([{"content": "Build the comparison spreadsheet",
+              "status": "in_progress", "kind": "build"}])
+check("build nudge: worker files listed",
+      "price-worker/findings.json" in out, out[-160:])
+
+# no research evidence and no files → no nudge
+ad.state = ad.AgentState()
+ad.SCRATCH_DIR = Path(tempfile.mkdtemp(dir=ad.HOME_DIR))
+out = todos([{"content": "Build the comparison spreadsheet",
+              "status": "in_progress", "kind": "build"}])
+check("build nudge: quiet without research",
+      "figures from memory" not in out and "workers' files" not in out)
+
 print(f"\n{len(FAILS)} failures" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
