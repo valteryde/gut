@@ -504,7 +504,8 @@ Talking to the user — act like a teammate, not a live feed:
   it's an ephemeral status, not a message.
 - send_message: a short chat update. Use sparingly — a milestone on a long
   task, a blocker, a finding worth flagging. Silence is fine while work is
-  straightforward; do not narrate steps.
+  straightforward; do not narrate steps. It doesn't end the task — when
+  nothing remains to do, call task_complete.
 - send_file: deliver an artifact (report, spreadsheet, export, download) as a
   chat attachment. Paths are relative to {home}. The user can't browse this
   filesystem — before task_complete, send_file every file they'll want,
@@ -522,7 +523,9 @@ Talking to the user — act like a teammate, not a live feed:
   The summary IS the answer: when the user asked a question, it holds the
   values with units and the source URLs verbatim — "sources are
   provided" or "see the report" is not an answer, the user sees nothing
-  else. Then what was done, where files are, and what to check.
+  else. Then what was done, where files are, and what to check. A plain
+  chat reply (a greeting, a quick question) also ends with task_complete —
+  the summary IS the reply, one line is enough.
 
 Planning — match the effort to the task:
 - Quick one-off actions: just do them — no plan, no checklist.
@@ -4544,6 +4547,15 @@ RESEARCH_NUDGE_MSG = (
     "working. And if you already have enough for a defensible answer, stop "
     "researching — flag what's unverified and deliver.")
 
+# A turn of nothing but send_message calls is a reply, not progress — and
+# send_message doesn't end the task, so the model loops on it forever
+# (each message is a unique signature; the stall detector can't see it).
+# Counted as an idle reply; this note names the exit until the cap ends it.
+CHAT_REPLY_NOTE = (
+    "send_message doesn't end the task. If nothing remains to do, call "
+    "task_complete now (for a chat reply the summary IS the reply — one "
+    "line is enough); otherwise continue with tool calls.")
+
 
 class StallDetector:
     """Loop detection for one run, on tool signatures (name + sorted args).
@@ -6365,9 +6377,8 @@ async def agent_loop(conv_id: str, task_text: str,
                         "next tool call.")
                     messages.append({"role": "user", "content": nudge})
                     continue
-                idle_replies = 0
-
                 acted_on_screen = acted_visibly = False
+                last_sent = ""
                 parsed: list[tuple[dict, str, dict]] = []
                 for tc in tool_calls:
                     fn = tc.get("function") or {}
@@ -6379,6 +6390,15 @@ async def agent_loop(conv_id: str, task_text: str,
                     # names still works — left_click → click, etc.
                     name, args = legacy_call(fn.get("name", ""), args)
                     parsed.append((tc, name, args))
+
+                # A turn of nothing but send_message calls is a reply, not
+                # work — it counts as an idle reply exactly like prose-only
+                # (handled after the calls run, once the message is sent).
+                # Only a turn that acted resets the streak.
+                chat_only = bool(parsed) and all(
+                    n == "send_message" for _, n, _ in parsed)
+                if not chat_only:
+                    idle_replies = 0
 
                 # A turn of nothing-but PARALLEL_TOOLS calls has no ordering
                 # and touches no shared state — run the calls concurrently
@@ -6462,6 +6482,9 @@ async def agent_loop(conv_id: str, task_text: str,
                             n=state.solo_research))
                         state.solo_research = 0
 
+                    if name == "send_message":
+                        last_sent = str(args.get("text") or last_sent)
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.get("id"),
@@ -6500,6 +6523,21 @@ async def agent_loop(conv_id: str, task_text: str,
                                          "text": text[:8000],
                                          "stats": run_stats()})
                         break
+
+                # The cap for prose replies and chat-only turns is shared:
+                # alternating the two must not reset the count. At the cap
+                # the run ends on the last text sent, the way the prose
+                # path ends on the last reply.
+                if not done and chat_only:
+                    idle_replies += 1
+                    if idle_replies >= IDLE_REPLY_LIMIT:
+                        done = True
+                        await broadcast({"type": "done",
+                                         "text": (last_sent or reply_text
+                                                  or "done")[:8000],
+                                         "stats": run_stats()})
+                        break
+                    _inject_note(messages, CHAT_REPLY_NOTE)
 
                 # One fresh screenshot per turn on the last tool result —
                 # skipped when the frame is byte-identical to the last sent.
