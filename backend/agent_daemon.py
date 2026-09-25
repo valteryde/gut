@@ -1360,7 +1360,11 @@ PROVIDER_MODELS = {
 # servers expose — discovered live in reconcile_models instead of static
 # entries above.
 PROVIDER_KEYS = tuple(PROVIDER_MODELS) + (
-    "OLLAMA_API_BASE", "OPENAI_COMPAT_BASE", "OPENAI_COMPAT_API_KEY")
+    "OLLAMA_API_BASE", "OPENAI_COMPAT_BASE", "OPENAI_COMPAT_API_KEY",
+    # Keyed SERP APIs for web_search — not model providers, but they ride
+    # the same pushed-key channel (provider_keys.json applies live, env is
+    # the fallback) since scraping folds the moment a host IP gets flagged.
+    "TAVILY_API_KEY", "BRAVE_API_KEY", "SERPER_API_KEY")
 PROVIDER_KEYS_FILE = GUT_DATA_DIR / "provider_keys.json"
 MANAGED_PREFIX = "gut-"
 
@@ -2654,6 +2658,11 @@ class _DDGResults(HTMLParser):
         self._cls = ""
 
 
+class _SearchBlocked(Exception):
+    """The engine answered with an anti-bot challenge instead of results —
+    reparsing can't help, so the caller should stop the retry loop."""
+
+
 async def _ddg_search(query: str, lang: str = "", region: str = "") -> list[dict]:
     data = {"q": query}
     if lang and region:  # kl = "country-language", e.g. dk-da
@@ -2664,7 +2673,75 @@ async def _ddg_search(query: str, lang: str = "", region: str = "") -> list[dict
         r.raise_for_status()
     p = _DDGResults()
     p.feed(r.text)
+    # DDG answers flagged IPs with an image CAPTCHA ("anomaly-modal") that
+    # parses cleanly to zero results — distinguish it from an honest empty.
+    if not p.results and ("anomaly-modal" in r.text
+                          or "challenge-form" in r.text):
+        raise _SearchBlocked
     return p.results
+
+
+async def _tavily_search(query: str, n: int, key: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post("https://api.tavily.com/search",
+                         json={"api_key": key, "query": query,
+                               "max_results": n, "search_depth": "basic"})
+        r.raise_for_status()
+    return [{"title": str(it.get("title", "")), "url": str(it.get("url", "")),
+             "snippet": str(it.get("content") or "")}
+            for it in r.json().get("results", [])]
+
+
+async def _brave_search(query: str, n: int,
+                        lang: str, region: str, key: str) -> list[dict]:
+    params: dict = {"q": query, "count": n}
+    if region:
+        params["country"] = region.lower()
+    if lang:
+        params["search_lang"] = lang.lower()
+    async with httpx.AsyncClient(
+            timeout=15, headers={"X-Subscription-Token": key,
+                                 "Accept": "application/json"}) as c:
+        r = await c.get("https://api.search.brave.com/res/v1/web/search",
+                        params=params)
+        r.raise_for_status()
+    return [{"title": str(it.get("title", "")), "url": str(it.get("url", "")),
+             "snippet": str(it.get("description") or "")}
+            for it in (r.json().get("web") or {}).get("results", [])]
+
+
+async def _serper_search(query: str, n: int,
+                         lang: str, region: str, key: str) -> list[dict]:
+    body: dict = {"q": query, "num": n}
+    if region:
+        body["gl"] = region.lower()
+    if lang:
+        body["hl"] = lang.lower()
+    async with httpx.AsyncClient(timeout=15,
+                                 headers={"X-API-KEY": key}) as c:
+        r = await c.post("https://google.serper.dev/search", json=body)
+        r.raise_for_status()
+    return [{"title": str(it.get("title", "")),
+             "url": str(it.get("link", "")),
+             "snippet": str(it.get("snippet") or "")}
+            for it in r.json().get("organic", [])]
+
+
+async def _api_search(query: str, n: int,
+                      lang: str, region: str) -> tuple[list, str]:
+    """First configured keyed SERP API, or ([], "") when none is. Keys are
+    env vars or pushed via /api/keys — effective_provider_keys merges both."""
+    eff = effective_provider_keys()
+    if eff.get("TAVILY_API_KEY"):
+        return await _tavily_search(query, n, eff["TAVILY_API_KEY"][0]), \
+            "tavily"
+    if eff.get("BRAVE_API_KEY"):
+        return await _brave_search(query, n, lang, region,
+                                   eff["BRAVE_API_KEY"][0]), "brave"
+    if eff.get("SERPER_API_KEY"):
+        return await _serper_search(query, n, lang, region,
+                                    eff["SERPER_API_KEY"][0]), "serper"
+    return [], ""
 
 
 def _openserp_engines(lang: str) -> str:
@@ -2702,7 +2779,12 @@ async def web_search(query: str, max_results: int = 8,
     lang = (lang or SEARCH_LANG).strip().upper()
     region = (region or SEARCH_REGION).strip().upper()
     results, backend = [], ""
-    if OPENSERP_URL:
+    openserp_failed = False
+    try:
+        results, backend = await _api_search(query, n, lang, region)
+    except Exception as e:
+        print(f"[gut] api search failed: {type(e).__name__} {e}")
+    if not results and OPENSERP_URL:
         # /mega/search fans out to the listed engines and merges+dedupes
         # — per-engine blocks (CAPTCHA, rate limits) don't sink the query.
         # A 502 means every engine failed at once (usually transient
@@ -2730,22 +2812,35 @@ async def web_search(query: str, max_results: int = 8,
                                for it in r.json().get("results", [])]
                     backend = "openserp"
                     break
+                openserp_failed = True
                 print(f"[gut] openserp search HTTP {r.status_code}: "
                       f"{r.text[:200]}")
             except Exception as e:
-                print(f"[gut] openserp search failed: {e}")
+                openserp_failed = True
+                # httpx timeout exceptions stringify to "" — log the class
+                # so a hung openserp isn't indistinguishable from a 502.
+                print(f"[gut] openserp search failed: "
+                      f"{type(e).__name__} {e}")
             if attempt == 0:
                 await asyncio.sleep(2)
     if not results:
         try:
             results, backend = await _ddg_search(query, lang, region), \
                 "duckduckgo"
+        except _SearchBlocked:
+            print(f"[gut] duckduckgo anti-bot challenge — query '{query}'")
+            out = ("search is blocked: duckduckgo served an anti-bot "
+                   "challenge"
+                   + (" and openserp is failing" if openserp_failed else "")
+                   + " — rephrasing won't help; fetch known pages directly "
+                     "with fetch_url (browser tools if you have them)")
+            return _mangled_note(out, mangled)
         except Exception as e:
             out = f"search failed ({e}) — use the browser tools instead"
             return _mangled_note(out, mangled)
     if not results:
         out = ("no results — try rephrasing, a different lang/region, or "
-               "the browser tools")
+               "fetch a known page directly with fetch_url")
     else:
         lines = [f"{i}. {r['title']}\n   {r['url']}"
                  + (f"\n   {r['snippet']}" if r["snippet"] else "")

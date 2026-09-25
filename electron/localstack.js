@@ -23,6 +23,8 @@ const PROVIDER_KEYS = [
   'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY',
   'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY', 'OLLAMA_API_BASE',
   'OPENAI_COMPAT_BASE', 'OPENAI_COMPAT_API_KEY',
+  // Search providers — feed the agent's web_search, no models.
+  'TAVILY_API_KEY', 'BRAVE_API_KEY', 'SERPER_API_KEY',
 ];
 
 const DEV = !app.isPackaged;

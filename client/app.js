@@ -2133,6 +2133,9 @@ let localNote = null;
 // marks). Each card leads with the vendor's logo and the models its key
 // unlocks; "Add key" expands an inline paste field that writes straight
 // into the stack's .env via IPC — no desktop start required.
+const SEARCH_ICON = 'M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28' +
+  'v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 ' +
+  '1 9.5 14z';
 const PROVIDERS = [
   { key: 'ANTHROPIC_API_KEY', name: 'Anthropic',
     models: 'Claude Sonnet 4.5 · Haiku 4.5',
@@ -2160,6 +2163,21 @@ const PROVIDERS = [
     optKey: 'OPENAI_COMPAT_API_KEY',
     models: 'vLLM · LM Studio · llama.cpp · LocalAI',
     icon: 'M4.5 4h15A1.5 1.5 0 0 1 21 5.5v3A1.5 1.5 0 0 1 19.5 10h-15A1.5 1.5 0 0 1 3 8.5v-3A1.5 1.5 0 0 1 4.5 4zM4.5 14h15a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5v-3A1.5 1.5 0 0 1 4.5 14z' },
+  // Search providers — no models, they feed the agent's web_search. Only
+  // one is used at a time: Tavily, else Brave, else Serper. `note`
+  // replaces the generic "models show up in the picker" success line.
+  { key: 'TAVILY_API_KEY', name: 'Tavily',
+    models: 'web_search for agents — free tier at tavily.com',
+    note: 'the agent’s web_search starts using it right away.',
+    icon: SEARCH_ICON },
+  { key: 'BRAVE_API_KEY', name: 'Brave Search',
+    models: 'web_search — free tier at brave.com/search/api',
+    note: 'the agent’s web_search starts using it right away.',
+    icon: SEARCH_ICON },
+  { key: 'SERPER_API_KEY', name: 'Serper',
+    models: 'web_search via Google — free credits at serper.dev',
+    note: 'the agent’s web_search starts using it right away.',
+    icon: SEARCH_ICON },
 ];
 
 const keysBox = $('keysBox');
@@ -2400,8 +2418,9 @@ async function saveProviderKeys(p, updates) {
   renderProviderKeys();
   const ok = await pushKeysRemote(d, updates,
     removing ? `${p.name} ${noun} removed from ${name}.`
-             : `${p.name} ${noun} is now on ${name} — its models show ` +
-               'up in the picker within a few seconds.');
+             : `${p.name} ${noun} is now on ${name} — ` +
+               (p.note || 'its models show up in the picker within a ' +
+                'few seconds.'));
   if (ok && !removing)
     for (const [k, v] of Object.entries(updates))
       if (String(v).trim()) vaultSet(k, v);
@@ -3666,12 +3685,14 @@ $('devForm').addEventListener('submit', (e) => {
 // observe its box instead and persist the result across reloads.
 const savedChatW = +localStorage.getItem('gut.chatWidth') || 0;
 if (savedChatW) chatPane.style.width = savedChatW + 'px';
+const narrowMq = matchMedia('(max-width: 760px)');
 let chatWTimer;
 new ResizeObserver(() => {
   clearTimeout(chatWTimer);
   chatWTimer = setTimeout(() => {
-    // The pane reports 0 while the settings page hides it — don't persist that.
-    if (chatPane.offsetWidth)
+    // The pane reports 0 while the settings page hides it — don't persist
+    // that, nor the forced full width of the narrow chat-only layout.
+    if (chatPane.offsetWidth && !narrowMq.matches)
       localStorage.setItem('gut.chatWidth', chatPane.offsetWidth);
   }, 200);
 }).observe(chatPane);
