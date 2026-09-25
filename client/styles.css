@@ -2028,14 +2028,15 @@ button.try:hover {
   color: var(--text);
 }
 
-/* narrow screens: chat on top */
+/* narrow screens: the desktop pane drops out — chat gets the window */
 @media (max-width: 760px) {
   main { flex-direction: column; gap: 10px; padding: 0 10px 10px; }
+  #desktopPane { display: none; }
   #chatPane {
-    width: 100%;
+    width: 100% !important;  /* outrank a persisted inline resize width */
     min-width: 0;
     max-width: none;
-    height: 46%;
+    flex: 1;
     resize: none;
   }
   .cost { display: none; }

@@ -83,7 +83,7 @@ function createWindow() {
   win = new BrowserWindow({
     width: 1440,
     height: 900,
-    minWidth: 960,
+    minWidth: 400,
     minHeight: 600,
     title: 'gut',
     // macOS: hide the native title bar; the in-page #topbar is the drag
