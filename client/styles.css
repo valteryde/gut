@@ -1791,7 +1791,7 @@ body.takeover #desktopPane { border-color: var(--clay); }
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  margin-left: -5px;
+  margin-left: calc(0px - var(--fav-ov, 5px));
   border: 1.5px solid var(--surface);
   background: var(--surface);
   display: flex;
@@ -1872,8 +1872,28 @@ body.takeover #desktopPane { border-color: var(--clay); }
   font-size: 10.5px;
   color: var(--text-2);
   cursor: pointer;
+  transition: border-color .15s, box-shadow .15s, transform .15s;
 }
-#researchPane .vthumb:hover { border-color: #2d2560; }
+#researchPane .vthumb:hover {
+  border-color: #2d2560;
+  transform: translateY(-1px);
+  box-shadow: 0 9px 22px rgba(60, 55, 45, .2);
+}
+#researchPane .vthumb:active { transform: translateY(0); }
+#researchPane .vthumb:focus-visible {
+  outline: 2px solid var(--mint-ink);
+  outline-offset: 2px;
+}
+#researchPane .vthumb .vback {
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-3);
+  transition: color .15s, transform .15s;
+}
+#researchPane .vthumb:hover .vback {
+  color: #2d2560;
+  transform: translateX(-2px);
+}
 #researchPane .vthumb .vdot {
   width: 6px;
   height: 6px;
@@ -1895,6 +1915,8 @@ body.takeover #desktopPane { border-color: var(--clay); }
   #researchPane .wline,
   #researchPane.live .eq i,
   #researchPane .vthumb .vdot { animation: none !important; }
+  #researchPane .vthumb,
+  #researchPane .vthumb .vback { transition: none; }
 }
 
 /* takeover notice — a clay band at the foot of the conversation, where

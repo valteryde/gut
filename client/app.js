@@ -1905,10 +1905,18 @@ function researchChrome() {
   research.boardEl.appendChild(research.orbsEl);
   const thumb = rel('div', 'vthumb');
   thumb.setAttribute('role', 'button');
+  thumb.tabIndex = 0;
   thumb.title = 'back to the desktop';
-  thumb.append(rel('span', 'vdot'),
+  thumb.append(rel('span', 'vback', '‹'),
+               rel('span', 'vdot'),
                document.createTextNode('desktop · idle'));
   thumb.addEventListener('click', researchHide);
+  thumb.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      researchHide();
+    }
+  });
   researchPaneEl.append(defs, rel('div', 'halo'), head,
                         research.boardEl, thumb);
   research.headEl = head;
@@ -2029,6 +2037,7 @@ function researchSource(l, dom) {
       l.favsEl.appendChild(l.moreEl);
     }
     l.moreEl.textContent = `+${l.sites.size - 13}`;
+    researchFavFit(l);
     return;
   }
   const f = rel('span', 'fav');
@@ -2047,6 +2056,17 @@ function researchSource(l, dom) {
   };
   f.appendChild(img);
   l.favsEl.appendChild(f);
+  researchFavFit(l);
+}
+
+// Past ~9 chips the stack would overflow the lane and clip off the end;
+// deepen the overlap instead so every fav and the "+n" stay visible.
+function researchFavFit(l) {
+  const n = l.favsEl.children.length;
+  const w = l.favsEl.clientWidth;
+  if (n < 2 || !w) return;
+  const step = Math.max(6, Math.min(13, Math.floor((w - 18) / (n - 1))));
+  l.favsEl.style.setProperty('--fav-ov', `${18 - step}px`);
 }
 
 // A result lands: the call's spark goes out, the bloom settles unless
